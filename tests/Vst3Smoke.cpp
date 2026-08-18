@@ -1,0 +1,225 @@
+#include <juce_audio_processors_headless/juce_audio_processors_headless.h>
+
+#include <array>
+#include <atomic>
+#include <cmath>
+#include <functional>
+#include <iostream>
+#include <memory>
+#include <thread>
+
+namespace {
+
+struct ProductExpectation {
+  const char *name;
+  int inputChannels;
+  const char *componentCid;
+  const char *controllerCid;
+};
+
+[[nodiscard]] juce::File bundleForModule(const juce::File &module) {
+  auto candidate = module;
+  while (candidate != juce::File{} && !candidate.hasFileExtension("vst3"))
+    candidate = candidate.getParentDirectory();
+  return candidate;
+}
+
+[[nodiscard]] bool check(const bool condition, const juce::String &message) {
+  if (condition)
+    return true;
+  std::cerr << message << '\n';
+  return false;
+}
+
+[[nodiscard]] bool checkIdentities(const juce::File &bundle,
+                                   const ProductExpectation &expected) {
+  const auto moduleInfo = bundle.getChildFile("Contents")
+                              .getChildFile("Resources")
+                              .getChildFile("moduleinfo.json");
+  if (!check(moduleInfo.existsAsFile(),
+             "Missing VST3 moduleinfo.json in " + bundle.getFullPathName())) {
+    return false;
+  }
+
+  const auto contents = moduleInfo.loadFileAsString();
+  return check(contents.contains("\"CID\": \"" +
+                                 juce::String(expected.componentCid) + "\""),
+               juce::String(expected.name) +
+                   " component CID changed unexpectedly") &&
+         check(contents.contains("\"CID\": \"" +
+                                 juce::String(expected.controllerCid) + "\""),
+               juce::String(expected.name) +
+                   " controller CID changed unexpectedly");
+}
+
+[[nodiscard]] bool smokeProduct(juce::VST3PluginFormatHeadless &format,
+                                const juce::File &module,
+                                const ProductExpectation expected) {
+  const auto bundle = bundleForModule(module);
+  if (!check(bundle.isDirectory(),
+             "VST3 bundle not found for " + module.getFullPathName()))
+    return false;
+  if (!checkIdentities(bundle, expected))
+    return false;
+
+  juce::OwnedArray<juce::PluginDescription> descriptions;
+  format.findAllTypesForFile(descriptions, bundle.getFullPathName());
+  if (!check(descriptions.size() == 1,
+             "Expected one component in " + bundle.getFullPathName()))
+    return false;
+
+  const auto &description = *descriptions[0];
+  if (!check(description.name == expected.name,
+             "Unexpected product name: " + description.name))
+    return false;
+
+  juce::String error;
+  auto instance =
+      format.createInstanceFromDescription(description, 48000.0, 512, error);
+  if (!check(instance != nullptr,
+             "Could not instantiate " + description.name + ": " + error))
+    return false;
+  auto secondInstance =
+      format.createInstanceFromDescription(description, 48000.0, 512, error);
+  if (!check(secondInstance != nullptr, "Could not create a second " +
+                                            description.name +
+                                            " instance: " + error)) {
+    return false;
+  }
+
+  auto succeeded = true;
+  const auto parameterCount = instance->getParameters().size();
+  succeeded &= check(
+      parameterCount == 2113,
+      description.name +
+          " must expose 32 Onda slots, bypass, and 2080 VST3 MIDI mappings "
+          "(found " +
+          juce::String(parameterCount) + ")");
+  for (int index = 0; index < juce::jmin(parameterCount, 32); ++index) {
+    const auto slotNumber = index + 1;
+    const auto expectedName = "Slot " + juce::String(index + 1);
+    const auto sourceID = "slot" + juce::String(slotNumber).paddedLeft('0', 2);
+    const auto expectedVstID = juce::String(
+        juce::VST3ClientExtensions::convertJuceParameterId(sourceID, true));
+    const auto *parameter = instance->getParameters()[index];
+    succeeded &= check(parameter->getName(64) == expectedName,
+                       description.name + " parameter name mismatch at index " +
+                           juce::String(index));
+    const auto *hosted =
+        dynamic_cast<const juce::HostedAudioProcessorParameter *>(parameter);
+    succeeded &=
+        check(hosted != nullptr && hosted->getParameterID() == expectedVstID,
+              description.name + " parameter ID mismatch at index " +
+                  juce::String(index));
+    succeeded &=
+        check(parameter->isAutomatable(),
+              description.name + " slot must be automatable at index " +
+                  juce::String(index));
+    succeeded &=
+        check(std::abs(parameter->getValue() - 0.5F) < 0.000001F,
+              description.name + " parameter default mismatch at index " +
+                  juce::String(index));
+  }
+  if (parameterCount > 32) {
+    const auto *bypass = instance->getParameters()[32];
+    succeeded &= check(bypass->getName(64) == "Bypass",
+                       description.name + " final parameter must be Bypass");
+    succeeded &= check(bypass->getNumSteps() == 2,
+                       description.name + " bypass must be boolean");
+    succeeded &= check(std::abs(bypass->getValue()) < 0.000001F,
+                       description.name + " bypass must default off");
+  }
+  auto midiMappingsAreNonAutomatable = true;
+  for (int index = 33; index < parameterCount; ++index)
+    midiMappingsAreNonAutomatable &=
+        !instance->getParameters()[index]->isAutomatable();
+  succeeded &= check(midiMappingsAreNonAutomatable,
+                     description.name +
+                         " VST3 MIDI mappings must remain non-automatable");
+
+  succeeded &=
+      check(instance->acceptsMidi(), description.name + " must accept MIDI");
+  succeeded &= check(!instance->producesMidi(),
+                     description.name + " must not produce MIDI");
+  succeeded &= check(!instance->supportsDoublePrecisionProcessing(),
+                     description.name + " must be f32-only");
+  succeeded &=
+      check(instance->getTotalNumInputChannels() == expected.inputChannels,
+            description.name + " input layout mismatch");
+  succeeded &= check(instance->getTotalNumOutputChannels() == 2,
+                     description.name + " output layout mismatch");
+
+  juce::MemoryBlock firstState;
+  instance->getStateInformation(firstState);
+  succeeded &=
+      check(!firstState.isEmpty(), description.name + " returned empty state");
+  instance->setStateInformation(firstState.getData(),
+                                static_cast<int>(firstState.getSize()));
+  juce::MemoryBlock secondState;
+  instance->getStateInformation(secondState);
+  succeeded &= check(firstState == secondState,
+                     description.name + " state did not round-trip exactly");
+
+  instance->prepareToPlay(48000.0, 512);
+  secondInstance->prepareToPlay(48000.0, 512);
+  const auto channels = juce::jmax(expected.inputChannels, 2);
+  std::atomic<bool> concurrentProcessingSucceeded{true};
+  const auto process = [&](juce::AudioPluginInstance &target) {
+    juce::AudioBuffer<float> audio(channels, 512);
+    juce::MidiBuffer midi;
+    midi.addEvent(juce::MidiMessage::noteOn(1, 60, 1.0F), 16);
+    for (int iteration = 0; iteration < 100; ++iteration) {
+      for (int channel = 0; channel < channels; ++channel)
+        std::fill_n(audio.getWritePointer(channel), audio.getNumSamples(),
+                    1.0F);
+      target.processBlock(audio, midi);
+      const auto expectedSample = expected.inputChannels == 0 ? 0.0F : 1.0F;
+      for (int channel = 0; channel < 2; ++channel) {
+        for (int frame = 0; frame < audio.getNumSamples(); ++frame) {
+          if (std::abs(audio.getSample(channel, frame) - expectedSample) >=
+              0.000001F) {
+            concurrentProcessingSucceeded.store(false,
+                                                std::memory_order_relaxed);
+          }
+        }
+      }
+    }
+  };
+  std::thread firstAudioThread(process, std::ref(*instance));
+  std::thread secondAudioThread(process, std::ref(*secondInstance));
+  firstAudioThread.join();
+  secondAudioThread.join();
+  succeeded &=
+      check(concurrentProcessingSucceeded.load(std::memory_order_relaxed),
+            description.name +
+                " produced an unsafe fallback with two concurrent instances");
+  instance->releaseResources();
+  secondInstance->releaseResources();
+
+  return succeeded;
+}
+
+} // namespace
+
+int main(const int argc, const char *const *argv) {
+  if (argc != 3) {
+    std::cerr << "usage: onda_vst3_smoke <instrument-module> <effect-module>\n";
+    return 2;
+  }
+
+  juce::ScopedJuceInitialiser_GUI juceInitialiser;
+  juce::VST3PluginFormatHeadless format;
+  constexpr std::array expectations{
+      ProductExpectation{"OndaSynth", 0, "ABCDEF019182FAEB4F6E64614F64796E",
+                         "ABCDEF011234ABCD4F6E64614F64796E"},
+      ProductExpectation{"OndaFX", 2, "ABCDEF019182FAEB4F6E64614F656678",
+                         "ABCDEF011234ABCD4F6E64614F656678"},
+  };
+
+  auto succeeded = true;
+  for (std::size_t index = 0; index < expectations.size(); ++index) {
+    succeeded &=
+        smokeProduct(format, juce::File{argv[index + 1]}, expectations[index]);
+  }
+  return succeeded ? 0 : 1;
+}

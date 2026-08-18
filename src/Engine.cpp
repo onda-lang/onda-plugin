@@ -1,0 +1,974 @@
+#include "Engine.h"
+
+#include "AudioFile.h"
+
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <cstring>
+#include <limits>
+#include <string_view>
+
+namespace onda::plugin {
+namespace {
+
+static_assert(sizeof(float) == 4U);
+static_assert(sizeof(double) == 8U);
+static_assert(sizeof(std::int32_t) == 4U);
+static_assert(sizeof(std::int64_t) == 8U);
+
+Diagnostic error(std::string message) {
+  Diagnostic result;
+  result.message = std::move(message);
+  return result;
+}
+
+int flattenedChannels(const onda_program_t *program, const bool input,
+                      Diagnostic &diagnostic) {
+  const auto count =
+      input ? onda_input_count(program) : onda_output_count(program);
+  if (count < 0) {
+    diagnostic = error("Onda returned invalid audio interface metadata");
+    return -1;
+  }
+
+  int channels = 0;
+  for (int index = 0; index < count; ++index) {
+    const auto primitive = input ? onda_input_elem_type(program, index)
+                                 : onda_output_elem_type(program, index);
+    const auto arrayLength = input ? onda_input_array_len(program, index)
+                                   : onda_output_array_len(program, index);
+    if (primitive != ONDA_PRIMITIVE_F32 || arrayLength <= 0 ||
+        channels > 2 - arrayLength) {
+      diagnostic = error(
+          "Audio inputs and outputs must flatten to at most two f32 channels");
+      return -1;
+    }
+    channels += arrayLength;
+  }
+  return channels;
+}
+
+bool bindAudio(onda_instance_t *instance, const onda_program_t *program,
+               std::vector<float> &slab, const bool input, const int blockSize,
+               Diagnostic &diagnostic) {
+  const auto count =
+      input ? onda_input_count(program) : onda_output_count(program);
+  for (int index = 0; index < count; ++index) {
+    const auto slotOffset = input ? onda_input_slot_offset(program, index)
+                                  : onda_output_slot_offset(program, index);
+    const auto arrayLength = input ? onda_input_array_len(program, index)
+                                   : onda_output_array_len(program, index);
+    const auto availableChannels =
+        slab.size() / static_cast<std::size_t>(blockSize);
+    if (slotOffset < 0 || arrayLength <= 0 ||
+        static_cast<std::size_t>(slotOffset) +
+                static_cast<std::size_t>(arrayLength) >
+            availableChannels) {
+      diagnostic = error("Onda returned invalid flattened audio metadata");
+      return false;
+    }
+    const auto samples = static_cast<std::size_t>(arrayLength) *
+                         static_cast<std::size_t>(blockSize);
+    if (samples > static_cast<std::size_t>(std::numeric_limits<int>::max()) /
+                      sizeof(float)) {
+      diagnostic = error("The prepared audio slab is too large");
+      return false;
+    }
+    auto *pointer = slab.data() + static_cast<std::size_t>(slotOffset) *
+                                      static_cast<std::size_t>(blockSize);
+    const auto bytes = static_cast<int>(samples * sizeof(float));
+    const auto status = input
+                            ? onda_bind_input(instance, index, pointer, bytes)
+                            : onda_bind_output(instance, index, pointer, bytes);
+    if (status != 0) {
+      diagnostic = error(input ? "Failed to bind an Onda input slab"
+                               : "Failed to bind an Onda output slab");
+      return false;
+    }
+  }
+  return true;
+}
+
+std::optional<std::string> parameterType(const int primitive) {
+  switch (primitive) {
+  case ONDA_PRIMITIVE_F32:
+    return "f32";
+  case ONDA_PRIMITIVE_F64:
+    return "f64";
+  case ONDA_PRIMITIVE_I32:
+    return "i32";
+  case ONDA_PRIMITIVE_I64:
+    return "i64";
+  case ONDA_PRIMITIVE_BOOL:
+    return "bool";
+  default:
+    return std::nullopt;
+  }
+}
+
+std::optional<std::string> parameterUnit(const onda_program_t *program,
+                                         const int index) {
+  const auto bytes = onda_param_unit_copy(program, index, nullptr, 0);
+  if (bytes < 0)
+    return std::nullopt;
+  if (bytes == 0)
+    return std::string{};
+
+  std::vector<char> buffer(static_cast<std::size_t>(bytes));
+  if (onda_param_unit_copy(program, index, buffer.data(), bytes) != bytes ||
+      buffer.back() != '\0') {
+    return std::nullopt;
+  }
+  return std::string(buffer.data(), buffer.size() - 1U);
+}
+
+std::optional<ParameterMapping> parameterMapping(const onda_program_t *program,
+                                                 const int index) {
+  if (onda_param_array_len(program, index) != 1)
+    return std::nullopt;
+  const auto primitive = onda_param_elem_type(program, index);
+  const auto type = parameterType(primitive);
+  const auto unit = parameterUnit(program, index);
+  if (!type || !unit)
+    return std::nullopt;
+
+  const auto plain = onda_param_normalized_to_plain(program, index, 0.5);
+  if (!std::isfinite(plain) ||
+      !std::isfinite(onda_param_plain_to_normalized(program, index, plain))) {
+    return std::nullopt;
+  }
+
+  ParameterMapping mapping;
+  mapping.parameterIndex = index;
+  mapping.type = *type;
+  mapping.unit = *unit;
+  if (const auto *name = onda_param_name(program, index))
+    mapping.name = name;
+
+  mapping.defaultPlain = onda_param_default_f64(program, index);
+  const auto normalizedDefault =
+      onda_param_plain_to_normalized(program, index, mapping.defaultPlain);
+  if (!std::isfinite(mapping.defaultPlain) ||
+      !std::isfinite(normalizedDefault)) {
+    return std::nullopt;
+  }
+  mapping.defaultNormalized = std::clamp(normalizedDefault, 0.0, 1.0);
+
+  if (primitive == ONDA_PRIMITIVE_BOOL) {
+    mapping.rangeMin = 0.0;
+    mapping.rangeMax = 1.0;
+    return mapping;
+  }
+
+  if (onda_param_has_range(program, index) != 1)
+    return std::nullopt;
+  mapping.rangeMin = onda_param_range_min_f64(program, index);
+  mapping.rangeMax = onda_param_range_max_f64(program, index);
+  if (!std::isfinite(mapping.rangeMin) || !std::isfinite(mapping.rangeMax) ||
+      mapping.rangeMin >= mapping.rangeMax) {
+    return std::nullopt;
+  }
+
+  const auto scale = onda_param_scale(program, index);
+  if (scale == ONDA_PARAM_SCALE_LINEAR)
+    mapping.scale = "linear";
+  else if (scale == ONDA_PARAM_SCALE_LOG)
+    mapping.scale = "log";
+  else
+    return std::nullopt;
+
+  const auto hasCurve = onda_param_has_curve(program, index);
+  if (hasCurve < 0)
+    return std::nullopt;
+  if (hasCurve == 1) {
+    const auto curve = onda_param_curve(program, index);
+    if (!std::isfinite(curve))
+      return std::nullopt;
+    mapping.curve = curve;
+  }
+
+  const auto hasStep = onda_param_has_step(program, index);
+  if (hasStep < 0)
+    return std::nullopt;
+  if (hasStep == 1) {
+    const auto step = onda_param_step_f64(program, index);
+    const auto stepCount = onda_param_step_count(program, index);
+    if (!std::isfinite(step) || step <= 0.0 || stepCount == 0U)
+      return std::nullopt;
+    mapping.step = step;
+    mapping.stepCount = stepCount;
+  }
+  return mapping;
+}
+
+struct ExpectedEvent {
+  std::string_view name;
+  std::span<const std::string_view> parameterNames;
+  std::span<const int> parameterTypes;
+  std::string_view category;
+  bool requiredForInstrument{};
+};
+
+static_assert(static_cast<std::size_t>(HostContextKind::count) == 9U);
+
+constexpr std::array<std::string_view, 4U> noteNames{"id", "channel", "key",
+                                                     "velocity"};
+constexpr std::array<int, 4U> noteTypes{ONDA_PRIMITIVE_I32, ONDA_PRIMITIVE_I32,
+                                        ONDA_PRIMITIVE_I32, ONDA_PRIMITIVE_F32};
+constexpr std::array<std::string_view, 2U> pitchNames{"channel", "value"};
+constexpr std::array<int, 2U> pitchTypes{ONDA_PRIMITIVE_I32,
+                                         ONDA_PRIMITIVE_F32};
+constexpr std::array<std::string_view, 2U> pressureNames{"channel", "pressure"};
+constexpr std::array<int, 2U> pressureTypes{ONDA_PRIMITIVE_I32,
+                                            ONDA_PRIMITIVE_F32};
+constexpr std::array<std::string_view, 3U> ccNames{"channel", "index", "value"};
+constexpr std::array<int, 3U> ccTypes{ONDA_PRIMITIVE_I32, ONDA_PRIMITIVE_I32,
+                                      ONDA_PRIMITIVE_F32};
+constexpr std::array<std::string_view, 3U> polyPressureNames{"channel", "key",
+                                                             "pressure"};
+constexpr std::array<int, 3U> polyPressureTypes{
+    ONDA_PRIMITIVE_I32, ONDA_PRIMITIVE_I32, ONDA_PRIMITIVE_F32};
+constexpr std::array<std::string_view, 2U> programChangeNames{"channel",
+                                                              "program"};
+constexpr std::array<int, 2U> programChangeTypes{ONDA_PRIMITIVE_I32,
+                                                 ONDA_PRIMITIVE_I32};
+
+constexpr std::array<std::string_view, 3U> transportNames{
+    "playing", "recording", "looping"};
+constexpr std::array<int, 3U> transportTypes{
+    ONDA_PRIMITIVE_BOOL, ONDA_PRIMITIVE_BOOL, ONDA_PRIMITIVE_BOOL};
+constexpr std::array<std::string_view, 1U> samplePositionNames{"sample"};
+constexpr std::array<int, 1U> samplePositionTypes{ONDA_PRIMITIVE_I64};
+constexpr std::array<std::string_view, 1U> timePositionNames{"seconds"};
+constexpr std::array<int, 1U> timePositionTypes{ONDA_PRIMITIVE_F64};
+constexpr std::array<std::string_view, 1U> tempoNames{"bpm"};
+constexpr std::array<int, 1U> tempoTypes{ONDA_PRIMITIVE_F64};
+constexpr std::array<std::string_view, 1U> musicalPositionNames{"quarter_note"};
+constexpr std::array<int, 1U> musicalPositionTypes{ONDA_PRIMITIVE_F64};
+constexpr std::array<std::string_view, 1U> barPositionNames{
+    "start_quarter_note"};
+constexpr std::array<int, 1U> barPositionTypes{ONDA_PRIMITIVE_F64};
+constexpr std::array<std::string_view, 2U> timeSignatureNames{"numerator",
+                                                              "denominator"};
+constexpr std::array<int, 2U> timeSignatureTypes{ONDA_PRIMITIVE_I32,
+                                                 ONDA_PRIMITIVE_I32};
+constexpr std::array<std::string_view, 2U> loopRegionNames{"start_quarter_note",
+                                                           "end_quarter_note"};
+constexpr std::array<int, 2U> loopRegionTypes{ONDA_PRIMITIVE_F64,
+                                              ONDA_PRIMITIVE_F64};
+constexpr std::array<std::string_view, 1U> renderModeNames{"realtime"};
+constexpr std::array<int, 1U> renderModeTypes{ONDA_PRIMITIVE_BOOL};
+
+constexpr std::array<ExpectedEvent, static_cast<std::size_t>(MidiKind::count)>
+    expectedMidiEvents{{
+        {"note_on", noteNames, noteTypes, "MIDI", true},
+        {"note_off", noteNames, noteTypes, "MIDI", true},
+        {"poly_pressure", polyPressureNames, polyPressureTypes, "MIDI"},
+        {"pitch_bend", pitchNames, pitchTypes, "MIDI"},
+        {"channel_pressure", pressureNames, pressureTypes, "MIDI"},
+        {"cc", ccNames, ccTypes, "MIDI"},
+        {"program_change", programChangeNames, programChangeTypes, "MIDI"},
+    }};
+
+constexpr std::array<ExpectedEvent,
+                     static_cast<std::size_t>(HostContextKind::count)>
+    expectedHostContextEvents{{
+        {"transport", transportNames, transportTypes, "host-context"},
+        {"sample_position", samplePositionNames, samplePositionTypes,
+         "host-context"},
+        {"time_position", timePositionNames, timePositionTypes, "host-context"},
+        {"tempo", tempoNames, tempoTypes, "host-context"},
+        {"musical_position", musicalPositionNames, musicalPositionTypes,
+         "host-context"},
+        {"bar_position", barPositionNames, barPositionTypes, "host-context"},
+        {"time_signature", timeSignatureNames, timeSignatureTypes,
+         "host-context"},
+        {"loop_region", loopRegionNames, loopRegionTypes, "host-context"},
+        {"render_mode", renderModeNames, renderModeTypes, "host-context"},
+    }};
+
+std::size_t primitiveBytes(const int primitive) noexcept {
+  switch (primitive) {
+  case ONDA_PRIMITIVE_BOOL:
+    return sizeof(bool);
+  case ONDA_PRIMITIVE_F32:
+    return sizeof(float);
+  case ONDA_PRIMITIVE_F64:
+    return sizeof(double);
+  case ONDA_PRIMITIVE_I32:
+    return sizeof(std::int32_t);
+  case ONDA_PRIMITIVE_I64:
+    return sizeof(std::int64_t);
+  default:
+    return 0U;
+  }
+}
+
+bool validateEvent(const onda_program_t *program, const ExpectedEvent &expected,
+                   const Product product, PreparedEngine::EventBinding &binding,
+                   Diagnostic &diagnostic) {
+  const std::string name(expected.name);
+  const auto index = onda_event_index(program, name.c_str());
+  if (index < 0) {
+    if (product == Product::instrument && expected.requiredForInstrument) {
+      diagnostic =
+          error("The instrument requires exact note_on and note_off events");
+      return false;
+    }
+    return true;
+  }
+
+  const auto parameterCount = onda_event_param_count(program, index);
+  if (parameterCount != static_cast<int>(expected.parameterNames.size()) ||
+      expected.parameterNames.size() > binding.offsets.size()) {
+    diagnostic = error("Canonical " + std::string(expected.category) +
+                       " event '" + name + "' has an incompatible payload");
+    return false;
+  }
+
+  for (int parameter = 0; parameter < parameterCount; ++parameter) {
+    const auto *parameterName =
+        onda_event_param_name(program, index, parameter);
+    const auto arrayLength =
+        onda_event_param_array_len(program, index, parameter);
+    if (parameterName == nullptr ||
+        expected.parameterNames[static_cast<std::size_t>(parameter)] !=
+            parameterName ||
+        onda_event_param_elem_type(program, index, parameter) !=
+            expected.parameterTypes[static_cast<std::size_t>(parameter)] ||
+        onda_event_param_is_slice(program, index, parameter) != 0 ||
+        arrayLength != 1) {
+      diagnostic = error("Canonical " + std::string(expected.category) +
+                         " event '" + name + "' has an incompatible payload");
+      return false;
+    }
+    binding.offsets[static_cast<std::size_t>(parameter)] =
+        onda_event_param_offset_bytes(program, index, parameter);
+  }
+
+  binding.index = index;
+  binding.payloadBytes = onda_event_payload_bytes(program, index);
+  if (binding.payloadBytes <= 0 || binding.payloadBytes > 32) {
+    diagnostic = error("Canonical " + std::string(expected.category) +
+                       " event '" + name + "' has an invalid packed payload");
+    return false;
+  }
+  for (int parameter = 0; parameter < parameterCount; ++parameter) {
+    const auto offset = binding.offsets[static_cast<std::size_t>(parameter)];
+    const auto bytes = primitiveBytes(
+        expected.parameterTypes[static_cast<std::size_t>(parameter)]);
+    if (bytes == 0U || offset < 0 ||
+        static_cast<std::size_t>(offset) + bytes >
+            static_cast<std::size_t>(binding.payloadBytes)) {
+      diagnostic = error("Canonical " + std::string(expected.category) +
+                         " event '" + name + "' has an invalid packed payload");
+      return false;
+    }
+  }
+  return true;
+}
+
+template <typename Value>
+bool writePayload(std::array<std::byte, 32U> &payload, const int payloadBytes,
+                  const int offset, const Value value) noexcept {
+  if (offset < 0 || static_cast<std::size_t>(offset) + sizeof(Value) >
+                        static_cast<std::size_t>(payloadBytes)) {
+    return false;
+  }
+  std::memcpy(payload.data() + offset, &value, sizeof(Value));
+  return true;
+}
+
+template <typename... Values>
+bool triggerEvent(onda_instance_t *const instance,
+                  const PreparedEngine::EventBinding &binding,
+                  const Values... values) noexcept {
+  if (binding.index < 0)
+    return true;
+  std::array<std::byte, 32U> payload{};
+  std::size_t index = 0U;
+  const auto valid = (writePayload(payload, binding.payloadBytes,
+                                   binding.offsets[index++], values) &&
+                      ...);
+  return valid && onda_trigger_event_by_index_unchecked(
+                      instance, binding.index, payload.data(),
+                      binding.payloadBytes) == 0;
+}
+
+} // namespace
+
+PreparedEngine::PreparedEngine(
+    Product product, const double sampleRate, const int blockSize,
+    ProgramHandle program, InstanceHandle instance, const int inputChannels,
+    const int outputChannels, std::vector<float> inputSlab,
+    std::vector<float> outputSlab, std::vector<BufferStorage> bufferStorage,
+    std::vector<BufferMapping> bufferMappings) noexcept
+    : product_(product), sampleRate_(sampleRate), blockSize_(blockSize),
+      program_(std::move(program)), inputChannels_(inputChannels),
+      outputChannels_(outputChannels), inputSlab_(std::move(inputSlab)),
+      outputSlab_(std::move(outputSlab)),
+      bufferStorage_(std::move(bufferStorage)), instance_(std::move(instance)),
+      bufferMappings_(std::move(bufferMappings)) {}
+
+BuildResult
+PreparedEngine::build(const std::filesystem::path &path, const Product product,
+                      const double sampleRate, const int blockSize,
+                      const std::span<const BufferFileBinding> bufferBindings) {
+  return build(compileFile(path, sampleRate, blockSize), product, sampleRate,
+               blockSize, bufferBindings, path);
+}
+
+BuildResult PreparedEngine::build(const ProjectImage &projectImage,
+                                  const Product product,
+                                  const double sampleRate,
+                                  const int blockSize) {
+  return build(compileProjectImage(projectImage, sampleRate, blockSize),
+               product, sampleRate, blockSize, {}, {});
+}
+
+BuildResult
+PreparedEngine::build(CompileResult compiled, const Product product,
+                      const double sampleRate, const int blockSize,
+                      const std::span<const BufferFileBinding> bufferBindings,
+                      const std::filesystem::path &diskEntry) {
+  BuildResult result;
+  result.projectImage = compiled.projectImage;
+  result.watchPaths = std::move(compiled.watchPaths);
+  result.diagnostic = std::move(compiled.diagnostic);
+  if (!compiled.program)
+    return result;
+  const auto hasProjectDefaults = result.projectImage.valid();
+
+  Diagnostic diagnostic;
+  const auto inputs =
+      flattenedChannels(compiled.program.get(), true, diagnostic);
+  const auto outputs =
+      flattenedChannels(compiled.program.get(), false, diagnostic);
+  if (inputs < 0 || outputs < 0) {
+    result.diagnostic = std::move(diagnostic);
+    return result;
+  }
+  if (product == Product::instrument && inputs != 0) {
+    result.diagnostic =
+        error("An Onda instrument must declare no audio inputs");
+    return result;
+  }
+
+  const auto bufferCount = onda_buffer_count(compiled.program.get());
+  if (bufferCount < 0) {
+    result.diagnostic = error("Onda returned invalid buffer metadata");
+    return result;
+  }
+  std::vector<BufferStorage> bufferStorage(
+      static_cast<std::size_t>(bufferCount));
+  std::vector<BufferMapping> bufferMappings;
+  bufferMappings.reserve(static_cast<std::size_t>(bufferCount));
+  std::vector<ProjectBufferAsset> projectBufferAssets;
+  projectBufferAssets.reserve(static_cast<std::size_t>(bufferCount));
+  std::string bufferError;
+  for (int index = 0; index < bufferCount; ++index) {
+    const auto *rawName = onda_buffer_name(compiled.program.get(), index);
+    const auto *rawType = onda_buffer_type(compiled.program.get(), index);
+    const auto rawKind =
+        onda_buffer_channels_kind(compiled.program.get(), index);
+    if (rawName == nullptr || rawType == nullptr ||
+        onda_buffer_elem_type(compiled.program.get(), index) < 0 ||
+        (rawKind != ONDA_BUFFER_CHANNELS_MONO &&
+         rawKind != ONDA_BUFFER_CHANNELS_STATIC &&
+         rawKind != ONDA_BUFFER_CHANNELS_DYNAMIC)) {
+      result.diagnostic = error("Onda returned invalid buffer metadata");
+      return result;
+    }
+
+    BufferMapping mapping;
+    mapping.index = index;
+    mapping.name = rawName;
+    mapping.type = rawType;
+    mapping.channelKind = rawKind == ONDA_BUFFER_CHANNELS_MONO
+                              ? BufferChannelKind::mono
+                              : (rawKind == ONDA_BUFFER_CHANNELS_STATIC
+                                     ? BufferChannelKind::fixed
+                                     : BufferChannelKind::dynamic);
+    if (mapping.channelKind == BufferChannelKind::fixed) {
+      mapping.fixedChannels =
+          onda_buffer_channels_static(compiled.program.get(), index);
+      if (mapping.fixedChannels <= 0) {
+        result.diagnostic = error("Onda returned invalid buffer metadata");
+        return result;
+      }
+    }
+
+    const auto binding = std::ranges::find(bufferBindings, mapping.name,
+                                           &BufferFileBinding::name);
+    if (binding == bufferBindings.end() || binding->path.empty()) {
+      if (!hasProjectDefaults) {
+        if (bufferError.empty())
+          bufferError = "Buffer '" + mapping.name + "' is not bound";
+        bufferMappings.push_back(std::move(mapping));
+        continue;
+      }
+
+      const auto asset = std::ranges::find(
+          compiled.projectBuffers, mapping.name, &ProjectBufferInfo::name);
+      if (asset == compiled.projectBuffers.end()) {
+        if (bufferError.empty())
+          bufferError =
+              "Buffer '" + mapping.name + "' is missing from the saved project";
+      } else if (asset->elementType != ONDA_PRIMITIVE_F32 ||
+                 asset->frames > std::numeric_limits<int>::max() ||
+                 asset->channels > std::numeric_limits<int>::max()) {
+        if (bufferError.empty())
+          bufferError = "Saved project buffer '" + mapping.name +
+                        "' is not a supported f32 audio buffer";
+      } else {
+        mapping.loadedFrames = static_cast<int>(asset->frames);
+        mapping.loadedChannels = static_cast<int>(asset->channels);
+        mapping.loadedSampleRate = asset->sampleRate;
+      }
+      bufferMappings.push_back(std::move(mapping));
+      continue;
+    }
+
+    result.watchPaths.push_back(binding->path);
+    if (onda_buffer_elem_type(compiled.program.get(), index) !=
+        ONDA_PRIMITIVE_F32) {
+      if (bufferError.empty()) {
+        bufferError = "Audio-file bindings require an f32 Onda buffer, but '" +
+                      mapping.name + "' is " + mapping.type;
+      }
+      bufferMappings.push_back(std::move(mapping));
+      continue;
+    }
+
+    auto decoded = decodeAudioFile(binding->path);
+    if (!decoded.audio) {
+      if (bufferError.empty())
+        bufferError = std::move(decoded.error);
+      bufferMappings.push_back(std::move(mapping));
+      continue;
+    }
+    const auto expectedChannels =
+        mapping.channelKind == BufferChannelKind::mono
+            ? 1
+            : (mapping.channelKind == BufferChannelKind::fixed
+                   ? mapping.fixedChannels
+                   : decoded.audio->channels);
+    if (decoded.audio->channels != expectedChannels) {
+      if (bufferError.empty()) {
+        bufferError = "Audio file for buffer '" + mapping.name + "' has " +
+                      std::to_string(decoded.audio->channels) +
+                      " channels; expected " + std::to_string(expectedChannels);
+      }
+      bufferMappings.push_back(std::move(mapping));
+      continue;
+    }
+
+    auto &storage = bufferStorage[static_cast<std::size_t>(index)];
+    storage.samples = std::move(decoded.audio->interleavedSamples);
+    storage.frames = decoded.audio->frames;
+    storage.channels = decoded.audio->channels;
+    storage.sampleRate = decoded.audio->sampleRate;
+    mapping.loadedPath = binding->path;
+    mapping.loadedFrames = storage.frames;
+    mapping.loadedChannels = storage.channels;
+    mapping.loadedSampleRate = storage.sampleRate;
+    Diagnostic assetDiagnostic;
+    auto encoded =
+        encodeF32BufferAsset(storage.samples, storage.frames, storage.channels,
+                             storage.sampleRate, assetDiagnostic);
+    if (encoded.empty()) {
+      if (bufferError.empty())
+        bufferError = std::move(assetDiagnostic.message);
+    } else {
+      projectBufferAssets.push_back(
+          {.name = mapping.name, .encodedBytes = std::move(encoded)});
+    }
+    bufferMappings.push_back(std::move(mapping));
+  }
+  if (!bufferError.empty()) {
+    result.buffers = std::move(bufferMappings);
+    result.diagnostic = error(std::move(bufferError));
+    return result;
+  }
+
+  OndaDiagnostic rawDiagnostic;
+  InstanceHandle instance{onda_instance_create(
+      compiled.program.get(), inputs, outputs, rawDiagnostic.outParameter())};
+  result.diagnostic = rawDiagnostic.copy();
+  if (!instance) {
+    if (result.diagnostic.empty())
+      result.diagnostic = error("Failed to create the Onda runtime instance");
+    return result;
+  }
+
+  const auto slabSize = [blockSize](const int channels) {
+    return static_cast<std::size_t>(channels) *
+           static_cast<std::size_t>(blockSize);
+  };
+  const auto inputSamples = slabSize(inputs);
+  const auto outputSamples = slabSize(outputs);
+  const auto maximumSamples = std::vector<float>{}.max_size();
+  if (inputSamples > maximumSamples || outputSamples > maximumSamples) {
+    result.diagnostic = error("The prepared audio slab is too large");
+    return result;
+  }
+  std::vector<float> inputSlab(inputSamples);
+  std::vector<float> outputSlab(outputSamples);
+  auto engine = std::unique_ptr<PreparedEngine>(new PreparedEngine(
+      product, sampleRate, blockSize, std::move(compiled.program),
+      std::move(instance), inputs, outputs, std::move(inputSlab),
+      std::move(outputSlab), std::move(bufferStorage),
+      std::move(bufferMappings)));
+
+  if (!bindAudio(engine->instance_.get(), engine->program_.get(),
+                 engine->inputSlab_, true, blockSize, result.diagnostic) ||
+      !bindAudio(engine->instance_.get(), engine->program_.get(),
+                 engine->outputSlab_, false, blockSize, result.diagnostic)) {
+    return result;
+  }
+  for (int index = 0; index < bufferCount; ++index) {
+    auto &storage = engine->bufferStorage_[static_cast<std::size_t>(index)];
+    if (!storage.samples.empty()) {
+      if (onda_bind_buffer(engine->instance_.get(), index,
+                           storage.samples.data(), storage.frames,
+                           storage.channels, storage.sampleRate,
+                           ONDA_PRIMITIVE_F32) != 0) {
+        result.diagnostic = error(
+            "Failed to bind audio file for Onda buffer '" +
+            engine->bufferMappings_[static_cast<std::size_t>(index)].name +
+            "'");
+        return result;
+      }
+    }
+  }
+  if (onda_prepare_unchecked_process(engine->instance_.get()) != 0) {
+    if (result.diagnostic.empty())
+      result.diagnostic = error("Failed to prepare unchecked Onda processing");
+    return result;
+  }
+
+  const auto parameterCount = onda_param_count(engine->program_.get());
+  if (parameterCount < 0) {
+    result.diagnostic = error("Onda returned invalid parameter metadata");
+    return result;
+  }
+  for (int index = 0;
+       index < parameterCount && engine->parameterMappingCount_ < slotCount;
+       ++index) {
+    auto mapping = parameterMapping(engine->program_.get(), index);
+    if (!mapping)
+      continue;
+    engine->parameterMappings_[engine->parameterMappingCount_++] =
+        std::move(*mapping);
+  }
+
+  for (std::size_t index = 0; index < expectedMidiEvents.size(); ++index) {
+    if (!validateEvent(engine->program_.get(), expectedMidiEvents[index],
+                       product, engine->midiEvents_[index],
+                       result.diagnostic)) {
+      return result;
+    }
+  }
+  for (std::size_t index = 0; index < expectedHostContextEvents.size();
+       ++index) {
+    if (!validateEvent(engine->program_.get(), expectedHostContextEvents[index],
+                       product, engine->hostContextEvents_[index],
+                       result.diagnostic)) {
+      return result;
+    }
+    if (index < static_cast<std::size_t>(HostContextKind::renderMode) &&
+        engine->hostContextEvents_[index].index >= 0) {
+      engine->needsPositionInfo_ = true;
+    }
+  }
+
+  if (!result.projectImage.valid()) {
+    result.projectImage =
+        captureProjectImage(diskEntry, compiled.manifest.get(),
+                            projectBufferAssets, result.diagnostic);
+    if (!result.projectImage.valid())
+      return result;
+  }
+
+  result.diagnostic = {};
+  result.engine = std::move(engine);
+  return result;
+}
+
+void PreparedEngine::applyParameters(
+    const std::array<std::atomic<float> *, slotCount> &slots) noexcept {
+  for (std::size_t index = 0; index < parameterMappingCount_; ++index) {
+    const auto value = slots[index]->load(std::memory_order_relaxed);
+    const auto normalized =
+        std::isfinite(value) ? std::clamp(value, 0.0F, 1.0F) : 0.5F;
+    static_cast<void>(onda_set_param_normalized(
+        instance_.get(), parameterMappings_[index].parameterIndex,
+        static_cast<double>(normalized)));
+  }
+}
+
+bool PreparedEngine::ensureBlockStarted(
+    const std::array<std::atomic<float> *, slotCount> &slots,
+    const HostContext &hostContext, const int hostCallbackOffset) noexcept {
+  if (logicalFrame_ == 0 && !blockStarted_) {
+    applyParameters(slots);
+    if (!dispatchHostContext(hostContext, hostCallbackOffset))
+      return false;
+    blockStarted_ = true;
+  }
+  return true;
+}
+
+bool PreparedEngine::processSegment(
+    float *const *hostInputs, float *const *hostOutputs,
+    const int callbackOffset, const int frames,
+    const std::array<std::atomic<float> *, slotCount> &slots,
+    const HostContext &hostContext, const int hostCallbackOffset) noexcept {
+  for (int channel = 0; channel < inputChannels_; ++channel) {
+    auto *destination =
+        inputSlab_.data() + channel * blockSize_ + logicalFrame_;
+    if (hostInputs != nullptr && hostInputs[channel] != nullptr) {
+      std::copy_n(hostInputs[channel] + callbackOffset, frames, destination);
+    } else {
+      std::fill_n(destination, frames, 0.0F);
+    }
+  }
+
+  for (int channel = 0; channel < 2; ++channel)
+    std::fill_n(hostOutputs[channel] + callbackOffset, frames, 0.0F);
+  for (int channel = 0; channel < outputChannels_; ++channel) {
+    std::fill_n(outputSlab_.data() + channel * blockSize_ + logicalFrame_,
+                frames, 0.0F);
+  }
+
+  int flags = 0;
+  if (logicalFrame_ == 0) {
+    flags |= ONDA_PROCESS_BEGIN_BLOCK;
+    if (!ensureBlockStarted(slots, hostContext,
+                            hostCallbackOffset + callbackOffset)) {
+      return false;
+    }
+  }
+  if (logicalFrame_ + frames == blockSize_)
+    flags |= ONDA_PROCESS_END_BLOCK;
+
+  if (onda_process_unchecked_segment(instance_.get(), logicalFrame_, frames,
+                                     flags) != 0) {
+    return false;
+  }
+
+  for (int channel = 0; channel < outputChannels_; ++channel) {
+    std::copy_n(outputSlab_.data() + channel * blockSize_ + logicalFrame_,
+                frames, hostOutputs[channel] + callbackOffset);
+  }
+  logicalFrame_ += frames;
+  if (logicalFrame_ == blockSize_) {
+    logicalFrame_ = 0;
+    blockStarted_ = false;
+  }
+  return true;
+}
+
+bool PreparedEngine::handlesMidi(const MidiKind kind) const noexcept {
+  const auto index = static_cast<std::size_t>(kind);
+  return index < midiEvents_.size() && midiEvents_[index].index >= 0;
+}
+
+bool PreparedEngine::handlesHostContext(
+    const HostContextKind kind) const noexcept {
+  const auto index = static_cast<std::size_t>(kind);
+  return index < hostContextEvents_.size() &&
+         hostContextEvents_[index].index >= 0;
+}
+
+bool PreparedEngine::dispatch(const MidiEvent &event) noexcept {
+  const auto kind = static_cast<std::size_t>(event.kind);
+  if (kind >= midiEvents_.size())
+    return false;
+  const auto &binding = midiEvents_[kind];
+  switch (event.kind) {
+  case MidiKind::noteOn:
+  case MidiKind::noteOff:
+    return triggerEvent(instance_.get(), binding, std::int32_t{-1},
+                        event.channel, event.keyOrController, event.value);
+  case MidiKind::polyPressure:
+    return triggerEvent(instance_.get(), binding, event.channel,
+                        event.keyOrController, event.value);
+  case MidiKind::pitchBend:
+  case MidiKind::channelPressure:
+    return triggerEvent(instance_.get(), binding, event.channel, event.value);
+  case MidiKind::controlChange:
+    return triggerEvent(instance_.get(), binding, event.channel,
+                        event.keyOrController, event.value);
+  case MidiKind::programChange:
+    return triggerEvent(instance_.get(), binding, event.channel,
+                        event.keyOrController);
+  case MidiKind::count:
+    return false;
+  }
+  return false;
+}
+
+bool PreparedEngine::dispatchHostContext(
+    const HostContext &hostContext, const int hostCallbackOffset) noexcept {
+  const auto binding = [this](const HostContextKind event) -> const auto & {
+    return hostContextEvents_[static_cast<std::size_t>(event)];
+  };
+
+  if (handlesHostContext(HostContextKind::transport) && hostContext.transport &&
+      !triggerEvent(instance_.get(), binding(HostContextKind::transport),
+                    hostContext.transport->playing,
+                    hostContext.transport->recording,
+                    hostContext.transport->looping)) {
+    return false;
+  }
+
+  if (handlesHostContext(HostContextKind::samplePosition) &&
+      hostContext.samplePosition) {
+    const auto sample = *hostContext.samplePosition;
+    if (hostCallbackOffset <= 0 ||
+        sample <=
+            std::numeric_limits<std::int64_t>::max() - hostCallbackOffset) {
+      const auto projected =
+          sample + static_cast<std::int64_t>(std::max(hostCallbackOffset, 0));
+      if (!triggerEvent(instance_.get(),
+                        binding(HostContextKind::samplePosition), projected)) {
+        return false;
+      }
+    }
+  }
+
+  const auto needsSecondsOffset =
+      hostCallbackOffset != 0 &&
+      ((handlesHostContext(HostContextKind::timePosition) &&
+        hostContext.timePosition.has_value()) ||
+       (handlesHostContext(HostContextKind::musicalPosition) &&
+        hostContext.musicalPosition.has_value()));
+  const auto secondsOffset =
+      needsSecondsOffset ? static_cast<double>(hostCallbackOffset) / sampleRate_
+                         : 0.0;
+  if (handlesHostContext(HostContextKind::timePosition) &&
+      hostContext.timePosition) {
+    const auto projected = *hostContext.timePosition + secondsOffset;
+    if (std::isfinite(projected) &&
+        !triggerEvent(instance_.get(), binding(HostContextKind::timePosition),
+                      projected)) {
+      return false;
+    }
+  }
+
+  if (handlesHostContext(HostContextKind::tempo) && hostContext.tempo &&
+      std::isfinite(*hostContext.tempo) && *hostContext.tempo > 0.0 &&
+      !triggerEvent(instance_.get(), binding(HostContextKind::tempo),
+                    *hostContext.tempo)) {
+    return false;
+  }
+
+  if (handlesHostContext(HostContextKind::musicalPosition) &&
+      hostContext.musicalPosition) {
+    auto projected = *hostContext.musicalPosition;
+    if (hostCallbackOffset != 0) {
+      if (!hostContext.tempo || !std::isfinite(*hostContext.tempo) ||
+          *hostContext.tempo <= 0.0) {
+        projected = std::numeric_limits<double>::quiet_NaN();
+      } else {
+        projected += secondsOffset * *hostContext.tempo / 60.0;
+      }
+    }
+    if (std::isfinite(projected) &&
+        !triggerEvent(instance_.get(),
+                      binding(HostContextKind::musicalPosition), projected)) {
+      return false;
+    }
+  }
+
+  if (handlesHostContext(HostContextKind::barPosition) &&
+      hostContext.barPosition && std::isfinite(*hostContext.barPosition) &&
+      !triggerEvent(instance_.get(), binding(HostContextKind::barPosition),
+                    *hostContext.barPosition)) {
+    return false;
+  }
+
+  if (handlesHostContext(HostContextKind::timeSignature) &&
+      hostContext.timeSignature && hostContext.timeSignature->numerator > 0 &&
+      hostContext.timeSignature->denominator > 0 &&
+      !triggerEvent(instance_.get(), binding(HostContextKind::timeSignature),
+                    hostContext.timeSignature->numerator,
+                    hostContext.timeSignature->denominator)) {
+    return false;
+  }
+
+  if (handlesHostContext(HostContextKind::loopRegion) &&
+      hostContext.loopRegion &&
+      std::isfinite(hostContext.loopRegion->startQuarterNote) &&
+      std::isfinite(hostContext.loopRegion->endQuarterNote) &&
+      !triggerEvent(instance_.get(), binding(HostContextKind::loopRegion),
+                    hostContext.loopRegion->startQuarterNote,
+                    hostContext.loopRegion->endQuarterNote)) {
+    return false;
+  }
+
+  return !handlesHostContext(HostContextKind::renderMode) ||
+         triggerEvent(instance_.get(), binding(HostContextKind::renderMode),
+                      hostContext.realtime);
+}
+
+bool PreparedEngine::process(
+    float *const *hostInputs, float *const *hostOutputs, const int frames,
+    const std::span<const MidiEvent> midi,
+    const std::array<std::atomic<float> *, slotCount> &slots,
+    const HostContext &hostContext, const int hostCallbackOffset) noexcept {
+  if (frames < 0 || frames > blockSize_ || hostCallbackOffset < 0)
+    return false;
+
+  int position = 0;
+  std::size_t eventIndex = 0;
+  while (position < frames) {
+    while (eventIndex < midi.size() &&
+           midi[eventIndex].sampleOffset <=
+               static_cast<std::uint32_t>(position)) {
+      if (!ensureBlockStarted(slots, hostContext,
+                              hostCallbackOffset + position)) {
+        return false;
+      }
+      if (!dispatch(midi[eventIndex]))
+        return false;
+      ++eventIndex;
+    }
+
+    auto next = frames;
+    if (eventIndex < midi.size()) {
+      next = std::min(next, static_cast<int>(std::min<std::uint32_t>(
+                                midi[eventIndex].sampleOffset,
+                                static_cast<std::uint32_t>(frames))));
+    }
+    next = std::min(next, position + blockSize_ - logicalFrame_);
+    if (next == position)
+      continue;
+    if (!processSegment(hostInputs, hostOutputs, position, next - position,
+                        slots, hostContext, hostCallbackOffset)) {
+      return false;
+    }
+    position = next;
+  }
+
+  while (eventIndex < midi.size() &&
+         midi[eventIndex].sampleOffset <= static_cast<std::uint32_t>(frames)) {
+    if (!ensureBlockStarted(slots, hostContext, hostCallbackOffset + frames)) {
+      return false;
+    }
+    if (!dispatch(midi[eventIndex]))
+      return false;
+    ++eventIndex;
+  }
+  return true;
+}
+
+void PreparedEngine::reset() noexcept {
+  logicalFrame_ = 0;
+  blockStarted_ = false;
+  static_cast<void>(onda_reset_instance_state(instance_.get()));
+}
+
+} // namespace onda::plugin
