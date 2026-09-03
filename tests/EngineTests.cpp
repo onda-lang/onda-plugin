@@ -14,6 +14,7 @@
 #include <fstream>
 #include <functional>
 #include <iostream>
+#include <limits>
 #include <mutex>
 #include <string_view>
 #include <thread>
@@ -214,6 +215,27 @@ sample {
 )");
   }
 
+  void writeRuntimeOutputEffect() const {
+    writeText(R"(
+outs { out1 }
+const Bins: f32[2] = [0.25, 0.5]
+const Steps: i32[2] = [3, 5]
+delegate observed(value: i32, exact: i64, active: bool, bins: f32[2], steps: i32[])
+init {
+  pin preserved = i32(0)
+  transient = i32(0)
+  print("init", preserved, transient)
+}
+sample {
+  preserved = preserved + 1
+  transient = transient + 1
+  print("sample", preserved, transient)
+  observed(preserved, i64(9007199254740993), true, Bins, Steps)
+  out1 = f32(preserved * 10 + transient)
+}
+)");
+  }
+
   ~TemporarySource() {
     std::error_code ignored;
     std::filesystem::remove(path_, ignored);
@@ -278,6 +300,19 @@ bool produces(onda::plugin::PreparedEngine &engine, const float expected) {
          std::all_of(right.begin(), right.end(), [expected](const float value) {
            return close(value, expected);
          });
+}
+
+std::vector<onda::plugin::RuntimeLogEntry>
+drain(onda::plugin::RuntimeLogSink &sink) {
+  std::vector<onda::plugin::RuntimeLogEntry> entries;
+  onda::plugin::RuntimeLogEntry entry;
+  while (sink.tryPop(entry))
+    entries.push_back(entry);
+  return entries;
+}
+
+std::string text(const onda::plugin::RuntimeLogEntry &entry) {
+  return {entry.text.data(), entry.textBytes};
 }
 
 std::mutex retirementAuditMutex;
@@ -392,6 +427,152 @@ int main() {
 
   built.engine.reset();
 
+  source.writeRuntimeOutputEffect();
+  auto runtimeOutput = onda::plugin::PreparedEngine::build(
+      source.path(), onda::plugin::Product::effect, 48'000.0, 8);
+  if (!runtimeOutput.engine) {
+    std::cerr << "runtime-output effect failed to build: "
+              << runtimeOutput.diagnostic.message << '\n';
+    return 1;
+  }
+  onda::plugin::RuntimeLogSink runtimeLog;
+  for (std::size_t index = 0;
+       index + 1U < onda::plugin::runtimeLogQueueCapacity; ++index) {
+    if (!runtimeLog.tryEmplace(
+            onda::plugin::RuntimeLogKind::print, 1U,
+            [](onda::plugin::RuntimeLogEntry &entry) noexcept {
+              entry.text[0] = 'x';
+              entry.textBytes = 1U;
+              return true;
+            })) {
+      std::cerr << "runtime log fixture filled too early\n";
+      return 1;
+    }
+  }
+  runtimeOutput.engine->attachLogSink(runtimeLog);
+  auto logEntries = drain(runtimeLog);
+  if (logEntries.size() + 1U != onda::plugin::runtimeLogQueueCapacity) {
+    std::cerr << "runtime log fixture was not drained completely\n";
+    return 1;
+  }
+
+  std::array<float, 1U> loggedLeft{};
+  std::array<float, 1U> loggedRight{};
+  std::array<float *, 2U> loggedOutputs{loggedLeft.data(), loggedRight.data()};
+  if (!runtimeOutput.engine->process(nullptr, loggedOutputs.data(), 1, {},
+                                     slots) ||
+      !close(loggedLeft[0], 11.0F)) {
+    std::cerr << "runtime-output effect did not process its first frame\n";
+    return 1;
+  }
+  logEntries = drain(runtimeLog);
+  if (logEntries.size() != 3U ||
+      logEntries[0].kind != onda::plugin::RuntimeLogKind::print ||
+      text(logEntries[0]) != "init: 0 0" ||
+      logEntries[0].sourceFileBytes == 0U ||
+      logEntries[0].lexicalOwnerBytes == 0U ||
+      logEntries[1].kind != onda::plugin::RuntimeLogKind::print ||
+      text(logEntries[1]) != "sample: 1 1" ||
+      logEntries[2].kind != onda::plugin::RuntimeLogKind::delegate ||
+      text(logEntries[2]) !=
+          "delegate observed: value=1 exact=9007199254740993 active=true "
+          "bins=[0.25, 0.5] steps=[3, 5]") {
+    std::cerr << "pending init and ordered runtime output were not captured\n";
+    return 1;
+  }
+
+  if (!runtimeOutput.engine->reset()) {
+    std::cerr << "preserve-pinned reset failed\n";
+    return 1;
+  }
+  logEntries = drain(runtimeLog);
+  if (logEntries.size() != 1U || text(logEntries[0]) != "init: 1 0") {
+    std::cerr << "reset init print did not retain pinned state\n";
+    return 1;
+  }
+  loggedLeft[0] = 0.0F;
+  loggedRight[0] = 0.0F;
+  if (!runtimeOutput.engine->process(nullptr, loggedOutputs.data(), 1, {},
+                                     slots) ||
+      !close(loggedLeft[0], 21.0F)) {
+    std::cerr << "preserve-pinned reset did not retain pinned state\n";
+    return 1;
+  }
+  runtimeOutput.engine.reset();
+
+  auto boundedLog = std::make_unique<onda::plugin::RuntimeLogSink>();
+  std::size_t formattedEntries{};
+  for (std::size_t index = 0;
+       index + 1U < onda::plugin::runtimeLogQueueCapacity; ++index) {
+    if (!boundedLog->tryEmplace(
+            onda::plugin::RuntimeLogKind::print, 7U,
+            [&formattedEntries](onda::plugin::RuntimeLogEntry &entry) noexcept {
+              ++formattedEntries;
+              entry.text[0] = 'x';
+              entry.textBytes = 1U;
+              return true;
+            })) {
+      std::cerr << "bounded runtime log filled too early\n";
+      return 1;
+    }
+  }
+  auto formatterCalledWhileFull = false;
+  if (boundedLog->tryEmplace(onda::plugin::RuntimeLogKind::print, 7U,
+                             [&formatterCalledWhileFull](
+                                 onda::plugin::RuntimeLogEntry &) noexcept {
+                               formatterCalledWhileFull = true;
+                               return true;
+                             }) ||
+      formatterCalledWhileFull ||
+      formattedEntries + 1U != onda::plugin::runtimeLogQueueCapacity) {
+    std::cerr << "full runtime log invoked its formatter\n";
+    return 1;
+  }
+  boundedLog->addTransportDrops(onda::plugin::RuntimeLogKind::print,
+                                std::numeric_limits<std::uint64_t>::max());
+  boundedLog->addTransportDrops(onda::plugin::RuntimeLogKind::print);
+  if (boundedLog->counterTotals(boundedLog->epoch()).printTransportDrops !=
+      std::numeric_limits<std::uint64_t>::max()) {
+    std::cerr << "runtime log counters did not saturate\n";
+    return 1;
+  }
+  boundedLog->addTransportDrops(onda::plugin::RuntimeLogKind::delegate, 2U);
+  const auto previousEpoch = boundedLog->epoch();
+  const auto firstCounterSnapshot = boundedLog->counterTotals(previousEpoch);
+  const auto secondCounterSnapshot = boundedLog->counterTotals(previousEpoch);
+  if (firstCounterSnapshot.delegateTransportDrops != 2U ||
+      secondCounterSnapshot.delegateTransportDrops != 2U) {
+    std::cerr << "runtime log counter snapshot was destructive\n";
+    return 1;
+  }
+  static_cast<void>(boundedLog->beginEpoch());
+  boundedLog->addTransportDrops(onda::plugin::RuntimeLogKind::delegate, 3U);
+  if (boundedLog->counterTotals(previousEpoch).delegateTransportDrops != 0U ||
+      boundedLog->counterTotals(boundedLog->epoch()).delegateTransportDrops !=
+          3U) {
+    std::cerr << "runtime log counters crossed an epoch boundary\n";
+    return 1;
+  }
+
+  onda::plugin::RuntimeLogSink epochLog;
+  const auto entryEpoch = epochLog.epoch();
+  if (!epochLog.tryEmplace(
+          onda::plugin::RuntimeLogKind::print, 8U,
+          [&epochLog](onda::plugin::RuntimeLogEntry &entry) noexcept {
+            static_cast<void>(epochLog.beginEpoch());
+            entry.text[0] = 'x';
+            entry.textBytes = 1U;
+            return true;
+          })) {
+    std::cerr << "runtime log epoch fixture was not published\n";
+    return 1;
+  }
+  auto epochEntries = drain(epochLog);
+  if (epochEntries.size() != 1U || epochEntries[0].epoch != entryEpoch) {
+    std::cerr << "in-flight runtime output crossed an epoch boundary\n";
+    return 1;
+  }
+
   source.writeFaultingEffect();
   auto faulting = onda::plugin::PreparedEngine::build(
       source.path(), onda::plugin::Product::effect, 48'000.0, 8);
@@ -459,7 +640,10 @@ int main() {
     }
   }
 
-  instrument.engine->reset();
+  if (!instrument.engine->reset()) {
+    std::cerr << "instrument reset failed\n";
+    return 1;
+  }
   instrumentLeft.fill(0.0F);
   instrumentRight.fill(0.0F);
   const std::array<onda::plugin::MidiEvent, 5U> controllerEvents{{
@@ -515,7 +699,10 @@ int main() {
     }
   }
 
-  instrument.engine->reset();
+  if (!instrument.engine->reset()) {
+    std::cerr << "instrument reset failed\n";
+    return 1;
+  }
   instrumentLeft.fill(1.0F);
   instrumentRight.fill(1.0F);
   if (!instrument.engine->process(nullptr, instrumentOutputs.data(), 6, {},
@@ -625,10 +812,10 @@ int main() {
       };
   if (!expectRejected("ins { in1, in2, in3 }\nouts { out1, out2 }\n"
                       "sample { out1 = in1; out2 = in2 }\n",
-                      "at most two f32 channels") ||
+                      "at most 2 f32 channels") ||
       !expectRejected("ins { in1: f64 }\nouts { out1 }\n"
                       "sample { out1 = f32(in1) }\n",
-                      "at most two f32 channels")) {
+                      "at most 2 f32 channels")) {
     std::cerr << "unsupported plugin interface was not rejected\n";
     return 1;
   }

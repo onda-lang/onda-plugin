@@ -97,7 +97,7 @@ void Worker::configure(const double sampleRate, const int blockSize) {
     if (!desired_.path.empty() || desired_.fallbackProjectImage.valid()) {
       status_.message = "Waiting for host specialization";
       status_.compiling = false;
-      status_.active = false;
+      deactivateStatus();
       ++status_.revision;
     }
   }
@@ -120,9 +120,7 @@ void Worker::load(std::filesystem::path path, const bool seedDefaults,
     if (policy == ExistingEnginePolicy::deactivateImmediately) {
       publishedProjectState_ = {};
       seedValues_.reset();
-      status_.active = false;
-      status_.mappings.clear();
-      status_.buffers.clear();
+      clearPublishedInterface();
     }
     ++status_.revision;
   }
@@ -152,9 +150,7 @@ void Worker::loadWithBufferBindings(
     if (policy == ExistingEnginePolicy::deactivateImmediately) {
       publishedProjectState_ = {};
       seedValues_.reset();
-      status_.active = false;
-      status_.mappings.clear();
-      status_.buffers.clear();
+      clearPublishedInterface();
     }
     ++status_.revision;
   }
@@ -190,9 +186,7 @@ void Worker::restore(std::filesystem::path path, ProjectImage projectImage,
     status_.usingProjectImage = false;
     if (policy == ExistingEnginePolicy::deactivateImmediately) {
       seedValues_.reset();
-      status_.active = false;
-      status_.mappings.clear();
-      status_.buffers.clear();
+      clearPublishedInterface();
     }
     ++status_.revision;
   }
@@ -217,10 +211,8 @@ void Worker::unload() {
     status_.path.clear();
     status_.message = "No Onda file loaded";
     status_.compiling = false;
-    status_.active = false;
+    clearPublishedInterface();
     status_.usingProjectImage = false;
-    status_.mappings.clear();
-    status_.buffers.clear();
     ++status_.revision;
   }
   deactivateRequested_.store(true, std::memory_order_release);
@@ -276,7 +268,7 @@ void Worker::clearBuffer(const std::string_view name) {
     forceRebuild_ = true;
     status_.message = "Waiting for buffer binding";
     status_.compiling = false;
-    status_.active = false;
+    deactivateStatus();
     publishedProjectState_ = {};
     for (auto &buffer : status_.buffers) {
       if (buffer.name == name) {
@@ -332,6 +324,19 @@ void Worker::advanceGeneration() noexcept {
   replacementSeedPending_.store(false, std::memory_order_release);
 }
 
+void Worker::deactivateStatus() noexcept {
+  status_.active = false;
+  status_.engineGeneration = 0;
+}
+
+void Worker::clearPublishedInterface() noexcept {
+  deactivateStatus();
+  status_.mappings.clear();
+  status_.buffers.clear();
+  status_.events.clear();
+  status_.midi = {};
+}
+
 void Worker::reportFailure(const char *const message) noexcept {
   try {
     std::lock_guard lock(mutex_);
@@ -356,7 +361,8 @@ void Worker::collectRetired() noexcept { destroy(retirements_.tryPop()); }
 bool Worker::updateStatus(const Request &request, std::string message,
                           const bool compiling, const bool active,
                           std::optional<std::vector<ParameterMapping>> mappings,
-                          std::optional<std::vector<BufferMapping>> buffers) {
+                          std::optional<std::vector<BufferMapping>> buffers,
+                          std::optional<std::vector<EventMapping>> events) {
   std::lock_guard lock(mutex_);
   if (!matchesDesiredLocked(request)) {
     return false;
@@ -364,7 +370,10 @@ bool Worker::updateStatus(const Request &request, std::string message,
   status_.path = desired_.path;
   status_.message = std::move(message);
   status_.compiling = compiling;
-  status_.active = active;
+  if (active)
+    status_.active = true;
+  else
+    deactivateStatus();
   if (mappings)
     status_.mappings = std::move(*mappings);
   else if (!active)
@@ -373,6 +382,12 @@ bool Worker::updateStatus(const Request &request, std::string message,
     status_.buffers = std::move(*buffers);
   else if (!active)
     status_.buffers.clear();
+  if (events)
+    status_.events = std::move(*events);
+  else if (!active)
+    status_.events.clear();
+  if (!active)
+    status_.midi = {};
   ++status_.revision;
   return true;
 }
@@ -570,6 +585,12 @@ void Worker::build(const Request &request) {
       result.engine->parameterMappings().end());
   std::vector<BufferMapping> buffers(result.engine->bufferMappings().begin(),
                                      result.engine->bufferMappings().end());
+  std::vector<EventMapping> events(result.engine->eventMappings().begin(),
+                                   result.engine->eventMappings().end());
+  const MidiCapabilities midi{
+      .noteOn = result.engine->handlesMidi(MidiKind::noteOn),
+      .noteOff = result.engine->handlesMidi(MidiKind::noteOff),
+  };
   {
     std::lock_guard lock(mutex_);
     if (!matchesDesiredLocked(request)) {
@@ -619,8 +640,11 @@ void Worker::build(const Request &request) {
     status_.compiling = false;
     status_.active = true;
     status_.usingProjectImage = usingProjectImage;
+    status_.engineGeneration = request.generation;
     status_.mappings = std::move(mappings);
     status_.buffers = std::move(buffers);
+    status_.events = std::move(events);
+    status_.midi = midi;
     ++status_.revision;
     completedGeneration_ = request.generation;
   }

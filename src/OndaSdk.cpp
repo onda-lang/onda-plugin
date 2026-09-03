@@ -54,6 +54,8 @@ onda_compile_options_t compileOptions(const double sampleRate,
       .fast_math = 0,
       .sample_rate = static_cast<float>(sampleRate),
       .block_size = blockSize,
+      .const_inputs = nullptr,
+      .const_input_count = 0U,
   };
 }
 

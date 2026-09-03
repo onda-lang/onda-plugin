@@ -44,6 +44,30 @@ thread_local bool enabled{};
 std::atomic<std::uint64_t> count{};
 } // namespace lock_audit
 
+class StateChangeListener final : public juce::AudioProcessorListener {
+public:
+  explicit StateChangeListener(juce::AudioProcessor &processor)
+      : processor_(processor) {
+    processor_.addListener(this);
+  }
+
+  ~StateChangeListener() override { processor_.removeListener(this); }
+
+  void audioProcessorParameterChanged(juce::AudioProcessor *, int,
+                                      float) override {}
+
+  void audioProcessorChanged(juce::AudioProcessor *,
+                             const ChangeDetails &details) override {
+    if (details.nonParameterStateChanged)
+      ++nonParameterChanges;
+  }
+
+  int nonParameterChanges{};
+
+private:
+  juce::AudioProcessor &processor_;
+};
+
 #if defined(__linux__)
 extern "C" int __real_pthread_mutex_lock(pthread_mutex_t *mutex);
 extern "C" int __wrap_pthread_mutex_lock(pthread_mutex_t *mutex) {
@@ -266,6 +290,46 @@ sample {
 )";
 }
 
+constexpr auto runtimeLoggingEffectSource = R"(
+ins { in1, in2 }
+outs { out1, out2 }
+delegate observed(value: i32)
+init {
+  pin preserved = i32(0)
+  transient = i32(0)
+  flood = false
+  print("init", preserved, transient)
+}
+event note_on(id: i32, channel: i32, key: i32, velocity: f32) {
+  flood = true
+}
+sample {
+  if transient == 0 {
+    preserved = preserved + 1
+    transient = 1
+    print("sample", preserved, transient)
+    observed(preserved)
+  }
+  if flood {
+    print("flood", preserved)
+  }
+  out1 = in1 * 0.25
+  out2 = in2 * 0.25
+}
+)";
+
+constexpr auto replacementLoggingEffectSource = R"(
+ins { in1, in2 }
+outs { out1, out2 }
+init {
+  print("replacement init")
+}
+sample {
+  out1 = in1 * 0.5
+  out2 = in2 * 0.5
+}
+)";
+
 std::string faultingSource(const onda::plugin::Product product) {
   const auto interface =
       product == onda::plugin::Product::instrument
@@ -413,8 +477,26 @@ sample {
 }
 )";
 
+constexpr auto userEventEffectSource = R"(
+ins { in1, in2 }
+outs { out1, out2 }
+init { held = 0.125 }
+event note_on(id: i32, channel: i32, key: i32, velocity: f32) {}
+event tempo(bpm: f64) {}
+event shape(level: f32 = 0.25, offsets: i32[2] = [1, 2], enabled: bool = true, gains: f32[], token: i64 = 9007199254740993) {
+  held = 0.0
+  if enabled && token == 9007199254740993 {
+    held = level + f32(offsets[0]) + gains[0]
+  }
+}
+sample {
+  out1 = held
+  out2 = held
+}
+)";
+
 constexpr std::uint32_t stateMagic = 0x41444e4fU;
-constexpr int stateVersion = 2;
+constexpr int stateVersion = 3;
 
 bool waitForOutput(onda::plugin::Processor &processor, const float expected,
                    const int frames = 64) {
@@ -502,7 +584,9 @@ makeState(const juce::String &path, const juce::String &browseDirectory,
           const std::array<float, onda::plugin::slotCount> &values,
           const int width, const int height,
           const std::span<const std::pair<juce::String, juce::String>>
-              bufferBindings = {}) {
+              bufferBindings = {},
+          const onda::plugin::ParamControlLayout layout =
+              onda::plugin::ParamControlLayout::sliders) {
   juce::MemoryBlock state;
   juce::MemoryOutputStream stream(state, false);
   stream.writeInt(static_cast<int>(stateMagic));
@@ -519,6 +603,7 @@ makeState(const juce::String &path, const juce::String &browseDirectory,
     stream.writeFloat(value);
   stream.writeInt(width);
   stream.writeInt(height);
+  stream.writeBool(layout == onda::plugin::ParamControlLayout::knobs);
   return state;
 }
 
@@ -569,6 +654,20 @@ bool exerciseRunViewAdapter() {
     std::cerr << "embedded run-view resources were not served canonically\n";
     return false;
   }
+  const std::string_view html{
+      reinterpret_cast<const char *>(root->data.data() + 3U),
+      root->data.size() - 3U};
+  if (html.find("id=\"clear-log\"") == std::string_view::npos ||
+      html.find("state.logEntries") == std::string_view::npos ||
+      html.find("entry.source") == std::string_view::npos ||
+      html.find("delegateOverflowCount") == std::string_view::npos ||
+      html.find("id=\"midi-keyboard\"") == std::string_view::npos ||
+      html.find("midiKeyboardInteractive") == std::string_view::npos ||
+      html.find("setMonitoredMidiNotes(message.activeNotes)") ==
+          std::string_view::npos) {
+    std::cerr << "embedded run view does not contain the 0.8.2 UI\n";
+    return false;
+  }
 
   onda::plugin::Processor processor(onda::plugin::Product::effect);
   const auto message = onda::plugin::makeRunViewState(
@@ -590,10 +689,363 @@ bool exerciseRunViewAdapter() {
       static_cast<bool>(state->getProperty("supportsDeviceSelection")) ||
       static_cast<bool>(state->getProperty("supportsRunSettings")) ||
       !static_cast<bool>(state->getProperty("supportsReset")) ||
-      static_cast<bool>(state->getProperty("supportsScope")) ||
+      !static_cast<bool>(state->getProperty("supportsScope")) ||
+      static_cast<bool>(state->getProperty("midiKeyboardInteractive")) ||
+      state->getProperty("paramLayout").toString() != "sliders" ||
       static_cast<bool>(state->getProperty("canExportProject")) ||
+      static_cast<bool>(state->getProperty("logRevealed")) ||
+      state->getProperty("logText").toString().isNotEmpty() ||
+      state->getProperty("logEntries").getArray() == nullptr ||
+      static_cast<juce::int64>(state->getProperty("printOverflowCount")) != 0 ||
+      static_cast<juce::int64>(state->getProperty("delegateOverflowCount")) !=
+          0 ||
       state->getProperty("error").toString() != "adapter test error") {
     std::cerr << "run-view capability state was invalid\n";
+    return false;
+  }
+
+  onda::plugin::MidiActivitySnapshot activity;
+  activity.notes[0] = std::uint64_t{1} << 60U;
+  activity.notes[1] = std::uint64_t{1} << (127U - 64U);
+  const auto midiMessage = onda::plugin::makeRunViewMidiActivity(activity);
+  const auto *midiEnvelope = midiMessage.getDynamicObject();
+  const auto *activeNotes =
+      midiEnvelope == nullptr
+          ? nullptr
+          : midiEnvelope->getProperty("activeNotes").getArray();
+  if (midiEnvelope == nullptr ||
+      midiEnvelope->getProperty("type").toString() != "midiActivity" ||
+      activeNotes == nullptr || activeNotes->size() != 2 ||
+      static_cast<int>(activeNotes->getReference(0)) != 60 ||
+      static_cast<int>(activeNotes->getReference(1)) != 127) {
+    std::cerr << "run-view MIDI activity message was invalid\n";
+    return false;
+  }
+
+  processor.setParamControlLayout(onda::plugin::ParamControlLayout::knobs);
+  const auto knobMessage = onda::plugin::makeRunViewState(
+      processor, processor.workerStatus(), processor.canExportProject(), {});
+  const auto *knobEnvelope = knobMessage.getDynamicObject();
+  const auto knobStateValue = knobEnvelope == nullptr
+                                  ? juce::var{}
+                                  : knobEnvelope->getProperty("state");
+  const auto *knobState = knobStateValue.getDynamicObject();
+  if (knobState == nullptr ||
+      knobState->getProperty("paramLayout").toString() != "knobs") {
+    std::cerr << "run-view parameter layout state was invalid\n";
+    return false;
+  }
+
+  const auto scopeMessage = onda::plugin::makeRunViewScope(processor);
+  const auto *scope = scopeMessage.getDynamicObject();
+  if (scope == nullptr ||
+      scope->getProperty("type").toString() != "scopeData" ||
+      static_cast<int>(scope->getProperty("channels")) != 0 ||
+      scope->getProperty("samples").getArray() == nullptr ||
+      !scope->getProperty("samples").getArray()->isEmpty()) {
+    std::cerr << "empty run-view scope message was invalid\n";
+    return false;
+  }
+  return true;
+}
+
+bool exerciseUserEvents() {
+  TemporarySource source;
+  if (!source.write(userEventEffectSource))
+    return false;
+
+  onda::plugin::Processor processor(onda::plugin::Product::effect);
+  processor.prepareToPlay(48'000.0, 64);
+  processor.loadFile(juce::File(source.path().string()), false);
+  if (!waitForOutput(processor, 0.125F)) {
+    std::cerr << "user-event processor did not become active\n";
+    return false;
+  }
+
+  const auto status = processor.workerStatus();
+  if (status.events.size() != 1U || status.events[0].name != "shape" ||
+      status.events[0].parameters.size() != 5U ||
+      status.events[0].parameters[1].type != "i32[2]" ||
+      status.events[0].parameters[2].type != "bool" ||
+      status.events[0].parameters[3].type != "f32[]" ||
+      status.events[0].parameters[4].type != "i64") {
+    std::cerr << "plugin MIDI/host events were not filtered from the view\n";
+    return false;
+  }
+
+  const auto message = onda::plugin::makeRunViewState(
+      processor, status, processor.canExportProject(), {});
+  const auto *envelope = message.getDynamicObject();
+  const auto stateValue =
+      envelope == nullptr ? juce::var{} : envelope->getProperty("state");
+  const auto *state = stateValue.getDynamicObject();
+  const auto *events =
+      state == nullptr ? nullptr : state->getProperty("events").getArray();
+  const auto *event = events == nullptr || events->size() != 1
+                          ? nullptr
+                          : events->getReference(0).getDynamicObject();
+  const auto *arguments =
+      event == nullptr ? nullptr : event->getProperty("args").getArray();
+  if (event == nullptr || event->getProperty("name").toString() != "shape" ||
+      arguments == nullptr || arguments->size() != 5 ||
+      arguments->getReference(1).getDynamicObject()->getProperty("type") !=
+          "i32[2]" ||
+      !static_cast<bool>(
+          arguments->getReference(3).getDynamicObject()->getProperty(
+              "isSlice")) ||
+      arguments->getReference(4).getDynamicObject()->getProperty("default") !=
+          "9007199254740993") {
+    std::cerr << "user-event metadata was not adapted for the run view\n";
+    return false;
+  }
+
+  juce::Array<juce::var> fixed{2, 3};
+  juce::Array<juce::var> slice{0.25};
+  juce::Array<juce::var> values{0.5, juce::var{fixed}, true, juce::var{slice},
+                                "9007199254740993"};
+  const auto error = processor.triggerEvent("shape", juce::var{values});
+  if (!error.empty() || !waitForOutput(processor, 2.75F)) {
+    std::cerr << "user event was not dispatched: " << error << '\n';
+    return false;
+  }
+
+  values.set(4, 9'007'199'254'740'992.0);
+  if (processor.triggerEvent("shape", juce::var{values}).empty()) {
+    std::cerr << "lossy numeric i64 event argument was accepted\n";
+    return false;
+  }
+
+  processor.unload();
+  const auto unloaded = processor.workerStatus();
+  if (unloaded.active || unloaded.engineGeneration != 0 ||
+      !unloaded.mappings.empty() || !unloaded.buffers.empty() ||
+      !unloaded.events.empty()) {
+    std::cerr << "unload retained a stale published interface\n";
+    return false;
+  }
+  return true;
+}
+
+bool exerciseScopeCapture() {
+  TemporarySource source;
+  if (!source.write(validSource(onda::plugin::Product::effect)))
+    return false;
+
+  onda::plugin::Processor processor(onda::plugin::Product::effect);
+  processor.prepareToPlay(48'000.0, 64);
+  processor.loadFile(juce::File(source.path().string()), false);
+  if (!waitForOutput(processor, 0.25F)) {
+    std::cerr << "scope processor did not become active\n";
+    return false;
+  }
+
+  processor.setScopeCaptureEnabled(true);
+  juce::AudioBuffer<float> audio(2, 64);
+  juce::MidiBuffer midi;
+  allocation_audit::count.store(0, std::memory_order_relaxed);
+  lock_audit::count.store(0, std::memory_order_relaxed);
+  allocation_audit::enabled = true;
+  lock_audit::enabled = true;
+  constexpr auto renderedFrames = 80 * 64;
+  for (auto firstFrame = 0; firstFrame < renderedFrames; firstFrame += 64) {
+    for (auto frame = 0; frame < audio.getNumSamples(); ++frame) {
+      const auto value = static_cast<float>(firstFrame + frame) / 4096.0F;
+      audio.setSample(0, frame, value);
+      audio.setSample(1, frame, -value);
+    }
+    processor.processBlock(audio, midi);
+  }
+  lock_audit::enabled = false;
+  allocation_audit::enabled = false;
+  if (allocation_audit::count.load(std::memory_order_relaxed) != 0 ||
+      lock_audit::count.load(std::memory_order_relaxed) != 0) {
+    std::cerr << "scope capture was not realtime-safe\n";
+    return false;
+  }
+
+  const auto snapshot = processor.scopeSnapshot();
+  const auto firstCapturedFrame =
+      renderedFrames -
+      static_cast<int>(onda::plugin::ScopeCapture::snapshotFrames);
+  if (snapshot.channels != 2 ||
+      snapshot.samples.size() !=
+          onda::plugin::ScopeCapture::snapshotFrames * 2U) {
+    std::cerr << "scope snapshot dimensions were invalid\n";
+    return false;
+  }
+  for (std::size_t frame = 0;
+       frame < onda::plugin::ScopeCapture::snapshotFrames; ++frame) {
+    const auto expected =
+        static_cast<float>(firstCapturedFrame + static_cast<int>(frame)) /
+        16384.0F;
+    if (std::abs(snapshot.samples[frame * 2U] - expected) >= 1.0e-6F ||
+        std::abs(snapshot.samples[frame * 2U + 1U] + expected) >= 1.0e-6F) {
+      std::cerr << "scope snapshot was not the latest interleaved output\n";
+      return false;
+    }
+  }
+
+  const auto message = onda::plugin::makeRunViewScope(processor);
+  const auto *scope = message.getDynamicObject();
+  const auto *samples =
+      scope == nullptr ? nullptr : scope->getProperty("samples").getArray();
+  if (scope == nullptr ||
+      scope->getProperty("type").toString() != "scopeData" ||
+      static_cast<int>(scope->getProperty("channels")) != 2 ||
+      samples == nullptr ||
+      samples->size() != static_cast<int>(snapshot.samples.size())) {
+    std::cerr << "captured run-view scope message was invalid\n";
+    return false;
+  }
+
+  processor.setScopeCaptureEnabled(false);
+  if (processor.scopeSnapshot().channels != 0 ||
+      !processor.scopeSnapshot().samples.empty()) {
+    std::cerr << "disabled scope capture remained visible\n";
+    return false;
+  }
+  return true;
+}
+
+bool exerciseRuntimeLogging() {
+  TemporarySource source;
+  if (!source.write(runtimeLoggingEffectSource))
+    return false;
+
+  onda::plugin::Processor processor(onda::plugin::Product::effect);
+  processor.prepareToPlay(48'000.0, 64);
+  processor.loadFile(juce::File(source.path().string()), false);
+  if (!waitForOutput(processor, 0.25F)) {
+    std::cerr << "logging processor did not become active\n";
+    return false;
+  }
+
+  const auto waitForRecords = [&processor](const std::size_t count) {
+    for (int attempt = 0; attempt < 100; ++attempt) {
+      juce::MessageManager::getInstance()->runDispatchLoopUntil(10);
+      auto snapshot = processor.runtimeLogSnapshot();
+      if (snapshot.records.size() >= count)
+        return snapshot;
+    }
+    return processor.runtimeLogSnapshot();
+  };
+  auto snapshot = waitForRecords(3U);
+  if (!snapshot.revealed || snapshot.records.size() != 3U ||
+      snapshot.records[0].text != "init: 0 0" ||
+      snapshot.records[1].text != "sample: 1 1" ||
+      snapshot.records[2].text != "delegate observed: value=1" ||
+      snapshot.records[0].sourceFile.empty() ||
+      snapshot.records[0].lexicalOwner.empty()) {
+    std::cerr << "processor runtime output was not drained in order\n";
+    return false;
+  }
+
+  const auto message = onda::plugin::makeRunViewState(
+      processor, processor.workerStatus(), processor.canExportProject(), {});
+  const auto *envelope = message.getDynamicObject();
+  const auto stateValue =
+      envelope == nullptr ? juce::var{} : envelope->getProperty("state");
+  const auto *state = stateValue.getDynamicObject();
+  const auto *entries =
+      state == nullptr ? nullptr : state->getProperty("logEntries").getArray();
+  const auto *firstEntry = entries == nullptr || entries->isEmpty()
+                               ? nullptr
+                               : entries->getReference(0).getDynamicObject();
+  const auto sourceValue =
+      firstEntry == nullptr ? juce::var{} : firstEntry->getProperty("source");
+  const auto *sourceContext = sourceValue.getDynamicObject();
+  if (state == nullptr ||
+      !static_cast<bool>(state->getProperty("logRevealed")) ||
+      !state->getProperty("logText").toString().contains("sample: 1 1") ||
+      entries == nullptr || entries->size() != 3 || sourceContext == nullptr ||
+      sourceContext->getProperty("file").toString().isEmpty() ||
+      static_cast<juce::int64>(sourceContext->getProperty("line")) == 0) {
+    std::cerr << "runtime output was not adapted to the logger view\n";
+    return false;
+  }
+
+  processor.clearRuntimeLog();
+  snapshot = processor.runtimeLogSnapshot();
+  if (!snapshot.revealed || !snapshot.records.empty() ||
+      snapshot.counters.printOverflow != 0U ||
+      snapshot.counters.delegateOverflow != 0U) {
+    std::cerr << "clearing the runtime log did not preserve its reveal state\n";
+    return false;
+  }
+
+  processor.reset();
+  if (!processWithoutAllocation(processor, 0.25F)) {
+    std::cerr << "reset logging was not realtime safe\n";
+    return false;
+  }
+  for (int index = 0; index < 4; ++index) {
+    if (!processWithoutAllocation(processor, 0.25F))
+      return false;
+  }
+  snapshot = waitForRecords(3U);
+  if (snapshot.records.size() < 3U || snapshot.records[0].text != "init: 1 0" ||
+      snapshot.records[1].text != "sample: 2 1" ||
+      snapshot.records[2].text != "delegate observed: value=2" ||
+      snapshot.counters.printTransportDrops == 0U) {
+    std::cerr << "host reset did not preserve pinned logging state\n";
+    return false;
+  }
+
+  processor.reset();
+  if (!processWithoutAllocation(processor, 0.25F))
+    return false;
+  processor.clearRuntimeLog();
+  juce::MessageManager::getInstance()->runDispatchLoopUntil(100);
+  snapshot = processor.runtimeLogSnapshot();
+  if (!snapshot.revealed || !snapshot.records.empty() ||
+      snapshot.counters.printTransportDrops != 0U ||
+      snapshot.counters.delegateTransportDrops != 0U) {
+    std::cerr << "clear-log retained queued output from the previous epoch\n";
+    return false;
+  }
+
+  for (int block = 0; block < 18; ++block) {
+    if (!processWithoutAllocation(processor, 0.25F))
+      return false;
+    juce::MessageManager::getInstance()->runDispatchLoopUntil(60);
+  }
+  snapshot = processor.runtimeLogSnapshot();
+  if (snapshot.records.size() > 1024U ||
+      snapshot.counters.printTransportDrops == 0U) {
+    std::cerr << "runtime log retention was not bounded and accounted for\n";
+    return false;
+  }
+  processor.clearRuntimeLog();
+
+  for (int index = 0; index < 4; ++index) {
+    if (!processWithoutAllocation(processor, 0.25F))
+      return false;
+  }
+  const auto previousRevision = processor.workerStatus().revision;
+  if (!source.write(replacementLoggingEffectSource))
+    return false;
+  processor.requestReload();
+  auto replacementReady = false;
+  for (int attempt = 0; attempt < 500; ++attempt) {
+    const auto status = processor.workerStatus();
+    if (status.revision > previousRevision && status.active &&
+        !status.compiling && status.message == "Active") {
+      replacementReady = true;
+      break;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  if (!replacementReady || !processWithoutAllocation(processor, 0.5F)) {
+    std::cerr << "replacement logging processor did not become active\n";
+    return false;
+  }
+  juce::MessageManager::getInstance()->runDispatchLoopUntil(100);
+  if (!processWithoutAllocation(processor, 0.5F))
+    return false;
+  snapshot = waitForRecords(1U);
+  if (!snapshot.revealed || snapshot.records.size() != 1U ||
+      snapshot.records[0].text != "replacement init") {
+    std::cerr << "replacement init log was crowded out by stale output\n";
     return false;
   }
   return true;
@@ -775,12 +1227,15 @@ bool exerciseStateRestore() {
       return false;
     }
     original.setEditorSize(777, 888);
+    original.setParamControlLayout(onda::plugin::ParamControlLayout::knobs);
     original.getStateInformation(state);
 
     const auto unchanged = [&] {
       const auto [width, height] = original.editorSize();
       return std::abs(original.slotValue(0) - 0.8125F) < 1.0e-6F &&
              width == 777 && height == 888 &&
+             original.paramControlLayout() ==
+                 onda::plugin::ParamControlLayout::knobs &&
              original.workerStatus().path == source.path();
     };
     const auto reject = [&](const juce::MemoryBlock &candidate) {
@@ -884,7 +1339,10 @@ bool exerciseStateRestore() {
     }
     const auto [width, height] = restored.editorSize();
     if (std::abs(restored.slotValue(0) - 0.8125F) >= 1.0e-6F || width != 777 ||
-        height != 888 || restored.workerStatus().path != source.path()) {
+        height != 888 ||
+        restored.paramControlLayout() !=
+            onda::plugin::ParamControlLayout::knobs ||
+        restored.workerStatus().path != source.path()) {
       std::cerr << "path, slot, or editor state did not restore\n";
       return false;
     }
@@ -986,16 +1444,37 @@ bool exerciseEditorLifecycle() {
     return false;
   }
 
+  StateChangeListener stateChanges{processor};
+
   std::unique_ptr<juce::AudioProcessorEditor> editor{
       processor.createEditorAndMakeActive()};
   if (!editor || processor.getActiveEditor() != editor.get()) {
     std::cerr << "processor did not create and retain its editor\n";
     return false;
   }
+  const auto *loadingOverlay = dynamic_cast<juce::Label *>(
+      editor->findChildWithID("onda-loading-overlay"));
+  if (loadingOverlay == nullptr ||
+      loadingOverlay->getBounds() != editor->getLocalBounds() ||
+      loadingOverlay->findColour(juce::Label::backgroundColourId) !=
+          juce::Colour::fromRGB(8, 21, 34)) {
+    std::cerr << "editor did not cover the initializing web view\n";
+    return false;
+  }
   editor->setVisible(true);
   juce::MessageManager::getInstance()->runDispatchLoopUntil(100);
-  if (!automate(0.4F, "with the editor open"))
+  editor->setSize(777, 888);
+  processor.setParamControlLayout(onda::plugin::ParamControlLayout::knobs);
+  juce::MessageManager::getInstance()->runDispatchLoopUntil(50);
+  const auto [resizedWidth, resizedHeight] = processor.editorSize();
+  if (resizedWidth != 777 || resizedHeight != 888 ||
+      processor.paramControlLayout() !=
+          onda::plugin::ParamControlLayout::knobs ||
+      stateChanges.nonParameterChanges < 2 ||
+      !automate(0.4F, "with the editor open")) {
+    std::cerr << "editor preferences did not mark plugin state dirty\n";
     return false;
+  }
 
   editor->setVisible(false);
   juce::MessageManager::getInstance()->runDispatchLoopUntil(50);
@@ -1005,6 +1484,20 @@ bool exerciseEditorLifecycle() {
   processor.editorBeingDeleted(editor.get());
   editor.reset();
   juce::MessageManager::getInstance()->runDispatchLoopUntil(50);
+  if (processor.getActiveEditor() != nullptr)
+    return false;
+
+  const auto [storedWidth, storedHeight] = processor.editorSize();
+  editor.reset(processor.createEditorAndMakeActive());
+  if (!editor || editor->getWidth() != 777 || editor->getHeight() != 888) {
+    std::cerr << "recreated editor did not retain its dimensions (stored "
+              << storedWidth << 'x' << storedHeight << ", reopened "
+              << (editor ? editor->getWidth() : 0) << 'x'
+              << (editor ? editor->getHeight() : 0) << ")\n";
+    return false;
+  }
+  processor.editorBeingDeleted(editor.get());
+  editor.reset();
   if (processor.getActiveEditor() != nullptr ||
       !automate(0.8F, "after editor destruction")) {
     return false;
@@ -1402,6 +1895,74 @@ bool exerciseExtendedMidi() {
   return true;
 }
 
+bool exerciseMidiKeyboardMonitor() {
+  TemporarySource source;
+  if (!source.write(validSource(onda::plugin::Product::instrument)))
+    return false;
+
+  onda::plugin::Processor processor(onda::plugin::Product::instrument);
+  processor.prepareToPlay(48'000.0, 8);
+  processor.loadFile(juce::File(source.path().string()), false);
+  if (!waitForOutput(processor, 0.25F, 8)) {
+    std::cerr << "MIDI keyboard monitor instrument did not become active\n";
+    return false;
+  }
+
+  const auto status = processor.workerStatus();
+  const auto stateMessage = onda::plugin::makeRunViewState(
+      processor, status, processor.canExportProject(), {});
+  const auto *envelope = stateMessage.getDynamicObject();
+  const auto stateValue =
+      envelope == nullptr ? juce::var{} : envelope->getProperty("state");
+  const auto *state = stateValue.getDynamicObject();
+  const auto midiValue =
+      state == nullptr ? juce::var{} : state->getProperty("midi");
+  const auto *midiState = midiValue.getDynamicObject();
+  if (!status.midi.noteOn || !status.midi.noteOff || midiState == nullptr ||
+      static_cast<bool>(midiState->getProperty("available")) ||
+      !static_cast<bool>(midiState->getProperty("noteOn")) ||
+      !static_cast<bool>(midiState->getProperty("noteOff"))) {
+    std::cerr << "plugin MIDI keyboard capabilities were invalid\n";
+    return false;
+  }
+
+  juce::AudioBuffer<float> audio(2, 8);
+  const auto process = [&](juce::MidiBuffer &midi) {
+    audio.clear();
+    processor.processBlock(audio, midi);
+  };
+  const auto initialRevision = processor.midiActivitySnapshot().revision;
+  juce::MidiBuffer noteOns;
+  noteOns.addEvent(juce::MidiMessage::noteOn(1, 60, 1.0F), 0);
+  noteOns.addEvent(juce::MidiMessage::noteOn(2, 60, 0.5F), 1);
+  noteOns.addEvent(juce::MidiMessage::noteOn(2, 64, 0.5F), 2);
+  process(noteOns);
+  const auto held = processor.midiActivitySnapshot();
+  if (held.revision == initialRevision || !held.active(60) ||
+      !held.active(64)) {
+    std::cerr << "host note-on activity was not captured\n";
+    return false;
+  }
+
+  juce::MidiBuffer firstRelease;
+  firstRelease.addEvent(juce::MidiMessage::noteOff(1, 60), 0);
+  process(firstRelease);
+  if (!processor.midiActivitySnapshot().active(60)) {
+    std::cerr << "one channel released another channel's held note\n";
+    return false;
+  }
+
+  juce::MidiBuffer allNotesOff;
+  allNotesOff.addEvent(juce::MidiMessage::controllerEvent(2, 123, 0), 0);
+  process(allNotesOff);
+  const auto released = processor.midiActivitySnapshot();
+  if (released.active(60) || released.active(64)) {
+    std::cerr << "host all-notes-off activity was not captured\n";
+    return false;
+  }
+  return true;
+}
+
 bool exerciseEventMetadataGating() {
   TemporarySource source;
   if (!source.write(validSource(onda::plugin::Product::effect)))
@@ -1663,14 +2224,16 @@ int main() {
   std::signal(SIGPIPE, SIG_IGN);
 #endif
   juce::ScopedJuceInitialiser_GUI juceInitialiser;
-  if (!exerciseRunViewAdapter() || !exercise(onda::plugin::Product::effect) ||
+  if (!exerciseRunViewAdapter() || !exerciseScopeCapture() ||
+      !exerciseUserEvents() || !exerciseRuntimeLogging() ||
+      !exercise(onda::plugin::Product::effect) ||
       !exercise(onda::plugin::Product::instrument) || !exerciseStateRestore() ||
       !exerciseEditorLifecycle() || !exerciseAudioFileBuffers() ||
       !exerciseSourceGraphFallbackAndDiskAuthority() ||
       !exerciseProjectExportRelinksAuthority() || !exerciseExtendedMidi() ||
-      !exerciseEventMetadataGating() || !exerciseHostContext() ||
-      !exerciseExplicitReset() || !exerciseSupersededHandoff() ||
-      !exerciseConcurrentInstances()) {
+      !exerciseMidiKeyboardMonitor() || !exerciseEventMetadataGating() ||
+      !exerciseHostContext() || !exerciseExplicitReset() ||
+      !exerciseSupersededHandoff() || !exerciseConcurrentInstances()) {
     return 1;
   }
   std::cout << "onda_processor_tests: passed\n";

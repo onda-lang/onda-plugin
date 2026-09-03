@@ -2,7 +2,8 @@
 
 `Processor` is the JUCE boundary. It owns the permanent parameters, linked
 project state with an Onda project image, two one-slot realtime
-handoffs, and the audio-thread-only active engine pointer. The VST3 wrapper
+handoffs, a bounded UI-event queue, and the audio-thread-only active engine
+pointer. The VST3 wrapper
 adds its format-required `Bypass` parameter outside
 the permanent 32-slot Onda set. It also exposes the fixed, non-automatable
 controller mappings that VST3 requires to deliver pitch bend, channel pressure,
@@ -24,8 +25,8 @@ pointer-stable input/output slabs, decoded interleaved audio buffers, fixed
 parameter mappings, and canonical MIDI and host-context event bindings.
 Construction validates:
 
-- instrument inputs are empty;
-- audio flattens to at most two `f32` channels in each direction;
+- audio flattens to no more than the compile-time plug-in input and output
+  channel counts and every channel is `f32`;
 - every buffer has either an Onda-owned immutable project default or an explicit
   `f32` audio-file binding with a compatible channel count;
 - canonical MIDI and host-context payload names, order, scalar shapes, and
@@ -59,6 +60,30 @@ into the shared view's host-message schema. `Editor` owns only the native
 browser lifetime, periodic publication, and command routing. Processor tests
 exercise the editor lifecycle through JUCE's real browser component; resource
 bytes and capability state are tested directly through `RunViewHost`.
+
+The view lists user-defined events but omits the canonical `plugin_midi` and
+`plugin_host` families, which the host drives. Scalar, fixed-array, and slice
+arguments are validated and packed on the message thread into a bounded SPSC
+queue. The callback dispatches them at its next boundary without allocation or
+locking; a build generation on every command prevents stale event indices from
+crossing an engine replacement.
+
+Editor dimensions and the parameter-control layout are processor-owned UI
+state. Changes notify the host that non-parameter state is dirty, are serialized
+with the project, and are restored before a recreated editor installs its size
+constraints. The browser bridge projects the saved layout into the shared view
+instead of relying on webview-local storage.
+
+While an editor exists, the callback writes interleaved output into a bounded,
+lock-free scope ring owned by `Processor`. The editor snapshots its newest
+1,024 frames at 20 Hz and publishes them through the shared view's separate
+`scopeData` message. Capturing is disabled when the editor closes; the callback
+never allocates, locks, or interacts with the browser.
+
+Host note-on/off state is retained per MIDI channel in atomic bitsets and
+published separately as `midiActivity`. The shared keyboard is configured as a
+read-only monitor: it exposes no MIDI device or note-input surface, and notes
+remain lit while any host channel holds the corresponding key.
 
 The callback captures aliased host input before clearing output. Logical blocks
 continue across host callbacks without added latency. JUCE playhead state is

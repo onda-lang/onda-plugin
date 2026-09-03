@@ -8,6 +8,7 @@
 namespace onda::plugin {
 
 class Processor;
+struct MidiActivitySnapshot;
 struct WorkerStatus;
 
 [[nodiscard]] std::optional<juce::WebBrowserComponent::Resource>
@@ -17,5 +18,10 @@ runViewResource(const juce::String &request);
                                          const WorkerStatus &status,
                                          bool canExportProject,
                                          const std::string &actionError);
+
+[[nodiscard]] juce::var makeRunViewScope(Processor &processor);
+
+[[nodiscard]] juce::var
+makeRunViewMidiActivity(const MidiActivitySnapshot &activity);
 
 } // namespace onda::plugin

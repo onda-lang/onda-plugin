@@ -19,6 +19,9 @@
 namespace onda::plugin {
 namespace {
 
+const auto editorBackground = juce::Colour::fromRGB(8, 21, 34);
+const auto editorMutedText = juce::Colour::fromRGB(146, 168, 191);
+
 constexpr auto juceHostBridgeScript = R"JS(
 (() => {
   const parameterDomains = new Map();
@@ -49,6 +52,9 @@ constexpr auto juceHostBridgeScript = R"JS(
     }
     if (argument?.type === "bool") {
       return Boolean(argument.default);
+    }
+    if (argument?.type === "i64") {
+      return typeof argument.default === "string" ? argument.default : "0";
     }
     const value = Number(argument?.default);
     return Number.isFinite(value) ? value : 0;
@@ -94,6 +100,17 @@ constexpr auto juceHostBridgeScript = R"JS(
     },
   };
 
+  document.addEventListener("click", (event) => {
+    const button = event.target?.closest?.("[data-param-layout]");
+    const layout = button?.dataset?.paramLayout;
+    if (layout === "sliders" || layout === "knobs") {
+      window.__JUCE__.backend.emitEvent("ondaCommand", {
+        type: "setParamLayout",
+        layout,
+      });
+    }
+  });
+
   window.__JUCE__.backend.addEventListener("ondaState", (message) => {
     if (message?.type === "state" && Array.isArray(message.state?.events)) {
       eventDefinitions = message.state.events;
@@ -111,6 +128,16 @@ constexpr auto juceHostBridgeScript = R"JS(
         } catch {
           // The shared view will surface malformed parameter metadata.
         }
+      }
+    }
+    if (message?.type === "state") {
+      const layout = message.state?.paramLayout;
+      const button =
+        layout === "sliders" || layout === "knobs"
+          ? document.querySelector(`[data-param-layout="${layout}"]`)
+          : null;
+      if (button && button.getAttribute("aria-pressed") !== "true") {
+        button.click();
       }
     }
     if (typeof window._onHostMessage === "function") {
@@ -182,18 +209,27 @@ public:
 Editor::Editor(Processor &owner)
     : AudioProcessorEditor(owner), processor_(owner),
       browser_(std::make_unique<Browser>(*this)) {
+  const auto [width, height] = processor_.editorSize();
   setOpaque(true);
   addAndMakeVisible(*browser_);
+  loadingOverlay_.setComponentID("onda-loading-overlay");
+  loadingOverlay_.setText("Loading Onda...", juce::dontSendNotification);
+  loadingOverlay_.setJustificationType(juce::Justification::centred);
+  loadingOverlay_.setColour(juce::Label::backgroundColourId, editorBackground);
+  loadingOverlay_.setColour(juce::Label::textColourId, editorMutedText);
+  loadingOverlay_.setOpaque(true);
+  addAndMakeVisible(loadingOverlay_);
   setResizable(true, true);
-  setResizeLimits(360, 480, 1600, 1400);
-  const auto [width, height] = processor_.editorSize();
   setSize(width, height);
+  setResizeLimits(360, 480, 1600, 1400);
+  processor_.setScopeCaptureEnabled(true);
   browser_->goToURL(juce::WebBrowserComponent::getResourceProviderRoot());
   startTimerHz(20);
 }
 
 Editor::~Editor() {
   stopTimer();
+  processor_.setScopeCaptureEnabled(false);
   for (std::size_t index = 0; index < activeGestures_.size(); ++index) {
     if (activeGestures_[index])
       processor_.endSlotGesture(index);
@@ -202,33 +238,61 @@ Editor::~Editor() {
 }
 
 void Editor::paint(juce::Graphics &graphics) {
-  graphics.fillAll(juce::Colour::fromRGB(12, 30, 51));
+  graphics.fillAll(editorBackground);
 }
 
 void Editor::resized() {
   browser_->setBounds(getLocalBounds());
+  loadingOverlay_.setBounds(getLocalBounds());
   processor_.setEditorSize(getWidth(), getHeight());
 }
 
-void Editor::timerCallback() { publishState(false); }
+void Editor::timerCallback() {
+  publishState(false);
+  publishMidiActivity();
+  publishScope();
+}
+
+void Editor::publishMidiActivity(const bool force) {
+  const auto activity = processor_.midiActivitySnapshot();
+  if (!force && hasPublishedMidi_ &&
+      activity.revision == publishedMidiRevision_) {
+    return;
+  }
+  publishedMidiRevision_ = activity.revision;
+  hasPublishedMidi_ = true;
+  browser_->emitEventIfBrowserIsVisible("ondaState",
+                                        makeRunViewMidiActivity(activity));
+}
 
 void Editor::publishState(const bool force) {
   const auto revision = processor_.workerStatusRevision();
+  const auto logRevision = processor_.runtimeLogRevision();
   std::array<float, slotCount> currentSlots{};
   for (std::size_t index = 0; index < currentSlots.size(); ++index)
     currentSlots[index] = processor_.slotValue(index);
+  const auto currentKnobLayout =
+      processor_.paramControlLayout() == ParamControlLayout::knobs;
   if (!force && hasPublished_ && revision == publishedRevision_ &&
-      currentSlots == publishedSlots_) {
+      logRevision == publishedLogRevision_ && currentSlots == publishedSlots_ &&
+      currentKnobLayout == publishedKnobLayout_) {
     return;
   }
   const auto status = processor_.workerStatus();
   publishedRevision_ = status.revision;
+  publishedLogRevision_ = logRevision;
   publishedSlots_ = currentSlots;
+  publishedKnobLayout_ = currentKnobLayout;
   hasPublished_ = true;
   browser_->emitEventIfBrowserIsVisible(
       "ondaState",
       makeRunViewState(processor_, status, processor_.canExportProject(),
                        actionError_));
+}
+
+void Editor::publishScope() {
+  browser_->emitEventIfBrowserIsVisible("ondaState",
+                                        makeRunViewScope(processor_));
 }
 
 void Editor::handleCommand(const juce::var &command) {
@@ -238,6 +302,11 @@ void Editor::handleCommand(const juce::var &command) {
   const auto type = input->getProperty("type").toString();
 
   if (type == "webviewReady") {
+    loadingOverlay_.setVisible(false);
+    publishState(true);
+    publishMidiActivity(true);
+  } else if (type == "clearLog") {
+    processor_.clearRuntimeLog();
     publishState(true);
   } else if (type == "chooseOndaFile") {
     actionError_.clear();
@@ -290,6 +359,20 @@ void Editor::handleCommand(const juce::var &command) {
     processor_.resetParametersToDefaults();
   } else if (type == "reset") {
     processor_.requestUserReset();
+  } else if (type == "triggerEvent") {
+    auto error = processor_.triggerEvent(
+        input->getProperty("name").toString().toStdString(),
+        input->getProperty("values"));
+    if (error != actionError_) {
+      actionError_ = std::move(error);
+      publishState(true);
+    }
+  } else if (type == "setParamLayout") {
+    const auto layout = input->getProperty("layout").toString();
+    if (layout == "sliders")
+      processor_.setParamControlLayout(ParamControlLayout::sliders);
+    else if (layout == "knobs")
+      processor_.setParamControlLayout(ParamControlLayout::knobs);
   } else if (type == "chooseBufferFile") {
     const auto name = input->getProperty("name").toString().toStdString();
     if (!hasBuffer(processor_.workerStatus(), name))

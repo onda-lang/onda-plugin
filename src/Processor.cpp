@@ -7,20 +7,144 @@
 
 #include <algorithm>
 #include <bit>
+#include <charconv>
 #include <cmath>
 #include <cstring>
 #include <limits>
 #include <new>
+#include <system_error>
 #include <unordered_set>
 
 namespace onda::plugin {
 namespace {
 
 constexpr std::uint32_t stateMagic = 0x41444e4fU; // ONDA, little-endian.
-constexpr int stateVersion = 2;
+constexpr int stateVersion = 3;
 constexpr int maximumPathBytes = 16 * 1024;
 constexpr int maximumBufferNameBytes = 1024;
 constexpr int maximumBufferBindings = 1024;
+constexpr std::size_t maximumRuntimeLogEntries = 1024U;
+constexpr std::size_t maximumRuntimeLogBytes = 256U * 1024U;
+
+template <typename Value>
+bool appendEventValue(UserEventCommand &command, const Value value) noexcept {
+  if (command.payloadBytes > command.payload.size() - sizeof(value))
+    return false;
+  std::memcpy(command.payload.data() + command.payloadBytes, &value,
+              sizeof(value));
+  command.payloadBytes += static_cast<std::uint32_t>(sizeof(value));
+  return true;
+}
+
+std::optional<double> eventNumber(const juce::var &value) {
+  if (!value.isInt() && !value.isInt64() && !value.isDouble())
+    return std::nullopt;
+  const auto number = static_cast<double>(value);
+  return std::isfinite(number) ? std::optional<double>{number} : std::nullopt;
+}
+
+bool isInteger(const double value) noexcept {
+  return std::fpclassify(std::remainder(value, 1.0)) == FP_ZERO;
+}
+
+bool appendEventScalar(UserEventCommand &command, const int type,
+                       const juce::var &value) {
+  if (type == ONDA_PRIMITIVE_BOOL)
+    return value.isBool() &&
+           appendEventValue(
+               command, static_cast<std::uint8_t>(static_cast<bool>(value)));
+
+  if (type == ONDA_PRIMITIVE_I64) {
+    if (value.isString()) {
+      const auto text = value.toString().toStdString();
+      std::int64_t integer{};
+      const auto parsed =
+          std::from_chars(text.data(), text.data() + text.size(), integer);
+      return parsed.ec == std::errc{} &&
+             parsed.ptr == text.data() + text.size() &&
+             appendEventValue(command, integer);
+    }
+    if (value.isInt())
+      return appendEventValue(
+          command, static_cast<std::int64_t>(static_cast<int>(value)));
+    if (value.isInt64())
+      return appendEventValue(
+          command, static_cast<std::int64_t>(static_cast<juce::int64>(value)));
+  }
+
+  const auto number = eventNumber(value);
+  if (!number)
+    return false;
+  switch (type) {
+  case ONDA_PRIMITIVE_F32:
+    return *number >= -static_cast<double>(std::numeric_limits<float>::max()) &&
+           *number <= static_cast<double>(std::numeric_limits<float>::max()) &&
+           appendEventValue(command, static_cast<float>(*number));
+  case ONDA_PRIMITIVE_F64:
+    return appendEventValue(command, *number);
+  case ONDA_PRIMITIVE_I32:
+    return isInteger(*number) &&
+           *number >=
+               static_cast<double>(std::numeric_limits<std::int32_t>::min()) &&
+           *number <=
+               static_cast<double>(std::numeric_limits<std::int32_t>::max()) &&
+           appendEventValue(command, static_cast<std::int32_t>(*number));
+  case ONDA_PRIMITIVE_I64: {
+    // A double cannot identify integers outside JavaScript's exact range.
+    // Full-range i64 values cross the UI boundary as decimal strings.
+    constexpr auto maximumExactDoubleInteger = 9'007'199'254'740'991.0;
+    return isInteger(*number) && *number >= -maximumExactDoubleInteger &&
+           *number <= maximumExactDoubleInteger &&
+           appendEventValue(command, static_cast<std::int64_t>(*number));
+  }
+  default:
+    return false;
+  }
+}
+
+bool appendEventParameter(UserEventCommand &command,
+                          const EventParameterMapping &parameter,
+                          const juce::var &value) {
+  if (!parameter.array && !parameter.slice)
+    return appendEventScalar(command, parameter.elementType, value);
+  const auto *values = value.getArray();
+  if (values == nullptr ||
+      (parameter.array && values->size() != parameter.arrayLength) ||
+      values->size() > std::numeric_limits<std::int32_t>::max()) {
+    return false;
+  }
+  if (parameter.slice &&
+      !appendEventValue(command, static_cast<std::int32_t>(values->size()))) {
+    return false;
+  }
+  return std::ranges::all_of(*values, [&command, &parameter](const auto &item) {
+    return appendEventScalar(command, parameter.elementType, item);
+  });
+}
+
+[[nodiscard]] std::size_t
+runtimeLogPayloadBytes(const RuntimeLogRecord &record) noexcept {
+  return record.text.size() + record.sourceFile.size() +
+         record.lexicalOwner.size();
+}
+
+[[nodiscard]] RuntimeLogCounters
+counterDifference(const RuntimeLogCounters &totals,
+                  const RuntimeLogCounters &previous) noexcept {
+  const auto difference = [](const std::uint64_t total,
+                             const std::uint64_t consumed) {
+    return total >= consumed ? total - consumed : total;
+  };
+  return {
+      .printOverflow = difference(totals.printOverflow, previous.printOverflow),
+      .printTransportDrops =
+          difference(totals.printTransportDrops, previous.printTransportDrops),
+      .delegateOverflow =
+          difference(totals.delegateOverflow, previous.delegateOverflow),
+      .delegateTransportDrops = difference(totals.delegateTransportDrops,
+                                           previous.delegateTransportDrops),
+  };
+}
 
 std::optional<juce::String> readBoundedString(juce::MemoryInputStream &stream,
                                               const int maximumBytes) {
@@ -171,7 +295,7 @@ ProjectImage readProjectImage(juce::MemoryInputStream &stream, bool &valid) {
 } // namespace
 
 Processor::Processor(const Product product)
-    : AudioProcessor(buses(product)), product_(product),
+    : AudioProcessor(buses()), product_(product),
       parameterState_(*this, nullptr, "OndaSlots", parameters()) {
   for (std::size_t index = 0; index < slotCount; ++index) {
     const auto id = slotId(index);
@@ -195,11 +319,16 @@ Processor::~Processor() {
   delete active_;
 }
 
-juce::AudioProcessor::BusesProperties Processor::buses(const Product product) {
+juce::AudioProcessor::BusesProperties Processor::buses() {
   BusesProperties result;
-  if (product == Product::effect)
-    result = result.withInput("Input", juce::AudioChannelSet::stereo(), true);
-  return result.withOutput("Output", juce::AudioChannelSet::stereo(), true);
+  if constexpr (pluginInputChannels > 0) {
+    result = result.withInput(
+        "Input",
+        juce::AudioChannelSet::canonicalChannelSet(pluginInputChannels), true);
+  }
+  return result.withOutput(
+      "Output",
+      juce::AudioChannelSet::canonicalChannelSet(pluginOutputChannels), true);
 }
 
 juce::AudioProcessorValueTreeState::ParameterLayout Processor::parameters() {
@@ -222,10 +351,13 @@ void Processor::prepareToPlay(const double sampleRate,
     channel.resize(static_cast<std::size_t>(safeBlockSize));
   deactivateRequested_.store(true, std::memory_order_release);
   replacementSeedPending_.store(false, std::memory_order_release);
+  clearMidiActivity();
   worker_->configure(sampleRate, safeBlockSize);
+  configuredBlockSize_.store(safeBlockSize, std::memory_order_release);
 }
 
 void Processor::reset() {
+  clearMidiActivity();
   if (runtimeFaulted_.load(std::memory_order_acquire))
     runtimeRecoveryRequested_.store(true, std::memory_order_release);
   else
@@ -233,11 +365,14 @@ void Processor::reset() {
 }
 
 bool Processor::isBusesLayoutSupported(const BusesLayout &layouts) const {
-  if (layouts.getMainOutputChannelSet() != juce::AudioChannelSet::stereo())
+  const auto expectedOutput =
+      juce::AudioChannelSet::canonicalChannelSet(pluginOutputChannels);
+  if (layouts.getMainOutputChannelSet() != expectedOutput)
     return false;
-  if (product_ == Product::instrument)
+  if constexpr (pluginInputChannels == 0)
     return layouts.getMainInputChannelSet().isDisabled();
-  return layouts.getMainInputChannelSet() == juce::AudioChannelSet::stereo();
+  return layouts.getMainInputChannelSet() ==
+         juce::AudioChannelSet::canonicalChannelSet(pluginInputChannels);
 }
 
 const juce::String Processor::getName() const {
@@ -245,8 +380,10 @@ const juce::String Processor::getName() const {
 }
 
 void Processor::retireActive() noexcept {
-  if (active_ != nullptr && retirements_.tryPush(active_))
+  if (active_ != nullptr && retirements_.tryPush(active_)) {
     active_ = nullptr;
+    clearMidiActivity();
+  }
 }
 
 void Processor::acquireEngine() noexcept {
@@ -278,7 +415,13 @@ void Processor::acquireEngine() noexcept {
       return;
     }
   }
+  static_cast<void>(runtimeLogSink_.beginEpoch());
+  activeLogGeneration_.store(replacement->buildGeneration(),
+                             std::memory_order_release);
+  replacement->attachLogSink(runtimeLogSink_);
   active_ = replacement;
+  clearMidiActivity();
+  scopeCapture_.requestReset();
   runtimeFaulted_.store(false, std::memory_order_release);
 }
 
@@ -347,9 +490,54 @@ Processor::convertMidi(const juce::MidiMessageMetadata &metadata,
   return event;
 }
 
+void Processor::observeMidiActivity(const juce::MidiMessage &message) noexcept {
+  const auto channel = message.getChannel() - 1;
+  if (channel < 0 || channel >= static_cast<int>(midiChannelCount))
+    return;
+
+  if (message.isController() && (message.getControllerNumber() == 120 ||
+                                 message.getControllerNumber() == 123)) {
+    auto changed = false;
+    for (auto &word : midiActiveNotes_[static_cast<std::size_t>(channel)])
+      changed = word.exchange(0U, std::memory_order_relaxed) != 0U || changed;
+    if (changed)
+      midiActivityRevision_.fetch_add(1U, std::memory_order_release);
+    return;
+  }
+
+  const auto noteOn = message.isNoteOn();
+  if (!noteOn && !message.isNoteOff())
+    return;
+  const auto note = message.getNoteNumber();
+  if (note < 0 || note >= static_cast<int>(midiNoteCount)) {
+    return;
+  }
+  const auto index = static_cast<std::size_t>(note) / 64U;
+  const auto bit = std::uint64_t{1} << (static_cast<std::size_t>(note) % 64U);
+  auto &word = midiActiveNotes_[static_cast<std::size_t>(channel)][index];
+  const auto previous = noteOn
+                            ? word.fetch_or(bit, std::memory_order_relaxed)
+                            : word.fetch_and(~bit, std::memory_order_relaxed);
+  if (((previous & bit) != 0U) != noteOn)
+    midiActivityRevision_.fetch_add(1U, std::memory_order_release);
+}
+
+void Processor::clearMidiActivity() noexcept {
+  auto changed = false;
+  for (auto &channel : midiActiveNotes_) {
+    for (auto &word : channel)
+      changed = word.exchange(0U, std::memory_order_relaxed) != 0U || changed;
+  }
+  if (changed)
+    midiActivityRevision_.fetch_add(1U, std::memory_order_release);
+}
+
 void Processor::fallback(juce::AudioBuffer<float> &audio) noexcept {
-  if (product_ == Product::instrument)
-    audio.clear();
+  const auto passthroughChannels =
+      product_ == Product::effect ? pluginPassthroughChannels : 0;
+  for (int channel = passthroughChannels; channel < pluginOutputChannels;
+       ++channel)
+    audio.clear(channel, 0, audio.getNumSamples());
 }
 
 void Processor::processBlock(juce::AudioBuffer<float> &audio,
@@ -387,38 +575,69 @@ void Processor::processBlock(juce::AudioBuffer<float> &audio,
     }
   }
 
-  if (resetRequested_.exchange(false, std::memory_order_acq_rel))
-    active_->reset();
+  if (resetRequested_.exchange(false, std::memory_order_acq_rel) &&
+      !active_->reset()) {
+    deactivateRequested_.store(true, std::memory_order_release);
+    runtimeFaulted_.store(true, std::memory_order_release);
+    fallback(audio);
+    return;
+  }
+
+  while (userEvents_.tryPop(userEventScratch_)) {
+    if (userEventScratch_.generation != active_->buildGeneration())
+      continue;
+    if (userEventScratch_.payloadBytes > userEventScratch_.payload.size() ||
+        !active_->triggerEvent(
+            userEventScratch_.eventIndex,
+            {userEventScratch_.payload.data(),
+             static_cast<std::size_t>(userEventScratch_.payloadBytes)},
+            slotAtomics_, hostContext)) {
+      deactivateRequested_.store(true, std::memory_order_release);
+      runtimeFaulted_.store(true, std::memory_order_release);
+      fallback(audio);
+      return;
+    }
+  }
 
   if (product_ == Product::effect) {
-    for (int channel = 0; channel < 2; ++channel) {
+    for (int channel = 0; channel < static_cast<int>(dryScratch_.size());
+         ++channel) {
       std::copy_n(audio.getReadPointer(channel), frames,
                   dryScratch_[static_cast<std::size_t>(channel)].data());
     }
   }
 
-  std::array<float *, 2U> channels{audio.getWritePointer(0),
-                                   audio.getWritePointer(1)};
+  std::array<float *, static_cast<std::size_t>(pluginInputChannels)> inputs{};
+  for (int channel = 0; channel < pluginInputChannels; ++channel)
+    inputs[static_cast<std::size_t>(channel)] = audio.getWritePointer(channel);
+  std::array<float *, static_cast<std::size_t>(pluginOutputChannels)> outputs{};
+  for (int channel = 0; channel < pluginOutputChannels; ++channel)
+    outputs[static_cast<std::size_t>(channel)] = audio.getWritePointer(channel);
   const auto processRange =
-      [this, &channels,
+      [this, &inputs, &outputs,
        &hostContext](const int offset, const int count,
                      const std::span<const MidiEvent> events) noexcept {
-        std::array<float *, 2U> shiftedOutputs{
-            channels[0] + offset,
-            channels[1] + offset,
-        };
-        std::array<float *, 2U> shiftedInputs{};
-        if (product_ == Product::effect)
-          shiftedInputs = shiftedOutputs;
-        return active_->process(
-            product_ == Product::effect ? shiftedInputs.data() : nullptr,
-            shiftedOutputs.data(), count, events, slotAtomics_, hostContext,
-            offset);
+        std::array<float *, static_cast<std::size_t>(pluginInputChannels)>
+            shiftedInputs{};
+        for (int channel = 0; channel < pluginInputChannels; ++channel) {
+          shiftedInputs[static_cast<std::size_t>(channel)] =
+              inputs[static_cast<std::size_t>(channel)] + offset;
+        }
+        std::array<float *, static_cast<std::size_t>(pluginOutputChannels)>
+            shiftedOutputs{};
+        for (int channel = 0; channel < pluginOutputChannels; ++channel) {
+          shiftedOutputs[static_cast<std::size_t>(channel)] =
+              outputs[static_cast<std::size_t>(channel)] + offset;
+        }
+        return active_->process(shiftedInputs.data(), shiftedOutputs.data(),
+                                count, events, slotAtomics_, hostContext,
+                                offset);
       };
 
   auto succeeded = true;
   auto position = 0;
   for (const auto metadata : midi) {
+    observeMidiActivity(metadata.getMessage());
     auto event = convertMidi(metadata, *active_, position, frames);
     if (!event)
       continue;
@@ -441,21 +660,25 @@ void Processor::processBlock(juce::AudioBuffer<float> &audio,
   if (!succeeded) {
     deactivateRequested_.store(true, std::memory_order_release);
     runtimeFaulted_.store(true, std::memory_order_release);
-    if (product_ == Product::instrument) {
-      audio.clear();
-    } else {
-      for (int channel = 0; channel < 2; ++channel) {
+    fallback(audio);
+    if (product_ == Product::effect) {
+      for (int channel = 0; channel < static_cast<int>(dryScratch_.size());
+           ++channel) {
         std::copy_n(dryScratch_[static_cast<std::size_t>(channel)].data(),
                     frames, audio.getWritePointer(channel));
       }
     }
   }
+  scopeCapture_.push(outputs, frames);
 }
 
 void Processor::processBlock(juce::AudioBuffer<double> &audio,
                              juce::MidiBuffer &) {
-  if (product_ == Product::instrument)
-    audio.clear();
+  const auto passthroughChannels =
+      product_ == Product::effect ? pluginPassthroughChannels : 0;
+  for (int channel = passthroughChannels; channel < pluginOutputChannels;
+       ++channel)
+    audio.clear(channel, 0, audio.getNumSamples());
 }
 
 juce::AudioProcessorEditor *Processor::createEditor() {
@@ -547,6 +770,9 @@ void Processor::unload() {
   runtimeFaulted_.store(false, std::memory_order_release);
   runtimeRecoveryRequested_.store(false, std::memory_order_release);
   resetRequested_.store(false, std::memory_order_release);
+  activeLogGeneration_.store(0U, std::memory_order_release);
+  clearMidiActivity();
+  clearRuntimeLog();
   worker_->unload();
 }
 
@@ -571,6 +797,37 @@ void Processor::requestUserReset() {
   reset();
 }
 
+std::string Processor::triggerEvent(const std::string_view name,
+                                    const juce::var &values) {
+  const auto status = worker_->status();
+  if (!status.active || status.engineGeneration == 0)
+    return "No active Onda program";
+  const auto event =
+      std::ranges::find(status.events, name, &EventMapping::name);
+  if (event == status.events.end())
+    return "Unknown Onda event '" + std::string{name} + "'";
+  const auto *arguments = values.getArray();
+  if (arguments == nullptr ||
+      static_cast<std::size_t>(arguments->size()) != event->parameters.size()) {
+    return "Event '" + event->name + "' has an invalid argument count";
+  }
+
+  UserEventCommand command;
+  command.generation = status.engineGeneration;
+  command.eventIndex = event->index;
+  for (std::size_t index = 0; index < event->parameters.size(); ++index) {
+    if (!appendEventParameter(
+            command, event->parameters[index],
+            arguments->getReference(static_cast<int>(index)))) {
+      return "Event '" + event->name + "' parameter '" +
+             event->parameters[index].name + "' has an invalid value";
+    }
+  }
+  if (!userEvents_.tryPush(command))
+    return "The event queue is full";
+  return {};
+}
+
 WorkerStatus Processor::workerStatus() const {
   auto status = worker_->status();
   const auto faulted = runtimeFaulted_.load(std::memory_order_acquire);
@@ -588,6 +845,57 @@ std::uint64_t Processor::workerStatusRevision() const {
   const auto revision = worker_->statusRevision();
   const auto faulted = runtimeFaulted_.load(std::memory_order_acquire);
   return (revision << 1U) | static_cast<std::uint64_t>(faulted);
+}
+
+RuntimeLogSnapshot Processor::runtimeLogSnapshot() const {
+  std::lock_guard lock(stateMutex_);
+  return {
+      .records = runtimeLogRecords_,
+      .counters = runtimeLogCounters_,
+      .revealed = runtimeLogRevealed_,
+  };
+}
+
+std::uint64_t Processor::runtimeLogRevision() const noexcept {
+  return runtimeLogRevision_.load(std::memory_order_acquire);
+}
+
+MidiActivitySnapshot Processor::midiActivitySnapshot() const noexcept {
+  MidiActivitySnapshot snapshot;
+  for (;;) {
+    const auto before = midiActivityRevision_.load(std::memory_order_acquire);
+    snapshot.notes = {};
+    for (const auto &channel : midiActiveNotes_) {
+      for (std::size_t index = 0; index < snapshot.notes.size(); ++index) {
+        snapshot.notes[index] |= channel[index].load(std::memory_order_relaxed);
+      }
+    }
+    const auto after = midiActivityRevision_.load(std::memory_order_acquire);
+    if (before == after) {
+      snapshot.revision = after;
+      return snapshot;
+    }
+  }
+}
+
+void Processor::clearRuntimeLog() {
+  {
+    std::lock_guard lock(stateMutex_);
+    consumedLogEpoch_ = runtimeLogSink_.beginEpoch();
+    consumedLogCounterTotals_ = {};
+    runtimeLogRecords_.clear();
+    runtimeLogBytes_ = 0U;
+    runtimeLogCounters_ = {};
+  }
+  runtimeLogRevision_.fetch_add(1U, std::memory_order_release);
+}
+
+void Processor::setScopeCaptureEnabled(const bool enabled) noexcept {
+  scopeCapture_.setEnabled(enabled);
+}
+
+ScopeSnapshot Processor::scopeSnapshot() const {
+  return scopeCapture_.snapshot();
 }
 
 juce::File Processor::lastBrowseDirectory() const {
@@ -623,12 +931,148 @@ std::pair<int, int> Processor::editorSize() const noexcept {
           editorHeight_.load(std::memory_order_relaxed)};
 }
 
-void Processor::setEditorSize(const int width, const int height) noexcept {
-  editorWidth_.store(std::clamp(width, 360, 1600), std::memory_order_relaxed);
-  editorHeight_.store(std::clamp(height, 480, 1400), std::memory_order_relaxed);
+void Processor::setEditorSize(const int width, const int height) {
+  const auto clampedWidth = std::clamp(width, 360, 1600);
+  const auto clampedHeight = std::clamp(height, 480, 1400);
+  const auto widthChanged =
+      editorWidth_.exchange(clampedWidth, std::memory_order_relaxed) !=
+      clampedWidth;
+  const auto heightChanged =
+      editorHeight_.exchange(clampedHeight, std::memory_order_relaxed) !=
+      clampedHeight;
+  if (widthChanged || heightChanged) {
+    updateHostDisplay(juce::AudioProcessorListener::ChangeDetails{}
+                          .withNonParameterStateChanged(true));
+  }
+}
+
+ParamControlLayout Processor::paramControlLayout() const noexcept {
+  return paramControlLayout_.load(std::memory_order_relaxed);
+}
+
+void Processor::setParamControlLayout(const ParamControlLayout layout) {
+  if (paramControlLayout_.exchange(layout, std::memory_order_relaxed) !=
+      layout) {
+    updateHostDisplay(juce::AudioProcessorListener::ChangeDetails{}
+                          .withNonParameterStateChanged(true));
+  }
+}
+
+void Processor::drainRuntimeLogs() {
+  struct StagedRecord {
+    std::uint64_t generation{};
+    std::uint64_t epoch{};
+    RuntimeLogRecord record;
+  };
+
+  std::vector<StagedRecord> records;
+  records.reserve(runtimeLogQueueCapacity - 1U);
+  RuntimeLogEntry entry;
+  for (std::size_t count = 0U;
+       count + 1U < runtimeLogQueueCapacity && runtimeLogSink_.tryPop(entry);
+       ++count) {
+    const auto textBytes =
+        std::min<std::size_t>(entry.textBytes, entry.text.size());
+    const auto sourceFileBytes =
+        std::min<std::size_t>(entry.sourceFileBytes, entry.sourceFile.size());
+    const auto lexicalOwnerBytes = std::min<std::size_t>(
+        entry.lexicalOwnerBytes, entry.lexicalOwner.size());
+    records.push_back({
+        .generation = entry.generation,
+        .epoch = entry.epoch,
+        .record =
+            {
+                .kind = entry.kind,
+                .text = std::string(entry.text.data(), textBytes),
+                .sourceFile =
+                    std::string(entry.sourceFile.data(), sourceFileBytes),
+                .lexicalOwner =
+                    std::string(entry.lexicalOwner.data(), lexicalOwnerBytes),
+                .line = entry.line,
+            },
+    });
+  }
+
+  const auto counterEpoch = runtimeLogSink_.epoch();
+  const auto counterTotals = runtimeLogSink_.counterTotals(counterEpoch);
+  const auto generation = activeLogGeneration_.load(std::memory_order_acquire);
+  const auto epoch = runtimeLogSink_.epoch();
+  const auto countersStable = counterEpoch == epoch;
+  const auto counters =
+      countersStable
+          ? counterDifference(counterTotals, consumedLogEpoch_ == epoch
+                                                 ? consumedLogCounterTotals_
+                                                 : RuntimeLogCounters{})
+          : RuntimeLogCounters{};
+  std::erase_if(records, [generation, epoch](const StagedRecord &record) {
+    return generation == 0U || record.generation != generation ||
+           record.epoch != epoch;
+  });
+
+  const auto hasCounters =
+      counters.printOverflow != 0U || counters.printTransportDrops != 0U ||
+      counters.delegateOverflow != 0U || counters.delegateTransportDrops != 0U;
+  const auto hasRecords = !records.empty();
+  const auto generationChanged = generation != consumedLogGeneration_;
+  if (!generationChanged && !hasRecords && !hasCounters)
+    return;
+
+  {
+    std::lock_guard lock(stateMutex_);
+    const auto currentGeneration =
+        activeLogGeneration_.load(std::memory_order_acquire) == generation;
+    const auto currentEpoch = runtimeLogSink_.epoch() == epoch;
+    if (!currentGeneration || !currentEpoch)
+      return;
+    if (generationChanged) {
+      runtimeLogRecords_.clear();
+      runtimeLogBytes_ = 0U;
+      runtimeLogCounters_ = {};
+      runtimeLogRevealed_ = false;
+      consumedLogGeneration_ = generation;
+    }
+    if (generation != 0U) {
+      for (auto &record : records) {
+        runtimeLogBytes_ += runtimeLogPayloadBytes(record.record);
+        runtimeLogRecords_.push_back(std::move(record.record));
+      }
+      auto discarded = std::size_t{};
+      while (
+          discarded < runtimeLogRecords_.size() &&
+          (runtimeLogRecords_.size() - discarded > maximumRuntimeLogEntries ||
+           runtimeLogBytes_ > maximumRuntimeLogBytes)) {
+        const auto &record = runtimeLogRecords_[discarded];
+        runtimeLogBytes_ -= runtimeLogPayloadBytes(record);
+        auto &dropCounter = record.kind == RuntimeLogKind::print
+                                ? runtimeLogCounters_.printTransportDrops
+                                : runtimeLogCounters_.delegateTransportDrops;
+        addSaturated(dropCounter, 1U);
+        ++discarded;
+      }
+      if (discarded != 0U) {
+        runtimeLogRecords_.erase(runtimeLogRecords_.begin(),
+                                 runtimeLogRecords_.begin() +
+                                     static_cast<std::ptrdiff_t>(discarded));
+      }
+      addSaturated(runtimeLogCounters_.printOverflow, counters.printOverflow);
+      addSaturated(runtimeLogCounters_.printTransportDrops,
+                   counters.printTransportDrops);
+      addSaturated(runtimeLogCounters_.delegateOverflow,
+                   counters.delegateOverflow);
+      addSaturated(runtimeLogCounters_.delegateTransportDrops,
+                   counters.delegateTransportDrops);
+      runtimeLogRevealed_ = runtimeLogRevealed_ || hasRecords || hasCounters;
+    }
+  }
+  if (countersStable) {
+    consumedLogEpoch_ = epoch;
+    consumedLogCounterTotals_ = counterTotals;
+  }
+  runtimeLogRevision_.fetch_add(1U, std::memory_order_release);
 }
 
 void Processor::timerCallback() {
+  drainRuntimeLogs();
   if (auto seed = worker_->takeSeedValues()) {
     if (seed->revision == worker_->requestGeneration()) {
       for (std::size_t index = 0; index < seed->count; ++index)
@@ -638,11 +1082,13 @@ void Processor::timerCallback() {
     replacementSeedPending_.store(false, std::memory_order_release);
   }
   const auto expected = expectedBlockSize_.load(std::memory_order_acquire);
-  if (expected > 0 && expected != static_cast<int>(dryScratch_[0].size())) {
+  if (expected > 0 &&
+      expected != configuredBlockSize_.load(std::memory_order_acquire)) {
     for (auto &channel : dryScratch_)
       channel.resize(static_cast<std::size_t>(expected));
     worker_->configure(expectedSampleRate_.load(std::memory_order_acquire),
                        expected);
+    configuredBlockSize_.store(expected, std::memory_order_release);
   }
   if (runtimeRecoveryRequested_.exchange(false, std::memory_order_acq_rel))
     worker_->requestRebuild();
@@ -668,6 +1114,7 @@ void Processor::getStateInformation(juce::MemoryBlock &destination) {
     stream.writeFloat(normalized(slotValue(index)));
   stream.writeInt(editorWidth_.load(std::memory_order_relaxed));
   stream.writeInt(editorHeight_.load(std::memory_order_relaxed));
+  stream.writeBool(paramControlLayout() == ParamControlLayout::knobs);
 }
 
 void Processor::setStateInformation(const void *data, const int byteCount) {
@@ -714,10 +1161,12 @@ void Processor::setStateInformation(const void *data, const int byteCount) {
         return;
       value = normalized(stream.readFloat());
     }
-    if (stream.getNumBytesRemaining() < 8U)
+    if (stream.getNumBytesRemaining() < 9U)
       return;
     const auto width = stream.readInt();
     const auto height = stream.readInt();
+    const auto layout = stream.readBool() ? ParamControlLayout::knobs
+                                          : ParamControlLayout::sliders;
 
     deactivateRequested_.store(true, std::memory_order_release);
     replacementSeedPending_.store(false, std::memory_order_release);
@@ -735,7 +1184,10 @@ void Processor::setStateInformation(const void *data, const int byteCount) {
             Worker::ExistingEnginePolicy::deactivateImmediately);
       }
     }
-    setEditorSize(width, height);
+    editorWidth_.store(std::clamp(width, 360, 1600), std::memory_order_relaxed);
+    editorHeight_.store(std::clamp(height, 480, 1400),
+                        std::memory_order_relaxed);
+    paramControlLayout_.store(layout, std::memory_order_relaxed);
     {
       std::lock_guard lock(stateMutex_);
       lastBrowseDirectory_ = pathFromJuce(*browseDirectory);

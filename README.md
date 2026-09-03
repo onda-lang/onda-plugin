@@ -1,7 +1,9 @@
 # Onda VST3 plugin
 
 This repository builds two VST3 plugins: `OndaSynth.vst3` and `OndaFX.vst3`.
-Both have 2 audio inputs and 2 audio outputs.
+Release builds expose 2 audio inputs and 2 audio outputs. `OndaSynth` clears
+its outputs while inactive; `OndaFX` passes through corresponding input
+channels and clears any additional outputs.
 
 ## DSP events
 
@@ -61,6 +63,21 @@ boundary only when the same snapshot also supplies tempo. Bar position and
 loop points use the host-provided values. Host context is not stored in plugin
 state and cannot be used to control the DAW.
 
+## Examples
+
+[`examples`](examples) contains tested, plug-in-ready instruments and effects
+that exercise MIDI, host tempo, polyphony, dynamics, nonlinear processing, and
+modulated delay. Load instrument patches in `OndaSynth` and effects in `OndaFX`
+through the embedded run view. The complete collection is included in every
+release archive.
+
+The embedded run view also shows a live scope of the plug-in output while its
+editor is open. Programs declaring canonical note events also get a read-only
+MIDI keyboard: host note-on/off messages illuminate its keys, while MIDI device
+selection and note input remain owned by the DAW. Editor dimensions and the
+Sliders/Knobs choice are retained when the view is reopened and saved in the DAW
+project.
+
 ## Audio-file buffers
 
 An `.ondaproject` input uses the immutable buffer defaults retained by Onda's
@@ -85,11 +102,16 @@ falls back to the saved project image. Clearing a binding restores an available
 `.ondaproject` default; otherwise the current engine remains inactive until
 every declared buffer is bound.
 
+Runtime output retained for the editor is bounded to 1,024 records and 256 KiB
+of text and source metadata. Older records are discarded first and included in
+the corresponding drop count shown by the logger.
+
 ## Build
 
 Requirements:
 
 - CMake 3.22+, Ninja, and a C++20 compiler
+- The plug-in version selected by [`plugin-version`](plugin-version)
 - The Onda release SDK selected by [`onda-version`](onda-version)
 - JUCE 8.0.13 at
   `7c9d3783b127263d72bb65fe0a7e2dc8a02a7ac2`
@@ -104,11 +126,30 @@ cmake --build build
 ctest --test-dir build --output-on-failure
 ```
 
-CMake reads the shared `onda-version` pin, downloads the platform's
-checksum-pinned release SDK, and fetches the exact release source revision
-needed for the embedded run-view resources. 
-`-DONDA_VERSION=x.y.z` overrides the pin explicitly; otherwise the
-`ONDA_VERSION` environment variable takes precedence over the file.
+The VST3 audio layout is fixed at compile time and defaults to 2 inputs and 2
+outputs. Custom builds can expose between 0 and 64 inputs and between 1 and 64
+outputs; for example:
+
+```sh
+cmake -S . -B build -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DONDA_PLUGIN_INPUT_CHANNELS=4 \
+  -DONDA_PLUGIN_OUTPUT_CHANNELS=8
+```
+
+An Onda program may declare up to the configured number of channels. Unused
+host inputs are ignored and unused host outputs are cleared. The published
+archives retain the default 2-input/2-output layout.
+
+CMake reads `plugin-version` for the embedded VST3 version and package release
+identity. `-DONDA_PLUGIN_VERSION=x.y.z` overrides it explicitly; otherwise the
+`ONDA_PLUGIN_VERSION` environment variable takes precedence over the file.
+
+Independently, `onda-version` selects the Onda SDK and the exact Onda source
+revision used for embedded run-view resources. `-DONDA_VERSION=x.y.z`
+overrides that pin; otherwise the `ONDA_VERSION` environment variable takes
+precedence over the file. This separation allows plug-in-only fixes to ship
+without changing the Onda SDK dependency.
 
 For a private Onda release, download the archive and its checksums using
 authenticated GitHub CLI and pass them explicitly:
@@ -142,3 +183,25 @@ ctest --test-dir build --output-on-failure
 The same checks can be run directly with
 `scripts/validate-vst3.sh /path/to/validator build`.
 
+## Releases
+
+Pull requests and pushes to `main` run clean Release builds and tests for Linux
+x64, Windows x64, and macOS arm64. Pushing a semantic version tag matching
+`plugin-version`, with or without a leading `v`, runs the same matrix and
+publishes the platform archives:
+
+```sh
+version="$(tr -d '\r\n' < plugin-version)"
+git tag "$version"
+git push origin "$version"
+```
+
+Each archive contains `OndaSynth.vst3`, `OndaFX.vst3`, the tested example
+collection, the project license, and third-party notices. The workflow creates
+a checksum manifest and publishes a new, immutable GitHub release. It never
+replaces assets on an existing release.
+Manual runs build without publishing by default; publishing can be enabled only
+when the workflow is dispatched from the matching release tag.
+
+macOS archives are unsigned and unnotarized. Users may need to approve the
+plug-ins explicitly in macOS Privacy & Security before a host can load them.

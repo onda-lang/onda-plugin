@@ -1,20 +1,24 @@
 cmake_minimum_required(VERSION 3.22)
 
-project(onda-plugin VERSION 0.1.0 LANGUAGES C CXX)
-
-include(FetchContent)
-include(CTest)
-
-option(ONDA_PLUGIN_BUILD_TESTS "Build the headless integration tests" ON)
-set(ONDA_SDK_ARCHIVE "" CACHE FILEPATH
-    "Optional pre-downloaded archive for the pinned Onda release SDK")
-set(ONDA_SDK_CHECKSUMS "" CACHE FILEPATH
-    "Optional pre-downloaded SHA256SUMS.txt for the pinned Onda release")
-set(ONDA_RELEASE_SOURCE_DIR "" CACHE PATH
-    "Optional checkout of the pinned Onda release, used only for UI resources")
-set(ONDA_JUCE_ROOT "" CACHE PATH "Optional local JUCE checkout")
-set(ONDA_VST3_VALIDATOR "" CACHE FILEPATH
-    "Optional Steinberg VST3 validator executable")
+if(NOT DEFINED ONDA_PLUGIN_VERSION OR ONDA_PLUGIN_VERSION STREQUAL "")
+    if(DEFINED ENV{ONDA_PLUGIN_VERSION}
+            AND NOT "$ENV{ONDA_PLUGIN_VERSION}" STREQUAL "")
+        set(ONDA_PLUGIN_VERSION "$ENV{ONDA_PLUGIN_VERSION}")
+    else()
+        set(ONDA_PLUGIN_VERSION_FILE
+            "${CMAKE_CURRENT_SOURCE_DIR}/plugin-version")
+        if(NOT EXISTS "${ONDA_PLUGIN_VERSION_FILE}")
+            message(FATAL_ERROR
+                "Plugin version file not found: ${ONDA_PLUGIN_VERSION_FILE}")
+        endif()
+        file(STRINGS "${ONDA_PLUGIN_VERSION_FILE}" ONDA_PLUGIN_VERSION
+            LIMIT_COUNT 1)
+    endif()
+endif()
+string(STRIP "${ONDA_PLUGIN_VERSION}" ONDA_PLUGIN_VERSION)
+if(NOT ONDA_PLUGIN_VERSION MATCHES "^[0-9]+\\.[0-9]+\\.[0-9]+$")
+    message(FATAL_ERROR "Invalid plugin version '${ONDA_PLUGIN_VERSION}'")
+endif()
 
 if(NOT DEFINED ONDA_VERSION OR ONDA_VERSION STREQUAL "")
     if(DEFINED ENV{ONDA_VERSION} AND NOT "$ENV{ONDA_VERSION}" STREQUAL "")
@@ -32,7 +36,45 @@ string(STRIP "${ONDA_VERSION}" ONDA_VERSION)
 if(NOT ONDA_VERSION MATCHES "^[0-9]+\\.[0-9]+\\.[0-9]+$")
     message(FATAL_ERROR "Invalid Onda version '${ONDA_VERSION}'")
 endif()
-message(STATUS "Building with Onda version: ${ONDA_VERSION}")
+
+project(onda-plugin VERSION "${ONDA_PLUGIN_VERSION}" LANGUAGES C CXX)
+
+include(FetchContent)
+include(CTest)
+
+option(ONDA_PLUGIN_BUILD_TESTS "Build the headless integration tests" ON)
+set(ONDA_PLUGIN_INPUT_CHANNELS "2" CACHE STRING
+    "Number of audio input channels exposed by each VST3")
+set(ONDA_PLUGIN_OUTPUT_CHANNELS "2" CACHE STRING
+    "Number of audio output channels exposed by each VST3")
+
+function(validate_channel_count variable minimum)
+    if(NOT "${${variable}}" MATCHES "^(0|[1-9][0-9]?)$")
+        message(FATAL_ERROR
+            "${variable} must be an integer between ${minimum} and 64")
+    endif()
+    if(${variable} LESS ${minimum} OR ${variable} GREATER 64)
+        message(FATAL_ERROR
+            "${variable} must be an integer between ${minimum} and 64")
+    endif()
+endfunction()
+
+validate_channel_count(ONDA_PLUGIN_INPUT_CHANNELS 0)
+validate_channel_count(ONDA_PLUGIN_OUTPUT_CHANNELS 1)
+
+set(ONDA_SDK_ARCHIVE "" CACHE FILEPATH
+    "Optional pre-downloaded archive for the pinned Onda release SDK")
+set(ONDA_SDK_CHECKSUMS "" CACHE FILEPATH
+    "Optional pre-downloaded SHA256SUMS.txt for the pinned Onda release")
+set(ONDA_RELEASE_SOURCE_DIR "" CACHE PATH
+    "Optional checkout of the pinned Onda release, used only for UI resources")
+set(ONDA_JUCE_ROOT "" CACHE PATH "Optional local JUCE checkout")
+set(ONDA_VST3_VALIDATOR "" CACHE FILEPATH
+    "Optional Steinberg VST3 validator executable")
+
+message(STATUS
+    "Building Onda VST3 ${PROJECT_VERSION} with Onda SDK ${ONDA_VERSION} "
+    "(${ONDA_PLUGIN_INPUT_CHANNELS} inputs, ${ONDA_PLUGIN_OUTPUT_CHANNELS} outputs)")
 
 set(JUCE_REVISION "7c9d3783b127263d72bb65fe0a7e2dc8a02a7ac2")
 
@@ -201,6 +243,7 @@ if(ONDA_JUCE_ROOT)
             "JUCE revision mismatch: expected ${JUCE_REVISION}, got ${JUCE_HEAD}")
     endif()
     add_subdirectory("${ONDA_JUCE_ROOT}" "${CMAKE_BINARY_DIR}/juce")
+    set(ONDA_JUCE_SOURCE_DIR "${ONDA_JUCE_ROOT}")
 else()
     FetchContent_Declare(
         JUCE
@@ -209,7 +252,82 @@ else()
         GIT_SHALLOW FALSE
     )
     FetchContent_MakeAvailable(JUCE)
+    set(ONDA_JUCE_SOURCE_DIR "${juce_SOURCE_DIR}")
 endif()
+
+set(ONDA_RELEASE_LICENSE_DIR "${CMAKE_BINARY_DIR}/release-licenses")
+file(REMOVE_RECURSE "${ONDA_RELEASE_LICENSE_DIR}")
+file(MAKE_DIRECTORY "${ONDA_RELEASE_LICENSE_DIR}")
+
+function(copy_onda_release_license source destination)
+    if(NOT EXISTS "${source}")
+        message(FATAL_ERROR "Required release license not found: ${source}")
+    endif()
+    configure_file("${source}"
+        "${ONDA_RELEASE_LICENSE_DIR}/${destination}" COPYONLY)
+endfunction()
+
+foreach(ONDA_SDK_LICENSE_PATH IN ITEMS LICENSE THIRD_PARTY_NOTICES.md licenses)
+    if(NOT EXISTS "${ONDA_SDK_ROOT}/${ONDA_SDK_LICENSE_PATH}")
+        message(FATAL_ERROR
+            "Required Onda SDK release material not found: "
+            "${ONDA_SDK_ROOT}/${ONDA_SDK_LICENSE_PATH}")
+    endif()
+endforeach()
+file(MAKE_DIRECTORY "${ONDA_RELEASE_LICENSE_DIR}/Onda")
+file(COPY
+    "${ONDA_SDK_ROOT}/LICENSE"
+    "${ONDA_SDK_ROOT}/THIRD_PARTY_NOTICES.md"
+    "${ONDA_SDK_ROOT}/licenses"
+    DESTINATION "${ONDA_RELEASE_LICENSE_DIR}/Onda")
+
+if(WIN32)
+    set(ONDA_WEBVIEW2_ROOT "${JUCE_WEBVIEW2_PACKAGE_LOCATION}")
+    if(NOT EXISTS "${ONDA_WEBVIEW2_ROOT}/LICENSE.txt")
+        file(GLOB ONDA_WEBVIEW2_LICENSES
+            "${JUCE_WEBVIEW2_PACKAGE_LOCATION}/Microsoft.Web.WebView2.*/LICENSE.txt")
+        list(LENGTH ONDA_WEBVIEW2_LICENSES ONDA_WEBVIEW2_LICENSE_COUNT)
+        if(NOT ONDA_WEBVIEW2_LICENSE_COUNT EQUAL 1)
+            message(FATAL_ERROR
+                "Expected one Microsoft.Web.WebView2 package license under "
+                "${JUCE_WEBVIEW2_PACKAGE_LOCATION}, found "
+                "${ONDA_WEBVIEW2_LICENSE_COUNT}")
+        endif()
+        list(GET ONDA_WEBVIEW2_LICENSES 0 ONDA_WEBVIEW2_LICENSE)
+        get_filename_component(ONDA_WEBVIEW2_ROOT
+            "${ONDA_WEBVIEW2_LICENSE}" DIRECTORY)
+    endif()
+    copy_onda_release_license(
+        "${ONDA_WEBVIEW2_ROOT}/LICENSE.txt" "WebView2-LICENSE.txt")
+    copy_onda_release_license(
+        "${ONDA_WEBVIEW2_ROOT}/NOTICE.txt" "WebView2-NOTICE.txt")
+endif()
+
+copy_onda_release_license("${ONDA_JUCE_SOURCE_DIR}/LICENSE.md" "JUCE-LICENSE.md")
+copy_onda_release_license(
+    "${ONDA_JUCE_SOURCE_DIR}/modules/juce_audio_processors_headless/format_types/VST3_SDK/LICENSE.txt"
+    "VST3-SDK-LICENSE.txt")
+copy_onda_release_license(
+    "${ONDA_JUCE_SOURCE_DIR}/modules/juce_audio_formats/codecs/flac/Flac Licence.txt"
+    "FLAC-LICENSE.txt")
+copy_onda_release_license(
+    "${ONDA_JUCE_SOURCE_DIR}/modules/juce_audio_formats/codecs/oggvorbis/Ogg Vorbis Licence.txt"
+    "Ogg-Vorbis-LICENSE.txt")
+copy_onda_release_license(
+    "${ONDA_JUCE_SOURCE_DIR}/modules/juce_core/zip/zlib/LICENSE"
+    "zlib-LICENSE.txt")
+copy_onda_release_license(
+    "${ONDA_JUCE_SOURCE_DIR}/modules/juce_graphics/image_formats/pnglib/LICENSE"
+    "libpng-LICENSE.txt")
+copy_onda_release_license(
+    "${ONDA_JUCE_SOURCE_DIR}/modules/juce_graphics/image_formats/jpglib/README"
+    "libjpeg-README.txt")
+copy_onda_release_license(
+    "${ONDA_JUCE_SOURCE_DIR}/modules/juce_graphics/fonts/harfbuzz/COPYING"
+    "HarfBuzz-COPYING.txt")
+copy_onda_release_license(
+    "${ONDA_JUCE_SOURCE_DIR}/modules/juce_graphics/unicode/sheenbidi/LICENSE"
+    "SheenBidi-LICENSE.txt")
 
 juce_add_binary_data(onda_run_resources
     NAMESPACE OndaRunResources
@@ -229,6 +347,7 @@ add_library(onda_plugin_engine STATIC
     src/ProjectExport.cpp
     src/ProjectExport.h
     src/Product.h
+    src/RuntimeLog.h
     src/SpscSlot.h
     src/Worker.cpp
     src/Worker.h
@@ -239,7 +358,11 @@ target_link_libraries(onda_plugin_engine
     PUBLIC Onda::Static
     PRIVATE juce::juce_audio_formats
 )
-target_compile_definitions(onda_plugin_engine PUBLIC JUCE_USE_CURL=0)
+target_compile_definitions(onda_plugin_engine PUBLIC
+    JUCE_USE_CURL=0
+    ONDA_PLUGIN_INPUT_CHANNELS=${ONDA_PLUGIN_INPUT_CHANNELS}
+    ONDA_PLUGIN_OUTPUT_CHANNELS=${ONDA_PLUGIN_OUTPUT_CHANNELS}
+)
 set_target_properties(onda_plugin_engine PROPERTIES
     CXX_EXTENSIONS OFF
     POSITION_INDEPENDENT_CODE ON
@@ -268,6 +391,7 @@ function(add_onda_plugin target product_name plugin_code is_synth)
         IS_MIDI_EFFECT FALSE
         COPY_PLUGIN_AFTER_BUILD FALSE
         NEEDS_WEB_BROWSER TRUE
+        NEEDS_WEBVIEW2 TRUE
     )
     juce_generate_juce_header(${target})
     target_sources(${target} PRIVATE
@@ -279,6 +403,8 @@ function(add_onda_plugin target product_name plugin_code is_synth)
         src/Processor.h
         src/RunViewHost.cpp
         src/RunViewHost.h
+        src/ScopeCapture.h
+        src/SpscQueue.h
     )
     target_link_libraries(${target} PRIVATE
         onda_plugin_engine
@@ -310,7 +436,30 @@ add_onda_plugin(OndaFX "OndaFX" Oefx FALSE
 target_compile_definitions(OndaFX PRIVATE
     ONDA_PLUGIN_PRODUCT_EFFECT=1)
 
+# JUCE shares one generated Linux web-browser subprocess source between all
+# targets in this directory. Unix Makefiles can otherwise invoke its generator
+# concurrently for both plug-ins and race while renaming the same output file.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_dependencies(OndaFX OndaSynth)
+endif()
+
 if(BUILD_TESTING AND ONDA_PLUGIN_BUILD_TESTS)
+    add_executable(onda_example_tests tests/ExampleTests.cpp)
+    target_compile_features(onda_example_tests PRIVATE cxx_std_20)
+    target_compile_definitions(onda_example_tests PRIVATE
+        ONDA_PLUGIN_EXAMPLES_DIR="${CMAKE_CURRENT_SOURCE_DIR}/examples")
+    target_link_libraries(onda_example_tests PRIVATE onda_plugin_engine)
+    if(MSVC)
+        target_compile_options(onda_example_tests PRIVATE /W4 /permissive-)
+    else()
+        target_compile_options(onda_example_tests PRIVATE
+            -Wall -Wextra -Wpedantic -Wconversion -Wsign-conversion)
+    endif()
+    if(ONDA_PLUGIN_INPUT_CHANNELS EQUAL 2 AND
+            ONDA_PLUGIN_OUTPUT_CHANNELS EQUAL 2)
+        add_test(NAME onda_example_tests COMMAND onda_example_tests)
+    endif()
+
     add_executable(onda_plugin_tests tests/EngineTests.cpp)
     target_compile_features(onda_plugin_tests PRIVATE cxx_std_20)
     target_link_libraries(onda_plugin_tests PRIVATE
@@ -323,7 +472,10 @@ if(BUILD_TESTING AND ONDA_PLUGIN_BUILD_TESTS)
         target_compile_options(onda_plugin_tests PRIVATE
             -Wall -Wextra -Wpedantic -Wconversion -Wsign-conversion)
     endif()
-    add_test(NAME onda_plugin_tests COMMAND onda_plugin_tests)
+    if(ONDA_PLUGIN_INPUT_CHANNELS EQUAL 2 AND
+            ONDA_PLUGIN_OUTPUT_CHANNELS EQUAL 2)
+        add_test(NAME onda_plugin_tests COMMAND onda_plugin_tests)
+    endif()
 
     add_executable(onda_processor_tests
         tests/ProcessorTests.cpp
@@ -334,6 +486,7 @@ if(BUILD_TESTING AND ONDA_PLUGIN_BUILD_TESTS)
         src/Processor.h
         src/RunViewHost.cpp
         src/RunViewHost.h
+        src/SpscQueue.h
     )
     target_compile_features(onda_processor_tests PRIVATE cxx_std_20)
     target_link_libraries(onda_processor_tests PRIVATE
@@ -352,7 +505,11 @@ if(BUILD_TESTING AND ONDA_PLUGIN_BUILD_TESTS)
         JUCE_VST3_CAN_REPLACE_VST2=0
         JUCE_USE_WIN_WEBVIEW2_WITH_STATIC_LINKING=1
     )
+    if(WIN32)
+        target_link_libraries(onda_processor_tests PRIVATE juce::juce_webview2)
+    endif()
     if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        add_dependencies(onda_processor_tests OndaFX)
         target_link_libraries(onda_processor_tests PRIVATE
             juce::pkgconfig_JUCE_BROWSER_LINUX_DEPS)
         target_link_options(onda_processor_tests PRIVATE
@@ -365,7 +522,10 @@ if(BUILD_TESTING AND ONDA_PLUGIN_BUILD_TESTS)
         target_compile_options(onda_processor_tests PRIVATE
             -Wall -Wextra -Wpedantic -Wconversion -Wsign-conversion)
     endif()
-    add_test(NAME onda_processor_tests COMMAND onda_processor_tests)
+    if(ONDA_PLUGIN_INPUT_CHANNELS EQUAL 2 AND
+            ONDA_PLUGIN_OUTPUT_CHANNELS EQUAL 2)
+        add_test(NAME onda_processor_tests COMMAND onda_processor_tests)
+    endif()
 
     add_executable(onda_vst3_smoke tests/Vst3Smoke.cpp)
     target_compile_features(onda_vst3_smoke PRIVATE cxx_std_20)
@@ -376,6 +536,9 @@ if(BUILD_TESTING AND ONDA_PLUGIN_BUILD_TESTS)
         ${CMAKE_DL_LIBS}
     )
     target_compile_definitions(onda_vst3_smoke PRIVATE
+        ONDA_PLUGIN_VERSION="${PROJECT_VERSION}"
+        ONDA_PLUGIN_INPUT_CHANNELS=${ONDA_PLUGIN_INPUT_CHANNELS}
+        ONDA_PLUGIN_OUTPUT_CHANNELS=${ONDA_PLUGIN_OUTPUT_CHANNELS}
         JUCE_PLUGINHOST_AU=0
         JUCE_PLUGINHOST_LADSPA=0
         JUCE_PLUGINHOST_LV2=0

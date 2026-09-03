@@ -8,11 +8,15 @@
 #include <memory>
 #include <thread>
 
+#ifndef ONDA_PLUGIN_VERSION
+#error "ONDA_PLUGIN_VERSION must match the version embedded by JUCE"
+#endif
+
 namespace {
 
 struct ProductExpectation {
   const char *name;
-  int inputChannels;
+  bool dryFallback;
   const char *componentCid;
   const char *controllerCid;
 };
@@ -31,8 +35,8 @@ struct ProductExpectation {
   return false;
 }
 
-[[nodiscard]] bool checkIdentities(const juce::File &bundle,
-                                   const ProductExpectation &expected) {
+[[nodiscard]] bool checkMetadata(const juce::File &bundle,
+                                 const ProductExpectation &expected) {
   const auto moduleInfo = bundle.getChildFile("Contents")
                               .getChildFile("Resources")
                               .getChildFile("moduleinfo.json");
@@ -42,7 +46,10 @@ struct ProductExpectation {
   }
 
   const auto contents = moduleInfo.loadFileAsString();
-  return check(contents.contains("\"CID\": \"" +
+  return check(contents.contains("\"Version\": \"" ONDA_PLUGIN_VERSION "\""),
+               juce::String(expected.name) +
+                   " module version does not match plugin-version") &&
+         check(contents.contains("\"CID\": \"" +
                                  juce::String(expected.componentCid) + "\""),
                juce::String(expected.name) +
                    " component CID changed unexpectedly") &&
@@ -59,7 +66,7 @@ struct ProductExpectation {
   if (!check(bundle.isDirectory(),
              "VST3 bundle not found for " + module.getFullPathName()))
     return false;
-  if (!checkIdentities(bundle, expected))
+  if (!checkMetadata(bundle, expected))
     return false;
 
   juce::OwnedArray<juce::PluginDescription> descriptions;
@@ -72,6 +79,11 @@ struct ProductExpectation {
   if (!check(description.name == expected.name,
              "Unexpected product name: " + description.name))
     return false;
+  if (!check(description.version == ONDA_PLUGIN_VERSION,
+             description.name + " reported version " + description.version +
+                 " instead of " ONDA_PLUGIN_VERSION)) {
+    return false;
+  }
 
   juce::String error;
   auto instance =
@@ -144,9 +156,10 @@ struct ProductExpectation {
   succeeded &= check(!instance->supportsDoublePrecisionProcessing(),
                      description.name + " must be f32-only");
   succeeded &=
-      check(instance->getTotalNumInputChannels() == expected.inputChannels,
+      check(instance->getTotalNumInputChannels() == ONDA_PLUGIN_INPUT_CHANNELS,
             description.name + " input layout mismatch");
-  succeeded &= check(instance->getTotalNumOutputChannels() == 2,
+  succeeded &= check(instance->getTotalNumOutputChannels() ==
+                         ONDA_PLUGIN_OUTPUT_CHANNELS,
                      description.name + " output layout mismatch");
 
   juce::MemoryBlock firstState;
@@ -162,7 +175,8 @@ struct ProductExpectation {
 
   instance->prepareToPlay(48000.0, 512);
   secondInstance->prepareToPlay(48000.0, 512);
-  const auto channels = juce::jmax(expected.inputChannels, 2);
+  const auto channels =
+      juce::jmax(ONDA_PLUGIN_INPUT_CHANNELS, ONDA_PLUGIN_OUTPUT_CHANNELS);
   std::atomic<bool> concurrentProcessingSucceeded{true};
   const auto process = [&](juce::AudioPluginInstance &target) {
     juce::AudioBuffer<float> audio(channels, 512);
@@ -173,8 +187,10 @@ struct ProductExpectation {
         std::fill_n(audio.getWritePointer(channel), audio.getNumSamples(),
                     1.0F);
       target.processBlock(audio, midi);
-      const auto expectedSample = expected.inputChannels == 0 ? 0.0F : 1.0F;
-      for (int channel = 0; channel < 2; ++channel) {
+      for (int channel = 0; channel < ONDA_PLUGIN_OUTPUT_CHANNELS; ++channel) {
+        const auto expectedSample =
+            expected.dryFallback && channel < ONDA_PLUGIN_INPUT_CHANNELS ? 1.0F
+                                                                         : 0.0F;
         for (int frame = 0; frame < audio.getNumSamples(); ++frame) {
           if (std::abs(audio.getSample(channel, frame) - expectedSample) >=
               0.000001F) {
@@ -210,9 +226,9 @@ int main(const int argc, const char *const *argv) {
   juce::ScopedJuceInitialiser_GUI juceInitialiser;
   juce::VST3PluginFormatHeadless format;
   constexpr std::array expectations{
-      ProductExpectation{"OndaSynth", 0, "ABCDEF019182FAEB4F6E64614F64796E",
+      ProductExpectation{"OndaSynth", false, "ABCDEF019182FAEB4F6E64614F64796E",
                          "ABCDEF011234ABCD4F6E64614F64796E"},
-      ProductExpectation{"OndaFX", 2, "ABCDEF019182FAEB4F6E64614F656678",
+      ProductExpectation{"OndaFX", true, "ABCDEF019182FAEB4F6E64614F656678",
                          "ABCDEF011234ABCD4F6E64614F656678"},
   };
 

@@ -2,6 +2,7 @@
 
 #include "OndaSdk.h"
 #include "Product.h"
+#include "RuntimeLog.h"
 
 #include <array>
 #include <atomic>
@@ -93,6 +94,22 @@ struct ParameterMapping {
   std::optional<std::uint32_t> stepCount;
 };
 
+struct EventParameterMapping {
+  std::string name;
+  std::string type;
+  int elementType{-1};
+  int arrayLength{1};
+  bool array{};
+  bool slice{};
+  std::vector<std::byte> defaultBytes;
+};
+
+struct EventMapping {
+  int index{-1};
+  std::string name;
+  std::vector<EventParameterMapping> parameters;
+};
+
 struct BufferFileBinding {
   std::string name;
   std::filesystem::path path;
@@ -148,7 +165,8 @@ public:
           const HostContext &hostContext = {},
           int hostCallbackOffset = 0) noexcept;
 
-  void reset() noexcept;
+  [[nodiscard]] bool reset() noexcept;
+  void attachLogSink(RuntimeLogSink &sink) noexcept;
 
   [[nodiscard]] double sampleRate() const noexcept { return sampleRate_; }
   [[nodiscard]] int blockSize() const noexcept { return blockSize_; }
@@ -161,6 +179,13 @@ public:
   [[nodiscard]] std::span<const BufferMapping> bufferMappings() const {
     return bufferMappings_;
   }
+  [[nodiscard]] std::span<const EventMapping> eventMappings() const {
+    return eventMappings_;
+  }
+  [[nodiscard]] bool
+  triggerEvent(int index, std::span<const std::byte> payload,
+               const std::array<std::atomic<float> *, slotCount> &slots,
+               const HostContext &hostContext = {}) noexcept;
   [[nodiscard]] bool handlesMidi(MidiKind kind) const noexcept;
   [[nodiscard]] bool handlesHostContext(HostContextKind kind) const noexcept;
   [[nodiscard]] bool needsPositionInfo() const noexcept {
@@ -175,6 +200,25 @@ private:
     float sampleRate{};
   };
 
+  struct DelegateParamMetadata {
+    std::string name;
+    int elementType{-1};
+    int arrayLength{};
+    bool array{};
+    bool slice{};
+  };
+
+  struct DelegateMetadata {
+    std::string name;
+    std::vector<DelegateParamMetadata> parameters;
+  };
+
+  struct LogSiteMetadata {
+    std::string sourceFile;
+    std::string lexicalOwner;
+    std::uint32_t line{};
+  };
+
   PreparedEngine(Product product, double sampleRate, int blockSize,
                  ProgramHandle program, InstanceHandle instance,
                  int inputChannels, int outputChannels,
@@ -185,6 +229,24 @@ private:
   build(CompileResult compiled, Product product, double sampleRate,
         int blockSize, std::span<const BufferFileBinding> bufferBindings,
         const std::filesystem::path &diskEntry);
+
+  [[nodiscard]] bool prepareRuntimeOutput(Diagnostic &diagnostic);
+  [[nodiscard]] bool initialize() noexcept;
+  void collectExecutionOutput() noexcept;
+  void flushPendingLogs() noexcept;
+  [[nodiscard]] bool
+  publishPrint(const onda_print_occurrence_t &occurrence) noexcept;
+  [[nodiscard]] bool
+  publishDelegate(const onda_delegate_occurrence_t &occurrence) noexcept;
+  template <typename Formatter>
+  [[nodiscard]] bool publish(RuntimeLogKind kind,
+                             Formatter &&formatter) noexcept;
+  void addGeneratedOverflow(RuntimeLogKind kind, std::uint32_t count) noexcept;
+  void addTransportDrop(RuntimeLogKind kind, std::uint64_t count = 1U) noexcept;
+
+  template <typename... Values>
+  [[nodiscard]] bool trigger(const EventBinding &binding,
+                             Values... values) noexcept;
 
   [[nodiscard]] bool processSegment(
       float *const *hostInputs, float *const *hostOutputs, int callbackOffset,
@@ -214,6 +276,18 @@ private:
   // instance after their storage makes it the first of these members destroyed.
   InstanceHandle instance_;
   std::vector<BufferMapping> bufferMappings_;
+  std::vector<EventMapping> eventMappings_;
+  std::vector<DelegateMetadata> delegates_;
+  std::vector<LogSiteMetadata> logSites_;
+  std::vector<std::uint8_t> delegateBatchStorage_;
+  std::vector<std::uint8_t> printBatchStorage_;
+  onda_delegate_batch_t delegateBatch_{};
+  onda_print_batch_t printBatch_{};
+  onda_execution_output_t executionOutput_{};
+  RuntimeLogSink *logSink_{};
+  std::vector<RuntimeLogEntry> pendingLogs_;
+  std::size_t pendingLogRead_{};
+  RuntimeLogCounters pendingLogCounters_{};
   int logicalFrame_{};
   bool blockStarted_{};
   std::array<ParameterMapping, slotCount> parameterMappings_{};

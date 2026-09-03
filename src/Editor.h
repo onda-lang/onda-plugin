@@ -25,13 +25,20 @@ private:
   void timerCallback() override;
   void handleCommand(const juce::var &command);
   void publishState(bool force);
+  void publishMidiActivity(bool force = false);
+  void publishScope();
 
   Processor &processor_;
   std::unique_ptr<Browser> browser_;
+  juce::Label loadingOverlay_;
   std::unique_ptr<juce::FileChooser> fileChooser_;
   std::uint64_t publishedRevision_{};
+  std::uint64_t publishedLogRevision_{};
+  std::uint64_t publishedMidiRevision_{};
   std::array<float, 32U> publishedSlots_{};
+  bool publishedKnobLayout_{};
   bool hasPublished_{};
+  bool hasPublishedMidi_{};
   std::array<bool, 32U> activeGestures_{};
   std::string actionError_;
 

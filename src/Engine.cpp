@@ -4,10 +4,13 @@
 
 #include <algorithm>
 #include <array>
+#include <charconv>
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <span>
 #include <string_view>
+#include <utility>
 
 namespace onda::plugin {
 namespace {
@@ -17,6 +20,9 @@ static_assert(sizeof(double) == 8U);
 static_assert(sizeof(std::int32_t) == 4U);
 static_assert(sizeof(std::int64_t) == 8U);
 
+constexpr std::size_t runtimeBatchCapacity = 64U * 1024U;
+constexpr std::size_t maximumPendingLogEntries = runtimeLogQueueCapacity - 1U;
+
 Diagnostic error(std::string message) {
   Diagnostic result;
   result.message = std::move(message);
@@ -24,7 +30,7 @@ Diagnostic error(std::string message) {
 }
 
 int flattenedChannels(const onda_program_t *program, const bool input,
-                      Diagnostic &diagnostic) {
+                      const int maximumChannels, Diagnostic &diagnostic) {
   const auto count =
       input ? onda_input_count(program) : onda_output_count(program);
   if (count < 0) {
@@ -39,9 +45,10 @@ int flattenedChannels(const onda_program_t *program, const bool input,
     const auto arrayLength = input ? onda_input_array_len(program, index)
                                    : onda_output_array_len(program, index);
     if (primitive != ONDA_PRIMITIVE_F32 || arrayLength <= 0 ||
-        channels > 2 - arrayLength) {
-      diagnostic = error(
-          "Audio inputs and outputs must flatten to at most two f32 channels");
+        channels > maximumChannels - arrayLength) {
+      diagnostic = error("Audio " + std::string(input ? "inputs" : "outputs") +
+                         " must flatten to at most " +
+                         std::to_string(maximumChannels) + " f32 channels");
       return -1;
     }
     channels += arrayLength;
@@ -288,6 +295,96 @@ constexpr std::array<ExpectedEvent,
         {"render_mode", renderModeNames, renderModeTypes, "host-context"},
     }};
 
+bool isPluginEvent(const std::string_view name) noexcept {
+  const auto named = [name](const ExpectedEvent &event) {
+    return event.name == name;
+  };
+  return std::ranges::any_of(expectedMidiEvents, named) ||
+         std::ranges::any_of(expectedHostContextEvents, named);
+}
+
+bool collectVisibleEvents(const onda_program_t *program,
+                          std::vector<EventMapping> &events,
+                          Diagnostic &diagnostic) {
+  const auto count = onda_event_count(program);
+  if (count < 0) {
+    diagnostic = error("Onda returned invalid event metadata");
+    return false;
+  }
+  events.reserve(static_cast<std::size_t>(count));
+  for (int eventIndex = 0; eventIndex < count; ++eventIndex) {
+    const auto *rawName = onda_event_name(program, eventIndex);
+    const auto parameterCount = onda_event_param_count(program, eventIndex);
+    if (rawName == nullptr || parameterCount < 0) {
+      diagnostic = error("Onda returned invalid event metadata");
+      return false;
+    }
+    if (isPluginEvent(rawName))
+      continue;
+
+    EventMapping event{
+        .index = eventIndex,
+        .name = rawName,
+        .parameters = {},
+    };
+    event.parameters.reserve(static_cast<std::size_t>(parameterCount));
+    for (int parameterIndex = 0; parameterIndex < parameterCount;
+         ++parameterIndex) {
+      const auto *parameterName =
+          onda_event_param_name(program, eventIndex, parameterIndex);
+      const auto elementType =
+          onda_event_param_elem_type(program, eventIndex, parameterIndex);
+      const auto type = parameterType(elementType);
+      const auto arrayLength =
+          onda_event_param_array_len(program, eventIndex, parameterIndex);
+      const auto isArray =
+          onda_event_param_is_array(program, eventIndex, parameterIndex);
+      const auto isSlice =
+          onda_event_param_is_slice(program, eventIndex, parameterIndex);
+      if (parameterName == nullptr || !type || arrayLength < 0 ||
+          (isArray != 0 && isArray != 1) || (isSlice != 0 && isSlice != 1) ||
+          (isArray == 1 && (isSlice == 1 || arrayLength <= 0)) ||
+          (isSlice == 1 && arrayLength != 0) ||
+          (isArray == 0 && isSlice == 0 && arrayLength != 1)) {
+        diagnostic = error("Onda returned invalid event metadata");
+        return false;
+      }
+
+      EventParameterMapping parameter{
+          .name = parameterName,
+          .type = *type,
+          .elementType = elementType,
+          .arrayLength = arrayLength,
+          .array = isArray == 1,
+          .slice = isSlice == 1,
+          .defaultBytes = {},
+      };
+      if (parameter.array)
+        parameter.type += "[" + std::to_string(arrayLength) + "]";
+      else if (parameter.slice)
+        parameter.type += "[]";
+
+      const auto defaultBytes = onda_event_param_default_bytes(
+          program, eventIndex, parameterIndex, nullptr, 0);
+      if (defaultBytes < 0) {
+        diagnostic = error("Onda returned invalid event metadata");
+        return false;
+      }
+      parameter.defaultBytes.resize(static_cast<std::size_t>(defaultBytes));
+      if (defaultBytes > 0 &&
+          onda_event_param_default_bytes(program, eventIndex, parameterIndex,
+                                         parameter.defaultBytes.data(),
+                                         defaultBytes) != defaultBytes) {
+        diagnostic = error("Onda returned invalid event metadata");
+        return false;
+      }
+      event.parameters.push_back(std::move(parameter));
+    }
+    events.push_back(std::move(event));
+  }
+  return true;
+}
+
 std::size_t primitiveBytes(const int primitive) noexcept {
   switch (primitive) {
   case ONDA_PRIMITIVE_BOOL:
@@ -303,6 +400,68 @@ std::size_t primitiveBytes(const int primitive) noexcept {
   default:
     return 0U;
   }
+}
+
+bool appendText(RuntimeLogEntry &entry, const std::string_view text) noexcept {
+  const auto available = entry.text.size() - entry.textBytes;
+  if (text.size() > available)
+    return false;
+  std::memcpy(entry.text.data() + entry.textBytes, text.data(), text.size());
+  entry.textBytes += static_cast<std::uint32_t>(text.size());
+  return true;
+}
+
+template <typename Value>
+bool appendNumber(RuntimeLogEntry &entry, const Value value) noexcept {
+  std::array<char, 64U> text{};
+  const auto converted =
+      std::to_chars(text.data(), text.data() + text.size(), value);
+  return converted.ec == std::errc{} &&
+         appendText(entry, {text.data(), converted.ptr});
+}
+
+bool appendScalar(RuntimeLogEntry &entry, const int elementType,
+                  const std::uint8_t *bytes) noexcept {
+  switch (elementType) {
+  case ONDA_PRIMITIVE_BOOL:
+    return appendText(entry, bytes[0] == 0U ? "false" : "true");
+  case ONDA_PRIMITIVE_F32: {
+    float value{};
+    std::memcpy(&value, bytes, sizeof(value));
+    return appendNumber(entry, value);
+  }
+  case ONDA_PRIMITIVE_F64: {
+    double value{};
+    std::memcpy(&value, bytes, sizeof(value));
+    return appendNumber(entry, value);
+  }
+  case ONDA_PRIMITIVE_I32: {
+    std::int32_t value{};
+    std::memcpy(&value, bytes, sizeof(value));
+    return appendNumber(entry, value);
+  }
+  case ONDA_PRIMITIVE_I64: {
+    std::int64_t value{};
+    std::memcpy(&value, bytes, sizeof(value));
+    return appendNumber(entry, value);
+  }
+  default:
+    return false;
+  }
+}
+
+template <std::size_t Size>
+std::uint32_t copyText(std::array<char, Size> &destination,
+                       const std::string_view source) noexcept {
+  auto bytes = std::min(source.size(), destination.size());
+  if (bytes < source.size()) {
+    while (bytes != 0U &&
+           (static_cast<unsigned char>(source[bytes]) & 0xc0U) == 0x80U) {
+      --bytes;
+    }
+  }
+  std::memcpy(destination.data(), source.data(), bytes);
+  return static_cast<std::uint32_t>(bytes);
 }
 
 bool validateEvent(const onda_program_t *program, const ExpectedEvent &expected,
@@ -380,10 +539,11 @@ bool writePayload(std::array<std::byte, 32U> &payload, const int payloadBytes,
   return true;
 }
 
+} // namespace
+
 template <typename... Values>
-bool triggerEvent(onda_instance_t *const instance,
-                  const PreparedEngine::EventBinding &binding,
-                  const Values... values) noexcept {
+bool PreparedEngine::trigger(const EventBinding &binding,
+                             Values... values) noexcept {
   if (binding.index < 0)
     return true;
   std::array<std::byte, 32U> payload{};
@@ -391,12 +551,14 @@ bool triggerEvent(onda_instance_t *const instance,
   const auto valid = (writePayload(payload, binding.payloadBytes,
                                    binding.offsets[index++], values) &&
                       ...);
-  return valid && onda_trigger_event_by_index_unchecked(
-                      instance, binding.index, payload.data(),
-                      binding.payloadBytes) == 0;
+  if (!valid)
+    return false;
+  const auto status = onda_trigger_event_by_index_unchecked(
+      instance_.get(), binding.index, payload.data(), binding.payloadBytes,
+      &executionOutput_);
+  collectExecutionOutput();
+  return status == 0;
 }
-
-} // namespace
 
 PreparedEngine::PreparedEngine(
     Product product, const double sampleRate, const int blockSize,
@@ -410,6 +572,311 @@ PreparedEngine::PreparedEngine(
       outputSlab_(std::move(outputSlab)),
       bufferStorage_(std::move(bufferStorage)), instance_(std::move(instance)),
       bufferMappings_(std::move(bufferMappings)) {}
+
+bool PreparedEngine::prepareRuntimeOutput(Diagnostic &diagnostic) {
+  const auto delegateCount = onda_delegate_count(program_.get());
+  const auto logSiteCount = onda_log_site_count(program_.get());
+  if (delegateCount < 0 || logSiteCount < 0) {
+    diagnostic = error("Onda returned invalid runtime-output metadata");
+    return false;
+  }
+
+  delegates_.reserve(static_cast<std::size_t>(delegateCount));
+  for (int delegateIndex = 0; delegateIndex < delegateCount; ++delegateIndex) {
+    const auto *name = onda_delegate_name(program_.get(), delegateIndex);
+    const auto parameterCount =
+        onda_delegate_param_count(program_.get(), delegateIndex);
+    if (name == nullptr || parameterCount < 0) {
+      diagnostic = error("Onda returned invalid delegate metadata");
+      return false;
+    }
+    DelegateMetadata delegate{.name = name, .parameters = {}};
+    delegate.parameters.reserve(static_cast<std::size_t>(parameterCount));
+    for (int parameterIndex = 0; parameterIndex < parameterCount;
+         ++parameterIndex) {
+      const auto *parameterName = onda_delegate_param_name(
+          program_.get(), delegateIndex, parameterIndex);
+      const auto elementType = onda_delegate_param_elem_type(
+          program_.get(), delegateIndex, parameterIndex);
+      const auto arrayLength = onda_delegate_param_array_len(
+          program_.get(), delegateIndex, parameterIndex);
+      const auto array = onda_delegate_param_is_array(
+          program_.get(), delegateIndex, parameterIndex);
+      const auto slice = onda_delegate_param_is_slice(
+          program_.get(), delegateIndex, parameterIndex);
+      if (parameterName == nullptr || primitiveBytes(elementType) == 0U ||
+          arrayLength < 0 || (array != 0 && array != 1) ||
+          (slice != 0 && slice != 1) || (array == 1 && slice == 1)) {
+        diagnostic = error("Onda returned invalid delegate metadata");
+        return false;
+      }
+      delegate.parameters.push_back({
+          .name = parameterName,
+          .elementType = elementType,
+          .arrayLength = arrayLength,
+          .array = array == 1,
+          .slice = slice == 1,
+      });
+    }
+    delegates_.push_back(std::move(delegate));
+  }
+
+  logSites_.reserve(static_cast<std::size_t>(logSiteCount));
+  for (int index = 0; index < logSiteCount; ++index) {
+    onda_log_site_info_t info{};
+    if (onda_log_site_info(program_.get(), index, &info) != 0) {
+      diagnostic = error("Onda returned invalid print-site metadata");
+      return false;
+    }
+    LogSiteMetadata site;
+    if (info.source.file_index >= 0) {
+      const auto *path =
+          onda_source_file_path(program_.get(), info.source.file_index);
+      if (path == nullptr) {
+        diagnostic = error("Onda returned invalid print-site source metadata");
+        return false;
+      }
+      site.sourceFile = path;
+    }
+    if (info.lexical_owner != nullptr)
+      site.lexicalOwner = info.lexical_owner;
+    site.line = info.source.line;
+    logSites_.push_back(std::move(site));
+  }
+
+  if (!delegates_.empty())
+    delegateBatchStorage_.resize(runtimeBatchCapacity);
+  if (!logSites_.empty())
+    printBatchStorage_.resize(runtimeBatchCapacity);
+  delegateBatch_ = {
+      .storage = delegateBatchStorage_.empty() ? nullptr
+                                               : delegateBatchStorage_.data(),
+      .capacity_bytes =
+          static_cast<std::uint32_t>(delegateBatchStorage_.size()),
+      .used_bytes = 0U,
+      .record_count = 0U,
+      .overflow_count = 0U,
+  };
+  printBatch_ = {
+      .storage =
+          printBatchStorage_.empty() ? nullptr : printBatchStorage_.data(),
+      .capacity_bytes = static_cast<std::uint32_t>(printBatchStorage_.size()),
+      .used_bytes = 0U,
+      .record_count = 0U,
+      .overflow_count = 0U,
+  };
+  executionOutput_ = {
+      .delegate_batch = delegates_.empty() ? nullptr : &delegateBatch_,
+      .print_batch = logSites_.empty() ? nullptr : &printBatch_,
+  };
+  if (!delegates_.empty() || !logSites_.empty())
+    pendingLogs_.reserve(maximumPendingLogEntries);
+  return true;
+}
+
+bool PreparedEngine::initialize() noexcept {
+  const auto status =
+      onda_init(instance_.get(), ONDA_INIT_FULL, &executionOutput_);
+  collectExecutionOutput();
+  return status == 0;
+}
+
+void PreparedEngine::attachLogSink(RuntimeLogSink &sink) noexcept {
+  if (logSink_ != nullptr)
+    return;
+  logSink_ = &sink;
+  sink.addGeneratedOverflow(RuntimeLogKind::print,
+                            pendingLogCounters_.printOverflow);
+  sink.addGeneratedOverflow(RuntimeLogKind::delegate,
+                            pendingLogCounters_.delegateOverflow);
+  sink.addTransportDrops(RuntimeLogKind::print,
+                         pendingLogCounters_.printTransportDrops);
+  sink.addTransportDrops(RuntimeLogKind::delegate,
+                         pendingLogCounters_.delegateTransportDrops);
+  flushPendingLogs();
+}
+
+void PreparedEngine::flushPendingLogs() noexcept {
+  if (logSink_ == nullptr)
+    return;
+  while (pendingLogRead_ < pendingLogs_.size() &&
+         logSink_->tryPush(pendingLogs_[pendingLogRead_], buildGeneration_)) {
+    ++pendingLogRead_;
+  }
+}
+
+void PreparedEngine::addGeneratedOverflow(const RuntimeLogKind kind,
+                                          const std::uint32_t count) noexcept {
+  if (count == 0U)
+    return;
+  if (logSink_ != nullptr) {
+    logSink_->addGeneratedOverflow(kind, count);
+  } else if (kind == RuntimeLogKind::print) {
+    addSaturated(pendingLogCounters_.printOverflow, count);
+  } else {
+    addSaturated(pendingLogCounters_.delegateOverflow, count);
+  }
+}
+
+void PreparedEngine::addTransportDrop(const RuntimeLogKind kind,
+                                      const std::uint64_t count) noexcept {
+  if (count == 0U)
+    return;
+  if (logSink_ != nullptr) {
+    logSink_->addTransportDrops(kind, count);
+  } else if (kind == RuntimeLogKind::print) {
+    addSaturated(pendingLogCounters_.printTransportDrops, count);
+  } else {
+    addSaturated(pendingLogCounters_.delegateTransportDrops, count);
+  }
+}
+
+template <typename Formatter>
+bool PreparedEngine::publish(const RuntimeLogKind kind,
+                             Formatter &&formatter) noexcept {
+  if (logSink_ != nullptr) {
+    return logSink_->tryEmplace(kind, buildGeneration_,
+                                std::forward<Formatter>(formatter));
+  }
+  if (pendingLogs_.size() >= maximumPendingLogEntries)
+    return false;
+  RuntimeLogEntry entry;
+  entry.prepare(kind, buildGeneration_);
+  if (!std::forward<Formatter>(formatter)(entry))
+    return false;
+  pendingLogs_.push_back(std::move(entry));
+  return true;
+}
+
+bool PreparedEngine::publishPrint(
+    const onda_print_occurrence_t &occurrence) noexcept {
+  if (occurrence.site_index >= logSites_.size() ||
+      occurrence.payload == nullptr)
+    return false;
+  const auto recordBytes =
+      static_cast<std::uint64_t>(ONDA_PRINT_RECORD_HEADER_SIZE) +
+      occurrence.payload_size_bytes;
+  if (recordBytes > std::numeric_limits<std::uint32_t>::max())
+    return false;
+  return publish(RuntimeLogKind::print, [this, &occurrence, recordBytes](
+                                            RuntimeLogEntry &entry) noexcept {
+    onda_print_batch_t batch{
+        .storage = const_cast<std::uint8_t *>(occurrence.payload) -
+                   ONDA_PRINT_RECORD_HEADER_SIZE,
+        .capacity_bytes = static_cast<std::uint32_t>(recordBytes),
+        .used_bytes = static_cast<std::uint32_t>(recordBytes),
+        .record_count = 1U,
+        .overflow_count = 0U,
+    };
+    std::size_t required{};
+    if (onda_format_print_batch_into(instance_.get(), &batch, entry.text.data(),
+                                     entry.text.size(), &required,
+                                     nullptr) != 0 ||
+        required >= entry.text.size()) {
+      return false;
+    }
+    if (required > 0U && entry.text[required - 1U] == '\n')
+      --required;
+    entry.textBytes = static_cast<std::uint32_t>(required);
+    const auto &site = logSites_[occurrence.site_index];
+    entry.sourceFileBytes = copyText(entry.sourceFile, site.sourceFile);
+    entry.lexicalOwnerBytes = copyText(entry.lexicalOwner, site.lexicalOwner);
+    entry.line = site.line;
+    return true;
+  });
+}
+
+bool PreparedEngine::publishDelegate(
+    const onda_delegate_occurrence_t &occurrence) noexcept {
+  if (occurrence.delegate_index >= delegates_.size() ||
+      (occurrence.payload_size_bytes != 0U && occurrence.payload == nullptr))
+    return false;
+  return publish(
+      RuntimeLogKind::delegate,
+      [this, &occurrence](RuntimeLogEntry &entry) noexcept {
+        const auto &delegate = delegates_[occurrence.delegate_index];
+        auto valid =
+            appendText(entry, "delegate ") && appendText(entry, delegate.name);
+        if (!delegate.parameters.empty())
+          valid = valid && appendText(entry, ": ");
+
+        std::size_t cursor{};
+        for (std::size_t parameterIndex = 0;
+             valid && parameterIndex < delegate.parameters.size();
+             ++parameterIndex) {
+          const auto &parameter = delegate.parameters[parameterIndex];
+          if (parameterIndex != 0U)
+            valid = appendText(entry, " ");
+          valid = valid && appendText(entry, parameter.name) &&
+                  appendText(entry, "=");
+
+          std::size_t count = static_cast<std::size_t>(parameter.arrayLength);
+          if (parameter.slice) {
+            if (cursor + sizeof(std::uint32_t) >
+                occurrence.payload_size_bytes) {
+              valid = false;
+              break;
+            }
+            std::uint32_t dynamicCount{};
+            std::memcpy(&dynamicCount, occurrence.payload + cursor,
+                        sizeof(dynamicCount));
+            cursor += sizeof(dynamicCount);
+            count = dynamicCount;
+          }
+          const auto scalarBytes = primitiveBytes(parameter.elementType);
+          if (scalarBytes == 0U ||
+              count > (occurrence.payload_size_bytes - cursor) / scalarBytes) {
+            valid = false;
+            break;
+          }
+          const auto collection = parameter.array || parameter.slice;
+          if (collection)
+            valid = appendText(entry, "[");
+          for (std::size_t index = 0; valid && index < count; ++index) {
+            if (index != 0U)
+              valid = appendText(entry, ", ");
+            valid = valid && appendScalar(entry, parameter.elementType,
+                                          occurrence.payload + cursor);
+            cursor += scalarBytes;
+          }
+          if (collection)
+            valid = valid && appendText(entry, "]");
+        }
+        return valid && cursor == occurrence.payload_size_bytes;
+      });
+}
+
+void PreparedEngine::collectExecutionOutput() noexcept {
+  flushPendingLogs();
+  onda_batch_cursor_t delegateCursor{};
+  onda_batch_cursor_t printCursor{};
+  onda_delegate_occurrence_t delegate{};
+  onda_print_occurrence_t print{};
+  auto hasDelegate = executionOutput_.delegate_batch != nullptr &&
+                     onda_delegate_batch_next(&delegateBatch_, &delegateCursor,
+                                              &delegate) != 0;
+  auto hasPrint =
+      executionOutput_.print_batch != nullptr &&
+      onda_print_batch_next(&printBatch_, &printCursor, &print) != 0;
+  std::uint64_t delegateDrops{};
+  std::uint64_t printDrops{};
+  while (hasDelegate || hasPrint) {
+    if (!hasPrint || (hasDelegate && delegate.sequence < print.sequence)) {
+      if (!publishDelegate(delegate))
+        addSaturated(delegateDrops, 1U);
+      hasDelegate = onda_delegate_batch_next(&delegateBatch_, &delegateCursor,
+                                             &delegate) != 0;
+    } else {
+      if (!publishPrint(print))
+        addSaturated(printDrops, 1U);
+      hasPrint = onda_print_batch_next(&printBatch_, &printCursor, &print) != 0;
+    }
+  }
+  addTransportDrop(RuntimeLogKind::delegate, delegateDrops);
+  addTransportDrop(RuntimeLogKind::print, printDrops);
+  addGeneratedOverflow(RuntimeLogKind::delegate, delegateBatch_.overflow_count);
+  addGeneratedOverflow(RuntimeLogKind::print, printBatch_.overflow_count);
+}
 
 BuildResult
 PreparedEngine::build(const std::filesystem::path &path, const Product product,
@@ -441,20 +908,14 @@ PreparedEngine::build(CompileResult compiled, const Product product,
   const auto hasProjectDefaults = result.projectImage.valid();
 
   Diagnostic diagnostic;
-  const auto inputs =
-      flattenedChannels(compiled.program.get(), true, diagnostic);
-  const auto outputs =
-      flattenedChannels(compiled.program.get(), false, diagnostic);
+  const auto inputs = flattenedChannels(compiled.program.get(), true,
+                                        pluginInputChannels, diagnostic);
+  const auto outputs = flattenedChannels(compiled.program.get(), false,
+                                         pluginOutputChannels, diagnostic);
   if (inputs < 0 || outputs < 0) {
     result.diagnostic = std::move(diagnostic);
     return result;
   }
-  if (product == Product::instrument && inputs != 0) {
-    result.diagnostic =
-        error("An Onda instrument must declare no audio inputs");
-    return result;
-  }
-
   const auto bufferCount = onda_buffer_count(compiled.program.get());
   if (bufferCount < 0) {
     result.diagnostic = error("Onda returned invalid buffer metadata");
@@ -621,6 +1082,8 @@ PreparedEngine::build(CompileResult compiled, const Product product,
       std::move(outputSlab), std::move(bufferStorage),
       std::move(bufferMappings)));
 
+  if (!engine->prepareRuntimeOutput(result.diagnostic))
+    return result;
   if (!bindAudio(engine->instance_.get(), engine->program_.get(),
                  engine->inputSlab_, true, blockSize, result.diagnostic) ||
       !bindAudio(engine->instance_.get(), engine->program_.get(),
@@ -641,6 +1104,10 @@ PreparedEngine::build(CompileResult compiled, const Product product,
         return result;
       }
     }
+  }
+  if (!engine->initialize()) {
+    result.diagnostic = error("Failed to initialize the Onda runtime instance");
+    return result;
   }
   if (onda_prepare_unchecked_process(engine->instance_.get()) != 0) {
     if (result.diagnostic.empty())
@@ -681,6 +1148,10 @@ PreparedEngine::build(CompileResult compiled, const Product product,
         engine->hostContextEvents_[index].index >= 0) {
       engine->needsPositionInfo_ = true;
     }
+  }
+  if (!collectVisibleEvents(engine->program_.get(), engine->eventMappings_,
+                            result.diagnostic)) {
+    return result;
   }
 
   if (!result.projectImage.valid()) {
@@ -735,7 +1206,7 @@ bool PreparedEngine::processSegment(
     }
   }
 
-  for (int channel = 0; channel < 2; ++channel)
+  for (int channel = 0; channel < pluginOutputChannels; ++channel)
     std::fill_n(hostOutputs[channel] + callbackOffset, frames, 0.0F);
   for (int channel = 0; channel < outputChannels_; ++channel) {
     std::fill_n(outputSlab_.data() + channel * blockSize_ + logicalFrame_,
@@ -753,8 +1224,10 @@ bool PreparedEngine::processSegment(
   if (logicalFrame_ + frames == blockSize_)
     flags |= ONDA_PROCESS_END_BLOCK;
 
-  if (onda_process_unchecked_segment(instance_.get(), logicalFrame_, frames,
-                                     flags) != 0) {
+  const auto status = onda_process_unchecked_segment(
+      instance_.get(), logicalFrame_, frames, flags, &executionOutput_);
+  collectExecutionOutput();
+  if (status != 0) {
     return false;
   }
 
@@ -790,20 +1263,17 @@ bool PreparedEngine::dispatch(const MidiEvent &event) noexcept {
   switch (event.kind) {
   case MidiKind::noteOn:
   case MidiKind::noteOff:
-    return triggerEvent(instance_.get(), binding, std::int32_t{-1},
-                        event.channel, event.keyOrController, event.value);
+    return trigger(binding, std::int32_t{-1}, event.channel,
+                   event.keyOrController, event.value);
   case MidiKind::polyPressure:
-    return triggerEvent(instance_.get(), binding, event.channel,
-                        event.keyOrController, event.value);
+    return trigger(binding, event.channel, event.keyOrController, event.value);
   case MidiKind::pitchBend:
   case MidiKind::channelPressure:
-    return triggerEvent(instance_.get(), binding, event.channel, event.value);
+    return trigger(binding, event.channel, event.value);
   case MidiKind::controlChange:
-    return triggerEvent(instance_.get(), binding, event.channel,
-                        event.keyOrController, event.value);
+    return trigger(binding, event.channel, event.keyOrController, event.value);
   case MidiKind::programChange:
-    return triggerEvent(instance_.get(), binding, event.channel,
-                        event.keyOrController);
+    return trigger(binding, event.channel, event.keyOrController);
   case MidiKind::count:
     return false;
   }
@@ -817,10 +1287,9 @@ bool PreparedEngine::dispatchHostContext(
   };
 
   if (handlesHostContext(HostContextKind::transport) && hostContext.transport &&
-      !triggerEvent(instance_.get(), binding(HostContextKind::transport),
-                    hostContext.transport->playing,
-                    hostContext.transport->recording,
-                    hostContext.transport->looping)) {
+      !trigger(binding(HostContextKind::transport),
+               hostContext.transport->playing, hostContext.transport->recording,
+               hostContext.transport->looping)) {
     return false;
   }
 
@@ -832,8 +1301,7 @@ bool PreparedEngine::dispatchHostContext(
             std::numeric_limits<std::int64_t>::max() - hostCallbackOffset) {
       const auto projected =
           sample + static_cast<std::int64_t>(std::max(hostCallbackOffset, 0));
-      if (!triggerEvent(instance_.get(),
-                        binding(HostContextKind::samplePosition), projected)) {
+      if (!trigger(binding(HostContextKind::samplePosition), projected)) {
         return false;
       }
     }
@@ -852,16 +1320,14 @@ bool PreparedEngine::dispatchHostContext(
       hostContext.timePosition) {
     const auto projected = *hostContext.timePosition + secondsOffset;
     if (std::isfinite(projected) &&
-        !triggerEvent(instance_.get(), binding(HostContextKind::timePosition),
-                      projected)) {
+        !trigger(binding(HostContextKind::timePosition), projected)) {
       return false;
     }
   }
 
   if (handlesHostContext(HostContextKind::tempo) && hostContext.tempo &&
       std::isfinite(*hostContext.tempo) && *hostContext.tempo > 0.0 &&
-      !triggerEvent(instance_.get(), binding(HostContextKind::tempo),
-                    *hostContext.tempo)) {
+      !trigger(binding(HostContextKind::tempo), *hostContext.tempo)) {
     return false;
   }
 
@@ -877,25 +1343,24 @@ bool PreparedEngine::dispatchHostContext(
       }
     }
     if (std::isfinite(projected) &&
-        !triggerEvent(instance_.get(),
-                      binding(HostContextKind::musicalPosition), projected)) {
+        !trigger(binding(HostContextKind::musicalPosition), projected)) {
       return false;
     }
   }
 
   if (handlesHostContext(HostContextKind::barPosition) &&
       hostContext.barPosition && std::isfinite(*hostContext.barPosition) &&
-      !triggerEvent(instance_.get(), binding(HostContextKind::barPosition),
-                    *hostContext.barPosition)) {
+      !trigger(binding(HostContextKind::barPosition),
+               *hostContext.barPosition)) {
     return false;
   }
 
   if (handlesHostContext(HostContextKind::timeSignature) &&
       hostContext.timeSignature && hostContext.timeSignature->numerator > 0 &&
       hostContext.timeSignature->denominator > 0 &&
-      !triggerEvent(instance_.get(), binding(HostContextKind::timeSignature),
-                    hostContext.timeSignature->numerator,
-                    hostContext.timeSignature->denominator)) {
+      !trigger(binding(HostContextKind::timeSignature),
+               hostContext.timeSignature->numerator,
+               hostContext.timeSignature->denominator)) {
     return false;
   }
 
@@ -903,15 +1368,14 @@ bool PreparedEngine::dispatchHostContext(
       hostContext.loopRegion &&
       std::isfinite(hostContext.loopRegion->startQuarterNote) &&
       std::isfinite(hostContext.loopRegion->endQuarterNote) &&
-      !triggerEvent(instance_.get(), binding(HostContextKind::loopRegion),
-                    hostContext.loopRegion->startQuarterNote,
-                    hostContext.loopRegion->endQuarterNote)) {
+      !trigger(binding(HostContextKind::loopRegion),
+               hostContext.loopRegion->startQuarterNote,
+               hostContext.loopRegion->endQuarterNote)) {
     return false;
   }
 
   return !handlesHostContext(HostContextKind::renderMode) ||
-         triggerEvent(instance_.get(), binding(HostContextKind::renderMode),
-                      hostContext.realtime);
+         trigger(binding(HostContextKind::renderMode), hostContext.realtime);
 }
 
 bool PreparedEngine::process(
@@ -965,10 +1429,30 @@ bool PreparedEngine::process(
   return true;
 }
 
-void PreparedEngine::reset() noexcept {
+bool PreparedEngine::triggerEvent(
+    const int index, const std::span<const std::byte> payload,
+    const std::array<std::atomic<float> *, slotCount> &slots,
+    const HostContext &hostContext) noexcept {
+  if (index < 0 ||
+      payload.size() >
+          static_cast<std::size_t>(std::numeric_limits<int>::max()) ||
+      !ensureBlockStarted(slots, hostContext, 0)) {
+    return false;
+  }
+  const auto status = onda_trigger_event_by_index_unchecked(
+      instance_.get(), index, payload.data(), static_cast<int>(payload.size()),
+      &executionOutput_);
+  collectExecutionOutput();
+  return status == 0;
+}
+
+bool PreparedEngine::reset() noexcept {
   logicalFrame_ = 0;
   blockStarted_ = false;
-  static_cast<void>(onda_reset_instance_state(instance_.get()));
+  const auto status =
+      onda_init(instance_.get(), ONDA_INIT_PRESERVE_PINNED, &executionOutput_);
+  collectExecutionOutput();
+  return status == 0 && onda_prepare_unchecked_process(instance_.get()) == 0;
 }
 
 } // namespace onda::plugin

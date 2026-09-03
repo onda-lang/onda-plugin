@@ -19,6 +19,11 @@
 
 namespace onda::plugin {
 
+struct MidiCapabilities {
+  bool noteOn{};
+  bool noteOff{};
+};
+
 struct WorkerStatus {
   std::uint64_t revision{};
   std::filesystem::path path;
@@ -26,8 +31,11 @@ struct WorkerStatus {
   bool compiling{};
   bool active{};
   bool usingProjectImage{};
+  std::uint64_t engineGeneration{};
   std::vector<ParameterMapping> mappings;
   std::vector<BufferMapping> buffers;
+  std::vector<EventMapping> events;
+  MidiCapabilities midi;
 };
 
 struct SeedValues {
@@ -115,13 +123,16 @@ private:
   void run() noexcept;
   void build(const Request &request);
   void advanceGeneration() noexcept;
+  void deactivateStatus() noexcept;
+  void clearPublishedInterface() noexcept;
   void reportFailure(const char *message) noexcept;
   void collectRetired() noexcept;
   void destroy(PreparedEngine *engine) noexcept;
   [[nodiscard]] bool updateStatus(
       const Request &request, std::string message, bool compiling, bool active,
       std::optional<std::vector<ParameterMapping>> mappings = std::nullopt,
-      std::optional<std::vector<BufferMapping>> buffers = std::nullopt);
+      std::optional<std::vector<BufferMapping>> buffers = std::nullopt,
+      std::optional<std::vector<EventMapping>> events = std::nullopt);
   [[nodiscard]] bool matchesDesiredLocked(const Request &request) const;
   [[nodiscard]] bool stillCurrent(const Request &request) const;
   [[nodiscard]] static std::vector<FileStamp>
