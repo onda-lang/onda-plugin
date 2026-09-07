@@ -91,6 +91,12 @@ public:
   void clearBuffer(std::string_view name);
   void setBufferBindings(std::vector<BufferFileBinding> bindings);
 
+  // Called by the audio thread after adoption or retirement; never takes a
+  // lock.
+  void setActiveGeneration(std::uint64_t generation) noexcept {
+    activeGeneration_.store(generation, std::memory_order_release);
+  }
+
   [[nodiscard]] WorkerStatus status() const;
   [[nodiscard]] std::uint64_t statusRevision() const;
   [[nodiscard]] std::optional<SeedValues> takeSeedValues();
@@ -161,11 +167,13 @@ private:
   std::condition_variable wake_;
   Request desired_;
   WorkerStatus status_;
+  WorkerStatus retainedStatus_;
   std::optional<SeedValues> seedValues_;
   PersistedProjectState publishedProjectState_;
   bool stopping_{};
   bool forceRebuild_{};
   std::atomic<std::uint64_t> requestGeneration_{};
+  std::atomic<std::uint64_t> activeGeneration_{};
   std::thread thread_;
 
   std::vector<std::filesystem::path> watchedPaths_;

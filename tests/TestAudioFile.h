@@ -1,5 +1,7 @@
 #pragma once
 
+#include "TemporaryDirectory.h"
+
 #include <juce_audio_formats/juce_audio_formats.h>
 
 #include <filesystem>
@@ -10,8 +12,7 @@
 class TemporaryAudioFile final {
 public:
   explicit TemporaryAudioFile(const std::string_view stem)
-      : path_(std::filesystem::temp_directory_path() /
-              (std::string{stem} + ".flac")) {}
+      : path_(testTemporaryRoot() / (std::string{stem} + ".flac")) {}
 
   ~TemporaryAudioFile() {
     std::error_code ignored;

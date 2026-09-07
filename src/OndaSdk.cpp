@@ -140,6 +140,20 @@ struct StoredProjectFile {
   std::vector<std::uint8_t> bytes;
 };
 
+std::vector<onda_project_buffer_asset_t>
+rawBufferAssets(const std::span<const ProjectBufferAsset> buffers) {
+  std::vector<onda_project_buffer_asset_t> result;
+  result.reserve(buffers.size());
+  for (const auto &buffer : buffers) {
+    result.push_back({
+        .name_utf8 = buffer.name.c_str(),
+        .ondabuffer_bytes = buffer.encodedBytes.data(),
+        .ondabuffer_byte_count = buffer.encodedBytes.size(),
+    });
+  }
+  return result;
+}
+
 ProjectImage loadFilesystemProjectImage(
     const std::filesystem::path &projectPath,
     const std::span<const std::filesystem::path> watchPaths,
@@ -329,19 +343,7 @@ ProjectImage captureProjectImage(
     return {};
   }
 
-  std::vector<onda_project_buffer_asset_t> rawBuffers;
-  rawBuffers.reserve(buffers.size());
-  for (const auto &buffer : buffers) {
-    if (buffer.name.empty() || buffer.encodedBytes.empty()) {
-      diagnostic.message = "Cannot capture an invalid project buffer asset";
-      return {};
-    }
-    rawBuffers.push_back({
-        .name_utf8 = buffer.name.c_str(),
-        .ondabuffer_bytes = buffer.encodedBytes.data(),
-        .ondabuffer_byte_count = buffer.encodedBytes.size(),
-    });
-  }
+  const auto rawBuffers = rawBufferAssets(buffers);
 
   const auto entryString = pathString(entry);
   const auto sourceRoot = pathString(entry.parent_path());
@@ -361,6 +363,27 @@ ProjectImage captureProjectImage(
 
 bool validateProjectImage(const ProjectImage &image, Diagnostic &diagnostic) {
   return deserialize(image, diagnostic) != nullptr;
+}
+
+ProjectImage
+withProjectBufferOverrides(const ProjectImage &image,
+                           const std::span<const ProjectBufferAsset> buffers,
+                           Diagnostic &diagnostic) {
+  auto handle = deserialize(image, diagnostic);
+  if (!handle)
+    return {};
+  const auto rawBuffers = rawBufferAssets(buffers);
+  OndaDiagnostic rawDiagnostic;
+  ProjectImageHandle updated{onda_project_image_with_buffer_overrides(
+      handle.get(), rawBuffers.data(), rawBuffers.size(),
+      rawDiagnostic.outParameter())};
+  diagnostic = rawDiagnostic.copy();
+  if (!updated) {
+    if (diagnostic.empty())
+      diagnostic.message = "Onda could not update the project buffer assets";
+    return {};
+  }
+  return serialize(updated.get(), diagnostic);
 }
 
 bool visitMaterializedProjectFiles(const ProjectImage &image,

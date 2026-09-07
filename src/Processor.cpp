@@ -382,6 +382,7 @@ const juce::String Processor::getName() const {
 void Processor::retireActive() noexcept {
   if (active_ != nullptr && retirements_.tryPush(active_)) {
     active_ = nullptr;
+    worker_->setActiveGeneration(0);
     clearMidiActivity();
   }
 }
@@ -420,6 +421,7 @@ void Processor::acquireEngine() noexcept {
                              std::memory_order_release);
   replacement->attachLogSink(runtimeLogSink_);
   active_ = replacement;
+  worker_->setActiveGeneration(replacement->buildGeneration());
   clearMidiActivity();
   scopeCapture_.requestReset();
   runtimeFaulted_.store(false, std::memory_order_release);

@@ -1,3 +1,5 @@
+#include "TemporaryDirectory.h"
+
 #include "AudioFile.h"
 #include "Engine.h"
 #include "ProjectExport.h"
@@ -24,8 +26,7 @@ namespace {
 class TemporarySource final {
 public:
   TemporarySource() {
-    path_ =
-        std::filesystem::temp_directory_path() / "onda-plugin-engine-test.onda";
+    path_ = testTemporaryRoot() / "onda-plugin-engine-test.onda";
     dependencyPath_ = path_.parent_path() / "onda_plugin_dependency_test.onda";
     writeValid();
   }
@@ -826,6 +827,17 @@ int main() {
     std::cerr << "incompatible canonical host-context event was accepted\n";
     return 1;
   }
+  if (!expectRejected("outs { out1 }\nevent tempo(bpm: f64[1]) {}\n"
+                      "sample { out1 = 0.0 }\n",
+                      "Canonical host-context event") ||
+      !expectRejected("outs { out1 }\n"
+                      "event note_on(id: i32[1], channel: i32, key: i32, "
+                      "velocity: f32) {}\n"
+                      "sample { out1 = 0.0 }\n",
+                      "Canonical MIDI event")) {
+    std::cerr << "one-element arrays were accepted as canonical scalars\n";
+    return 1;
+  }
 
   source.writeText(R"(
 ins { in1, in2 }
@@ -927,7 +939,7 @@ sample { out1 = in1; out2 = in2 }
   }
 
   const auto assetExportRoot =
-      std::filesystem::temp_directory_path() /
+      testTemporaryRoot() /
       ("onda-buffer-export-" +
        std::to_string(
            std::chrono::steady_clock::now().time_since_epoch().count()));
@@ -1028,6 +1040,7 @@ sample { out1 = in1; out2 = in2 }
     }
     deactivate.store(false);
     replacementSeedPending.store(false);
+    worker.setActiveGeneration(workerEngine->buildGeneration());
 
     source.writeImportedEffect("0.75");
     auto *dependencyReload = waitForReplacement(replacements);
@@ -1040,6 +1053,7 @@ sample { out1 = in1; out2 = in2 }
       return 1;
     }
     workerEngine = dependencyReload;
+    worker.setActiveGeneration(workerEngine->buildGeneration());
 
     worker.configure(44'100.0, 16);
     auto *reconfigured = waitForReplacement(replacements);
@@ -1053,6 +1067,7 @@ sample { out1 = in1; out2 = in2 }
       return 1;
     }
     workerEngine = reconfigured;
+    worker.setActiveGeneration(workerEngine->buildGeneration());
 
     source.writeInvalid();
     bool observedFailure = false;
@@ -1081,6 +1096,7 @@ sample { out1 = in1; out2 = in2 }
       return 1;
     }
     workerEngine = replacement;
+    worker.setActiveGeneration(workerEngine->buildGeneration());
 
     const auto revisionWithoutDependency = worker.status().revision;
     source.removeDependency();
@@ -1275,7 +1291,7 @@ sample { out1 = in1; out2 = in2 }
     const auto stamp =
         std::chrono::steady_clock::now().time_since_epoch().count();
     const auto invalidPath =
-        std::filesystem::temp_directory_path() /
+        testTemporaryRoot() /
         ("onda-plugin-invalid-checkpoint-" + std::to_string(stamp) + ".onda");
     {
       std::ofstream invalid(invalidPath, std::ios::binary | std::ios::trunc);

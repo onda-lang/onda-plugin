@@ -37,7 +37,23 @@ if(NOT ONDA_VERSION MATCHES "^[0-9]+\\.[0-9]+\\.[0-9]+$")
     message(FATAL_ERROR "Invalid Onda version '${ONDA_VERSION}'")
 endif()
 
+# Match the Onda release SDK's minimum macOS version.
+if(CMAKE_HOST_APPLE AND NOT DEFINED CMAKE_OSX_DEPLOYMENT_TARGET)
+    set(CMAKE_OSX_DEPLOYMENT_TARGET "15.0" CACHE STRING "Minimum macOS version")
+endif()
 project(onda-plugin VERSION "${ONDA_PLUGIN_VERSION}" LANGUAGES C CXX)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+    "${CMAKE_CURRENT_SOURCE_DIR}/onda-version"
+    "${CMAKE_CURRENT_SOURCE_DIR}/plugin-version")
+
+if(APPLE AND CMAKE_OSX_DEPLOYMENT_TARGET VERSION_LESS "15.0")
+    message(FATAL_ERROR "The Onda SDK requires macOS 15.0 or later")
+endif()
+
+if(MSVC)
+    # Onda::Static is built with the static MSVC runtime.
+    set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+endif()
 
 include(FetchContent)
 include(CTest)
@@ -68,6 +84,8 @@ set(ONDA_SDK_CHECKSUMS "" CACHE FILEPATH
     "Optional pre-downloaded SHA256SUMS.txt for the pinned Onda release")
 set(ONDA_RELEASE_SOURCE_DIR "" CACHE PATH
     "Optional checkout of the pinned Onda release, used only for UI resources")
+set(ONDA_DEVELOPMENT_SOURCE_DIR "" CACHE PATH
+    "Use a local Onda checkout and its target/release libraries for development")
 set(ONDA_JUCE_ROOT "" CACHE PATH "Optional local JUCE checkout")
 set(ONDA_VST3_VALIDATOR "" CACHE FILEPATH
     "Optional Steinberg VST3 validator executable")
@@ -95,139 +113,148 @@ else()
         "${CMAKE_SYSTEM_NAME}/${CMAKE_SYSTEM_PROCESSOR}")
 endif()
 
-set(ONDA_SDK_ARCHIVE_NAME
-    "onda-${ONDA_VERSION}-${ONDA_SDK_PLATFORM}.${ONDA_SDK_EXTENSION}")
-if(ONDA_SDK_ARCHIVE)
-    get_filename_component(ONDA_SDK_ARCHIVE "${ONDA_SDK_ARCHIVE}"
-        ABSOLUTE BASE_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
-elseif(EXISTS "${CMAKE_BINARY_DIR}/_deps/${ONDA_SDK_ARCHIVE_NAME}")
-    set(ONDA_SDK_ARCHIVE
-        "${CMAKE_BINARY_DIR}/_deps/${ONDA_SDK_ARCHIVE_NAME}")
+if(ONDA_DEVELOPMENT_SOURCE_DIR)
+    get_filename_component(ONDA_DEVELOPMENT_SOURCE_DIR
+        "${ONDA_DEVELOPMENT_SOURCE_DIR}" ABSOLUTE)
+    set(ONDA_SDK_ROOT "${ONDA_DEVELOPMENT_SOURCE_DIR}")
+    set(ONDA_RELEASE_SOURCE_DIR "${ONDA_DEVELOPMENT_SOURCE_DIR}")
+    set(Onda_DIR "${ONDA_DEVELOPMENT_SOURCE_DIR}/cmake")
+    message(WARNING "Using a local Onda development build; not a release SDK")
 else()
-    set(ONDA_SDK_ARCHIVE
-        "${CMAKE_BINARY_DIR}/_deps/${ONDA_SDK_ARCHIVE_NAME}")
-    file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/_deps")
-    file(DOWNLOAD
-        "https://github.com/onda-lang/onda/releases/download/${ONDA_VERSION}/${ONDA_SDK_ARCHIVE_NAME}"
-        "${ONDA_SDK_ARCHIVE}"
-        STATUS ONDA_SDK_DOWNLOAD_STATUS
-        TLS_VERIFY ON
-        SHOW_PROGRESS)
-    list(GET ONDA_SDK_DOWNLOAD_STATUS 0 ONDA_SDK_DOWNLOAD_CODE)
-    if(NOT ONDA_SDK_DOWNLOAD_CODE EQUAL 0)
-        list(GET ONDA_SDK_DOWNLOAD_STATUS 1 ONDA_SDK_DOWNLOAD_MESSAGE)
-        message(FATAL_ERROR
-            "Could not download the Onda ${ONDA_VERSION} release SDK: "
-            "${ONDA_SDK_DOWNLOAD_MESSAGE}. For a private release, download "
-            "${ONDA_SDK_ARCHIVE_NAME} and SHA256SUMS.txt with GitHub CLI, "
-            "then configure with -DONDA_SDK_ARCHIVE and "
-            "-DONDA_SDK_CHECKSUMS")
-    endif()
-endif()
-
-if(NOT EXISTS "${ONDA_SDK_ARCHIVE}")
-    message(FATAL_ERROR
-        "ONDA_SDK_ARCHIVE does not exist: ${ONDA_SDK_ARCHIVE}")
-endif()
-
-if(ONDA_SDK_CHECKSUMS)
-    get_filename_component(ONDA_SDK_CHECKSUMS "${ONDA_SDK_CHECKSUMS}"
-        ABSOLUTE BASE_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
-elseif(EXISTS "${CMAKE_BINARY_DIR}/_deps/${ONDA_VERSION}-SHA256SUMS.txt")
-    set(ONDA_SDK_CHECKSUMS
-        "${CMAKE_BINARY_DIR}/_deps/${ONDA_VERSION}-SHA256SUMS.txt")
-else()
-    set(ONDA_SDK_CHECKSUMS
-        "${CMAKE_BINARY_DIR}/_deps/${ONDA_VERSION}-SHA256SUMS.txt")
-    file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/_deps")
-    file(DOWNLOAD
-        "https://github.com/onda-lang/onda/releases/download/${ONDA_VERSION}/SHA256SUMS.txt"
-        "${ONDA_SDK_CHECKSUMS}"
-        STATUS ONDA_CHECKSUMS_DOWNLOAD_STATUS
-        TLS_VERIFY ON)
-    list(GET ONDA_CHECKSUMS_DOWNLOAD_STATUS 0 ONDA_CHECKSUMS_DOWNLOAD_CODE)
-    if(NOT ONDA_CHECKSUMS_DOWNLOAD_CODE EQUAL 0)
-        list(GET ONDA_CHECKSUMS_DOWNLOAD_STATUS 1 ONDA_CHECKSUMS_DOWNLOAD_MESSAGE)
-        message(FATAL_ERROR
-            "Could not download checksums for Onda ${ONDA_VERSION}: "
-            "${ONDA_CHECKSUMS_DOWNLOAD_MESSAGE}. Download SHA256SUMS.txt "
-            "with GitHub CLI and configure with -DONDA_SDK_CHECKSUMS")
-    endif()
-endif()
-
-if(NOT EXISTS "${ONDA_SDK_CHECKSUMS}")
-    message(FATAL_ERROR
-        "ONDA_SDK_CHECKSUMS does not exist: ${ONDA_SDK_CHECKSUMS}")
-endif()
-file(STRINGS "${ONDA_SDK_CHECKSUMS}" ONDA_SDK_CHECKSUM_LINES)
-set(ONDA_SDK_SHA256 "")
-foreach(ONDA_SDK_CHECKSUM_LINE IN LISTS ONDA_SDK_CHECKSUM_LINES)
-    if(ONDA_SDK_CHECKSUM_LINE MATCHES "^([0-9A-Fa-f]+)[ \\t]+(.+)$")
-        get_filename_component(ONDA_CHECKSUM_ASSET_NAME "${CMAKE_MATCH_2}" NAME)
-        if(ONDA_CHECKSUM_ASSET_NAME STREQUAL ONDA_SDK_ARCHIVE_NAME)
-            set(ONDA_SDK_SHA256 "${CMAKE_MATCH_1}")
-            break()
+    set(ONDA_SDK_ARCHIVE_NAME
+        "onda-${ONDA_VERSION}-${ONDA_SDK_PLATFORM}.${ONDA_SDK_EXTENSION}")
+    if(ONDA_SDK_ARCHIVE)
+        get_filename_component(ONDA_SDK_ARCHIVE "${ONDA_SDK_ARCHIVE}"
+            ABSOLUTE BASE_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
+    elseif(EXISTS "${CMAKE_BINARY_DIR}/_deps/${ONDA_SDK_ARCHIVE_NAME}")
+        set(ONDA_SDK_ARCHIVE
+            "${CMAKE_BINARY_DIR}/_deps/${ONDA_SDK_ARCHIVE_NAME}")
+    else()
+        set(ONDA_SDK_ARCHIVE
+            "${CMAKE_BINARY_DIR}/_deps/${ONDA_SDK_ARCHIVE_NAME}")
+        file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/_deps")
+        file(DOWNLOAD
+            "https://github.com/onda-lang/onda/releases/download/${ONDA_VERSION}/${ONDA_SDK_ARCHIVE_NAME}"
+            "${ONDA_SDK_ARCHIVE}"
+            STATUS ONDA_SDK_DOWNLOAD_STATUS
+            TLS_VERIFY ON
+            SHOW_PROGRESS)
+        list(GET ONDA_SDK_DOWNLOAD_STATUS 0 ONDA_SDK_DOWNLOAD_CODE)
+        if(NOT ONDA_SDK_DOWNLOAD_CODE EQUAL 0)
+            list(GET ONDA_SDK_DOWNLOAD_STATUS 1 ONDA_SDK_DOWNLOAD_MESSAGE)
+            message(FATAL_ERROR
+                "Could not download the Onda ${ONDA_VERSION} release SDK: "
+                "${ONDA_SDK_DOWNLOAD_MESSAGE}. For a private release, download "
+                "${ONDA_SDK_ARCHIVE_NAME} and SHA256SUMS.txt with GitHub CLI, "
+                "then configure with -DONDA_SDK_ARCHIVE and "
+                "-DONDA_SDK_CHECKSUMS")
         endif()
     endif()
-endforeach()
-string(LENGTH "${ONDA_SDK_SHA256}" ONDA_SDK_SHA256_LENGTH)
-if(NOT ONDA_SDK_SHA256_LENGTH EQUAL 64)
-    message(FATAL_ERROR
-        "${ONDA_SDK_CHECKSUMS} has no valid checksum for "
-        "${ONDA_SDK_ARCHIVE_NAME}")
-endif()
-file(SHA256 "${ONDA_SDK_ARCHIVE}" ONDA_SDK_ARCHIVE_SHA256)
-if(NOT ONDA_SDK_ARCHIVE_SHA256 STREQUAL ONDA_SDK_SHA256)
-    message(FATAL_ERROR
-        "Onda SDK checksum mismatch: expected ${ONDA_SDK_SHA256}, got "
-        "${ONDA_SDK_ARCHIVE_SHA256}")
-endif()
 
-set(ONDA_SDK_EXTRACT_DIR
-    "${CMAKE_BINARY_DIR}/_deps/onda-${ONDA_VERSION}-${ONDA_SDK_PLATFORM}")
-set(ONDA_SDK_ROOT
-    "${ONDA_SDK_EXTRACT_DIR}/onda-${ONDA_VERSION}-${ONDA_SDK_PLATFORM}")
-if(NOT EXISTS "${ONDA_SDK_ROOT}/lib/cmake/Onda/OndaConfig.cmake")
-    file(REMOVE_RECURSE "${ONDA_SDK_EXTRACT_DIR}")
-    file(MAKE_DIRECTORY "${ONDA_SDK_EXTRACT_DIR}")
-    file(ARCHIVE_EXTRACT
-        INPUT "${ONDA_SDK_ARCHIVE}"
-        DESTINATION "${ONDA_SDK_EXTRACT_DIR}")
-endif()
+    if(NOT EXISTS "${ONDA_SDK_ARCHIVE}")
+        message(FATAL_ERROR
+            "ONDA_SDK_ARCHIVE does not exist: ${ONDA_SDK_ARCHIVE}")
+    endif()
 
-if(NOT ONDA_RELEASE_SOURCE_DIR)
-    FetchContent_Declare(
-        OndaReleaseSource
-        GIT_REPOSITORY https://github.com/onda-lang/onda.git
-        GIT_TAG "${ONDA_VERSION}"
-        GIT_SHALLOW FALSE
-        SOURCE_SUBDIR _resources_only
-    )
-    FetchContent_MakeAvailable(OndaReleaseSource)
-    set(ONDA_RELEASE_SOURCE_DIR "${ondareleasesource_SOURCE_DIR}")
-endif()
+    if(ONDA_SDK_CHECKSUMS)
+        get_filename_component(ONDA_SDK_CHECKSUMS "${ONDA_SDK_CHECKSUMS}"
+            ABSOLUTE BASE_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
+    elseif(EXISTS "${CMAKE_BINARY_DIR}/_deps/${ONDA_VERSION}-SHA256SUMS.txt")
+        set(ONDA_SDK_CHECKSUMS
+            "${CMAKE_BINARY_DIR}/_deps/${ONDA_VERSION}-SHA256SUMS.txt")
+    else()
+        set(ONDA_SDK_CHECKSUMS
+            "${CMAKE_BINARY_DIR}/_deps/${ONDA_VERSION}-SHA256SUMS.txt")
+        file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/_deps")
+        file(DOWNLOAD
+            "https://github.com/onda-lang/onda/releases/download/${ONDA_VERSION}/SHA256SUMS.txt"
+            "${ONDA_SDK_CHECKSUMS}"
+            STATUS ONDA_CHECKSUMS_DOWNLOAD_STATUS
+            TLS_VERIFY ON)
+        list(GET ONDA_CHECKSUMS_DOWNLOAD_STATUS 0 ONDA_CHECKSUMS_DOWNLOAD_CODE)
+        if(NOT ONDA_CHECKSUMS_DOWNLOAD_CODE EQUAL 0)
+            list(GET ONDA_CHECKSUMS_DOWNLOAD_STATUS 1 ONDA_CHECKSUMS_DOWNLOAD_MESSAGE)
+            message(FATAL_ERROR
+                "Could not download checksums for Onda ${ONDA_VERSION}: "
+                "${ONDA_CHECKSUMS_DOWNLOAD_MESSAGE}. Download SHA256SUMS.txt "
+                "with GitHub CLI and configure with -DONDA_SDK_CHECKSUMS")
+        endif()
+    endif()
 
-execute_process(
-    COMMAND git rev-parse "${ONDA_VERSION}^{commit}"
-    WORKING_DIRECTORY "${ONDA_RELEASE_SOURCE_DIR}"
-    OUTPUT_VARIABLE ONDA_RELEASE_TAG_REVISION
-    OUTPUT_STRIP_TRAILING_WHITESPACE
-    RESULT_VARIABLE ONDA_RELEASE_TAG_GIT_RESULT)
-execute_process(
-    COMMAND git rev-parse HEAD
-    WORKING_DIRECTORY "${ONDA_RELEASE_SOURCE_DIR}"
-    OUTPUT_VARIABLE ONDA_RELEASE_SOURCE_HEAD
-    OUTPUT_STRIP_TRAILING_WHITESPACE
-    RESULT_VARIABLE ONDA_RELEASE_HEAD_GIT_RESULT)
-if(NOT ONDA_RELEASE_TAG_GIT_RESULT EQUAL 0
-        OR NOT ONDA_RELEASE_HEAD_GIT_RESULT EQUAL 0
-        OR NOT ONDA_RELEASE_SOURCE_HEAD STREQUAL ONDA_RELEASE_TAG_REVISION)
-    message(FATAL_ERROR
-        "Onda release resources are not at tag ${ONDA_VERSION}: "
-        "got ${ONDA_RELEASE_SOURCE_HEAD}")
-endif()
+    if(NOT EXISTS "${ONDA_SDK_CHECKSUMS}")
+        message(FATAL_ERROR
+            "ONDA_SDK_CHECKSUMS does not exist: ${ONDA_SDK_CHECKSUMS}")
+    endif()
+    file(STRINGS "${ONDA_SDK_CHECKSUMS}" ONDA_SDK_CHECKSUM_LINES)
+    set(ONDA_SDK_SHA256 "")
+    foreach(ONDA_SDK_CHECKSUM_LINE IN LISTS ONDA_SDK_CHECKSUM_LINES)
+        if(ONDA_SDK_CHECKSUM_LINE MATCHES "^([0-9A-Fa-f]+)[ \\t]+(.+)$")
+            get_filename_component(ONDA_CHECKSUM_ASSET_NAME "${CMAKE_MATCH_2}" NAME)
+            if(ONDA_CHECKSUM_ASSET_NAME STREQUAL ONDA_SDK_ARCHIVE_NAME)
+                set(ONDA_SDK_SHA256 "${CMAKE_MATCH_1}")
+                break()
+            endif()
+        endif()
+    endforeach()
+    string(LENGTH "${ONDA_SDK_SHA256}" ONDA_SDK_SHA256_LENGTH)
+    if(NOT ONDA_SDK_SHA256_LENGTH EQUAL 64)
+        message(FATAL_ERROR
+            "${ONDA_SDK_CHECKSUMS} has no valid checksum for "
+            "${ONDA_SDK_ARCHIVE_NAME}")
+    endif()
+    file(SHA256 "${ONDA_SDK_ARCHIVE}" ONDA_SDK_ARCHIVE_SHA256)
+    if(NOT ONDA_SDK_ARCHIVE_SHA256 STREQUAL ONDA_SDK_SHA256)
+        message(FATAL_ERROR
+            "Onda SDK checksum mismatch: expected ${ONDA_SDK_SHA256}, got "
+            "${ONDA_SDK_ARCHIVE_SHA256}")
+    endif()
 
-set(Onda_DIR "${ONDA_SDK_ROOT}/lib/cmake/Onda")
+    set(ONDA_SDK_EXTRACT_DIR
+        "${CMAKE_BINARY_DIR}/_deps/onda-${ONDA_VERSION}-${ONDA_SDK_PLATFORM}")
+    set(ONDA_SDK_ROOT
+        "${ONDA_SDK_EXTRACT_DIR}/onda-${ONDA_VERSION}-${ONDA_SDK_PLATFORM}")
+    if(NOT EXISTS "${ONDA_SDK_ROOT}/lib/cmake/Onda/OndaConfig.cmake")
+        file(REMOVE_RECURSE "${ONDA_SDK_EXTRACT_DIR}")
+        file(MAKE_DIRECTORY "${ONDA_SDK_EXTRACT_DIR}")
+        file(ARCHIVE_EXTRACT
+            INPUT "${ONDA_SDK_ARCHIVE}"
+            DESTINATION "${ONDA_SDK_EXTRACT_DIR}")
+    endif()
+
+    if(NOT ONDA_RELEASE_SOURCE_DIR)
+        FetchContent_Declare(
+            OndaReleaseSource
+            GIT_REPOSITORY https://github.com/onda-lang/onda.git
+            GIT_TAG "${ONDA_VERSION}"
+            GIT_SHALLOW FALSE
+            SOURCE_SUBDIR _resources_only
+        )
+        FetchContent_MakeAvailable(OndaReleaseSource)
+        set(ONDA_RELEASE_SOURCE_DIR "${ondareleasesource_SOURCE_DIR}")
+    endif()
+
+    execute_process(
+        COMMAND git rev-parse "${ONDA_VERSION}^{commit}"
+        WORKING_DIRECTORY "${ONDA_RELEASE_SOURCE_DIR}"
+        OUTPUT_VARIABLE ONDA_RELEASE_TAG_REVISION
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        RESULT_VARIABLE ONDA_RELEASE_TAG_GIT_RESULT)
+    execute_process(
+        COMMAND git rev-parse HEAD
+        WORKING_DIRECTORY "${ONDA_RELEASE_SOURCE_DIR}"
+        OUTPUT_VARIABLE ONDA_RELEASE_SOURCE_HEAD
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        RESULT_VARIABLE ONDA_RELEASE_HEAD_GIT_RESULT)
+    if(NOT ONDA_RELEASE_TAG_GIT_RESULT EQUAL 0
+            OR NOT ONDA_RELEASE_HEAD_GIT_RESULT EQUAL 0
+            OR NOT ONDA_RELEASE_SOURCE_HEAD STREQUAL ONDA_RELEASE_TAG_REVISION)
+        message(FATAL_ERROR
+            "Onda release resources are not at tag ${ONDA_VERSION}: "
+            "got ${ONDA_RELEASE_SOURCE_HEAD}")
+    endif()
+
+    set(Onda_DIR "${ONDA_SDK_ROOT}/lib/cmake/Onda")
+endif()
 find_package(Onda CONFIG REQUIRED)
 
 if(ONDA_JUCE_ROOT)

@@ -2,6 +2,7 @@ name: Build Onda VST3
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  MACOSX_DEPLOYMENT_TARGET: "15.0"
 
 on:
   workflow_dispatch:
@@ -37,9 +38,9 @@ jobs:
           - name: linux-x64
             runner: ubuntu-24.04
           - name: windows-x64
-            runner: windows-2022
+            runner: windows-latest
           - name: macos-arm64
-            runner: macos-15
+            runner: macos-latest
 
     env:
       BUILD_PATH: ${{ github.workspace }}/build
@@ -159,6 +160,12 @@ jobs:
           cp -R examples "$package_root/"
           cp README.md LICENSE THIRD_PARTY_NOTICES.md "$package_root/"
           cp -R "$BUILD_PATH/release-licenses" "$package_root/licenses"
+          if [[ "${{ runner.os }}" == "Linux" ]]; then
+            find "$package_root" -type f -name '*.so' -exec strip --strip-unneeded {} +
+            "$BUILD_PATH/onda_vst3_smoke" \
+              "$package_root/OndaSynth.vst3/Contents/x86_64-linux/OndaSynth.so" \
+              "$package_root/OndaFX.vst3/Contents/x86_64-linux/OndaFX.so"
+          fi
           cd "$RUNNER_TEMP"
           cmake -E tar cf "$archive" --format=zip "$PACKAGE_NAME"
 

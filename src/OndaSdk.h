@@ -112,6 +112,10 @@ struct CompileResult {
     std::span<const ProjectBufferAsset> buffers, Diagnostic &diagnostic);
 [[nodiscard]] bool validateProjectImage(const ProjectImage &image,
                                         Diagnostic &diagnostic);
+[[nodiscard]] ProjectImage
+withProjectBufferOverrides(const ProjectImage &image,
+                           std::span<const ProjectBufferAsset> buffers,
+                           Diagnostic &diagnostic);
 using MaterializedProjectVisitor =
     std::function<bool(MaterializedProjectFile &&)>;
 [[nodiscard]] bool

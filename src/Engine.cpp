@@ -497,6 +497,7 @@ bool validateEvent(const onda_program_t *program, const ExpectedEvent &expected,
         onda_event_param_elem_type(program, index, parameter) !=
             expected.parameterTypes[static_cast<std::size_t>(parameter)] ||
         onda_event_param_is_slice(program, index, parameter) != 0 ||
+        onda_event_param_is_array(program, index, parameter) != 0 ||
         arrayLength != 1) {
       diagnostic = error("Canonical " + std::string(expected.category) +
                          " event '" + name + "' has an incompatible payload");
@@ -1154,7 +1155,12 @@ PreparedEngine::build(CompileResult compiled, const Product product,
     return result;
   }
 
-  if (!result.projectImage.valid()) {
+  if (result.projectImage.valid() && !projectBufferAssets.empty()) {
+    result.projectImage = withProjectBufferOverrides(
+        result.projectImage, projectBufferAssets, result.diagnostic);
+    if (!result.projectImage.valid())
+      return result;
+  } else if (!result.projectImage.valid()) {
     result.projectImage =
         captureProjectImage(diskEntry, compiled.manifest.get(),
                             projectBufferAssets, result.diagnostic);

@@ -471,7 +471,28 @@ Worker::mergedPaths(std::vector<std::filesystem::path> first,
 }
 
 void Worker::build(const Request &request) {
-  const auto hadActiveEngine = status().active;
+  bool hadActiveEngine;
+  {
+    std::lock_guard lock(mutex_);
+    if (!matchesDesiredLocked(request))
+      return;
+    const auto active = activeGeneration_.load(std::memory_order_acquire);
+    hadActiveEngine =
+        active != 0 && !deactivateRequested_.load(std::memory_order_acquire);
+    // Publication precedes adoption. Keep the interface of the engine that
+    // actually runs, so a superseded queued replacement cannot become fallback.
+    if (hadActiveEngine) {
+      if (status_.engineGeneration == active)
+        retainedStatus_ = status_;
+      if (retainedStatus_.engineGeneration == active) {
+        status_.engineGeneration = active;
+        status_.mappings = retainedStatus_.mappings;
+        status_.buffers = retainedStatus_.buffers;
+        status_.events = retainedStatus_.events;
+        status_.midi = retainedStatus_.midi;
+      }
+    }
+  }
   if (!updateStatus(request, "Compiling", true, hadActiveEngine))
     return;
 
@@ -566,9 +587,10 @@ void Worker::build(const Request &request) {
     auto message = diagnosticMessage(result.diagnostic);
     if (attemptedProjectImage)
       message = diskFailure + "; saved project image also failed: " + message;
-    static_cast<void>(updateStatus(request, std::move(message), false,
-                                   hadActiveEngine, std::nullopt,
-                                   std::move(result.buffers)));
+    static_cast<void>(updateStatus(
+        request, std::move(message), false, hadActiveEngine, std::nullopt,
+        hadActiveEngine ? std::nullopt
+                        : std::make_optional(std::move(result.buffers))));
     completedGeneration_ = request.generation;
     return;
   }

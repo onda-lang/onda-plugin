@@ -1,3 +1,6 @@
+#include "TemporaryDirectory.h"
+
+#include "AudioFile.h"
 #include "Processor.h"
 #include "RunViewHost.h"
 #include "TestAudioFile.h"
@@ -167,7 +170,7 @@ public:
   TemporarySource() {
     const auto stamp =
         std::chrono::steady_clock::now().time_since_epoch().count();
-    path_ = std::filesystem::temp_directory_path() /
+    path_ = testTemporaryRoot() /
             ("onda-processor-fault-" + std::to_string(stamp) + ".onda");
   }
 
@@ -200,7 +203,7 @@ public:
   TemporaryProject() {
     const auto stamp =
         std::chrono::steady_clock::now().time_since_epoch().count();
-    directory_ = std::filesystem::temp_directory_path() /
+    directory_ = testTemporaryRoot() /
                  ("onda-processor-project-" + std::to_string(stamp));
     std::filesystem::create_directories(directory_);
     entry_ = directory_ / "main.onda";
@@ -1507,6 +1510,85 @@ bool exerciseEditorLifecycle() {
   return true;
 }
 
+bool exerciseProjectBufferOverrideRestore() {
+  TemporarySource source;
+  if (!source.write(R"(
+config const Gain: f32 = 1.0
+buffers { clip: buffer<f32[2]>, untouched: buffer<f32> }
+outs { out1, out2 }
+sample {
+  out1 = clip[0, 0] * Gain + untouched[0]
+  out2 = clip[0, 0] * Gain + untouched[0]
+}
+)"))
+    return false;
+  const auto projectPath = source.path().parent_path() / "override.ondaproject";
+  {
+    std::ofstream manifest(projectPath);
+    manifest << "{\"entry\":\"" << source.path().filename().string()
+             << R"(","constants":{"Gain":2.0},"buffers":{
+    "clip":{"inline":{"element":"f32","channels":2,"sample_rate":48000,"values":[0.25,0.5]}},
+    "untouched":{"inline":{"element":"f32","channels":1,"sample_rate":48000,"values":[0.125]}}
+  }})";
+    if (!manifest.good())
+      return false;
+  }
+  TemporaryAudioFile audio{"onda-project-override"};
+  if (!audio.write(0.75F, 0.25F))
+    return false;
+  const auto decoded = onda::plugin::decodeAudioFile(audio.path());
+  if (!decoded.audio)
+    return false;
+  // Compare the checkpoint exactly, accounting for the FLAC fixture's 16-bit
+  // quantization before applying the project constant and unchanged buffer.
+  const auto expectedOverride =
+      decoded.audio->interleavedSamples[0] * 2.0F + 0.125F;
+  juce::MemoryBlock saved;
+  {
+    onda::plugin::Processor processor(onda::plugin::Product::effect);
+    processor.prepareToPlay(48'000.0, 8);
+    processor.loadFile(juce::File(projectPath.string()), false);
+    if (!waitForOutput(processor, 0.625F, 8)) {
+      std::cerr << "project default failed: " << processor.workerStatus().message << '\n';
+      return false;
+    }
+    processor.bindBufferFile("clip", juce::File(audio.path().string()));
+    if (!waitForOutput(processor, expectedOverride, 8)) {
+      std::cerr << "project override failed: " << processor.workerStatus().message << '\n';
+      return false;
+    }
+    processor.getStateInformation(saved);
+    processor.clearBuffer("clip");
+    if (!waitForOutput(processor, 0.625F, 8)) {
+      std::cerr << "clearing an override did not restore the project default\n";
+      return false;
+    }
+  }
+  // Missing external audio alone must trigger the exact saved override.
+  std::filesystem::remove(audio.path());
+  {
+    onda::plugin::Processor restored(onda::plugin::Product::effect);
+    restored.setStateInformation(saved.getData(),
+                                 static_cast<int>(saved.getSize()));
+    restored.prepareToPlay(48'000.0, 8);
+    if (!waitForProjectImageOutput(restored, expectedOverride, 8)) {
+      std::cerr << "saved project lost its buffer override or constants\n";
+      return false;
+    }
+  }
+  source.remove();
+  std::filesystem::remove(projectPath);
+  onda::plugin::Processor portable(onda::plugin::Product::effect);
+  portable.setStateInformation(saved.getData(),
+                               static_cast<int>(saved.getSize()));
+  portable.prepareToPlay(48'000.0, 8);
+  if (!waitForProjectImageOutput(portable, expectedOverride, 8)) {
+    std::cerr << "buffer override checkpoint depended on the source project\n";
+    return false;
+  }
+  return true;
+}
+
 bool exerciseAudioFileBuffers() {
   TemporarySource source;
   if (!source.write(R"(
@@ -1699,7 +1781,7 @@ sample {
     }
 
     const auto exportDirectory =
-        std::filesystem::temp_directory_path() /
+        testTemporaryRoot() /
         ("onda-portable-buffer-project-" +
          std::to_string(
              std::chrono::steady_clock::now().time_since_epoch().count()));
@@ -1811,8 +1893,8 @@ bool exerciseProjectExportRelinksAuthority() {
 
   const auto stamp =
       std::chrono::steady_clock::now().time_since_epoch().count();
-  const auto exportRoot = std::filesystem::temp_directory_path() /
-                          ("onda-processor-export-" + std::to_string(stamp));
+  const auto exportRoot =
+      testTemporaryRoot() / ("onda-processor-export-" + std::to_string(stamp));
   std::filesystem::create_directories(exportRoot);
   const auto cleanup = [&] {
     std::error_code ignored;
@@ -2163,7 +2245,48 @@ bool exerciseSupersededHandoff() {
       }
     }
   }
-  return true;
+  if (!waitForSafeEffectBypass(processor) ||
+      processor.workerStatus().engineGeneration != 0) {
+    std::cerr << "discarded replacement remained active in worker status\n";
+    return false;
+  }
+  // Repeat with an adopted engine: the failure must retain its audio and
+  // interface, not those of the superseded replacement.
+  if (!source.write(validSource(onda::plugin::Product::effect)))
+    return false;
+  processor.loadFile(juce::File(source.path().string()), false);
+  if (!waitForOutput(processor, 0.25F))
+    return false;
+  const auto running = processor.workerStatus();
+  if (!source.write(
+          "outs { out1, out2 }\nsample { out1 = 0.75; out2 = 0.75 }\n"))
+    return false;
+  processor.loadFile(juce::File(source.path().string()), false);
+  if (!waitForPublishedReplacement(processor))
+    return false;
+  if (!source.write("this is not valid Onda source\n"))
+    return false;
+  processor.loadFile(juce::File(source.path().string()), false);
+  for (int attempt = 0; attempt < 500; ++attempt) {
+    for (int channel = 0; channel < audio.getNumChannels(); ++channel)
+      std::fill_n(audio.getWritePointer(channel), audio.getNumSamples(), 1.0F);
+    processor.processBlock(audio, midi);
+    const auto status = processor.workerStatus();
+    if (!status.compiling && status.message != "Waiting to compile" &&
+        status.message != "Active") {
+      if (!status.active ||
+          status.engineGeneration != running.engineGeneration ||
+          status.mappings.size() != running.mappings.size() ||
+          std::abs(audio.getSample(0, 0) - 0.25F) >= 1.0e-5F) {
+        std::cerr << "superseded replacement displaced the running interface\n";
+        return false;
+      }
+      return true;
+    }
+    juce::MessageManager::getInstance()->runDispatchLoopUntil(10);
+  }
+  std::cerr << "superseded replacement failure did not finish\n";
+  return false;
 }
 
 bool exerciseConcurrentInstances() {
@@ -2229,6 +2352,7 @@ int main() {
       !exercise(onda::plugin::Product::effect) ||
       !exercise(onda::plugin::Product::instrument) || !exerciseStateRestore() ||
       !exerciseEditorLifecycle() || !exerciseAudioFileBuffers() ||
+      !exerciseProjectBufferOverrideRestore() ||
       !exerciseSourceGraphFallbackAndDiskAuthority() ||
       !exerciseProjectExportRelinksAuthority() || !exerciseExtendedMidi() ||
       !exerciseMidiKeyboardMonitor() || !exerciseEventMetadataGating() ||
