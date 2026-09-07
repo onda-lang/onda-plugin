@@ -78,6 +78,28 @@ extern "C" int __wrap_pthread_mutex_lock(pthread_mutex_t *mutex) {
     lock_audit::count.fetch_add(1, std::memory_order_relaxed);
   return __real_pthread_mutex_lock(mutex);
 }
+extern "C" void *__real_malloc(std::size_t);
+extern "C" void *__real_calloc(std::size_t, std::size_t);
+extern "C" void *__real_realloc(void *, std::size_t);
+extern "C" void __real_free(void *);
+extern "C" void *__wrap_malloc(const std::size_t size) {
+  allocation_audit::record();
+  return __real_malloc(size);
+}
+extern "C" void *__wrap_calloc(const std::size_t count,
+                               const std::size_t size) {
+  allocation_audit::record();
+  return __real_calloc(count, size);
+}
+extern "C" void *__wrap_realloc(void *pointer, const std::size_t size) {
+  allocation_audit::record();
+  return __real_realloc(pointer, size);
+}
+extern "C" void __wrap_free(void *pointer) {
+  if (pointer != nullptr)
+    allocation_audit::record();
+  __real_free(pointer);
+}
 #endif
 
 void *operator new(const std::size_t size) {
@@ -616,6 +638,10 @@ bool processWithoutAllocation(onda::plugin::Processor &processor,
   juce::MidiBuffer midi;
   midi.addEvent(juce::MidiMessage::noteOn(1, 60, 1.0F), 16);
   midi.addEvent(juce::MidiMessage::controllerEvent(1, 74, 96), 32);
+  const std::array<std::uint8_t, 256> sysex{};
+  midi.addEvent(juce::MidiMessage::createSysExMessage(
+                    sysex.data(), static_cast<int>(sysex.size())),
+                40);
   for (int channel = 0; channel < audio.getNumChannels(); ++channel)
     std::fill_n(audio.getWritePointer(channel), audio.getNumSamples(), 1.0F);
 
@@ -800,6 +826,26 @@ bool exerciseUserEvents() {
           "9007199254740993") {
     std::cerr << "user-event metadata was not adapted for the run view\n";
     return false;
+  }
+
+  for (const auto &argument : *arguments) {
+    if (argument.getDynamicObject()->hasProperty("value")) {
+      std::cerr << "ordinary state refresh overwrites edited event arguments\n";
+      return false;
+    }
+  }
+  const auto resetMessage = onda::plugin::makeRunViewState(
+      processor, status, processor.canExportProject(), {}, true);
+  const auto &resetArguments = *resetMessage["state"]["events"]
+                                    .getArray()
+                                    ->getReference(0)["args"]
+                                    .getArray();
+  for (const auto &argument : resetArguments) {
+    if (!argument.getDynamicObject()->hasProperty("value") ||
+        argument["value"] != argument["default"]) {
+      std::cerr << "new-program state did not initialize event arguments\n";
+      return false;
+    }
   }
 
   juce::Array<juce::var> fixed{2, 3};
@@ -1546,21 +1592,35 @@ sample {
   juce::MemoryBlock saved;
   {
     onda::plugin::Processor processor(onda::plugin::Product::effect);
+    StateChangeListener listener(processor);
     processor.prepareToPlay(48'000.0, 8);
     processor.loadFile(juce::File(projectPath.string()), false);
     if (!waitForOutput(processor, 0.625F, 8)) {
       std::cerr << "project default failed: " << processor.workerStatus().message << '\n';
       return false;
     }
+    juce::MessageManager::getInstance()->runDispatchLoopUntil(100);
+    auto changes = listener.nonParameterChanges;
     processor.bindBufferFile("clip", juce::File(audio.path().string()));
     if (!waitForOutput(processor, expectedOverride, 8)) {
       std::cerr << "project override failed: " << processor.workerStatus().message << '\n';
       return false;
     }
+    juce::MessageManager::getInstance()->runDispatchLoopUntil(100);
+    if (listener.nonParameterChanges <= changes) {
+      std::cerr << "buffer override did not mark host state dirty\n";
+      return false;
+    }
+    changes = listener.nonParameterChanges;
     processor.getStateInformation(saved);
     processor.clearBuffer("clip");
     if (!waitForOutput(processor, 0.625F, 8)) {
       std::cerr << "clearing an override did not restore the project default\n";
+      return false;
+    }
+    juce::MessageManager::getInstance()->runDispatchLoopUntil(100);
+    if (listener.nonParameterChanges <= changes) {
+      std::cerr << "clearing a buffer override did not mark host state dirty\n";
       return false;
     }
   }
@@ -1902,12 +1962,15 @@ bool exerciseProjectExportRelinksAuthority() {
   };
 
   onda::plugin::Processor processor(onda::plugin::Product::effect);
+  StateChangeListener listener(processor);
   processor.prepareToPlay(48'000.0, 64);
   processor.loadFile(juce::File(project.entry().string()), false);
   if (!waitForOutput(processor, 0.25F)) {
     cleanup();
     return false;
   }
+  juce::MessageManager::getInstance()->runDispatchLoopUntil(100);
+  const auto changes = listener.nonParameterChanges;
   std::optional<std::string> saveError;
   if (!processor.saveProjectAsAsync(
           juce::File(exportRoot.string()),
@@ -1922,6 +1985,14 @@ bool exerciseProjectExportRelinksAuthority() {
       processor.workerStatus().path != exportRoot / "project.ondaproject") {
     std::cerr << "Save Project As did not relink the exported disk project: "
               << (saveError ? *saveError : "timed out") << '\n';
+    cleanup();
+    return false;
+  }
+
+  processor.prepareToPlay(48'000.0, 64);
+  juce::MessageManager::getInstance()->runDispatchLoopUntil(100);
+  if (listener.nonParameterChanges <= changes) {
+    std::cerr << "project export relinking did not mark host state dirty\n";
     cleanup();
     return false;
   }
@@ -2289,6 +2360,188 @@ bool exerciseSupersededHandoff() {
   return false;
 }
 
+// No dispatch-loop pumping: host preparation and offline processing must be
+// complete before the very first rendered sample.
+bool rendersImmediately(onda::plugin::Processor &processor, const int frames,
+                        const float expected) {
+  juce::AudioBuffer<float> audio(2, frames);
+  juce::MidiBuffer midi;
+  for (int block = 0; block < 100; ++block) {
+    for (int channel = 0; channel < 2; ++channel)
+      std::fill_n(audio.getWritePointer(channel), frames, 1.0F);
+    processor.processBlock(audio, midi);
+    for (int channel = 0; channel < 2; ++channel) {
+      for (int frame = 0; frame < frames; ++frame) {
+        if (std::abs(audio.getSample(channel, frame) - expected) > 1.0e-6F) {
+          std::cerr
+              << "host preparation returned before correct audio was ready\n";
+          return false;
+        }
+      }
+    }
+  }
+  return true;
+}
+
+bool exerciseHostPreparation() {
+  using namespace onda::plugin;
+  for (const auto product : {Product::effect, Product::instrument}) {
+    TemporarySource source;
+    if (!source.write(validSource(product)))
+      return false;
+    Processor original(product);
+    if (std::fpclassify(original.getTailLengthSeconds()) != FP_ZERO)
+      return false;
+    original.loadFile(juce::File(source.path().string()), true);
+    original.prepareToPlay(48'000.0, 64);
+    if (!rendersImmediately(original, 64, 0.25F) ||
+        !std::isinf(original.getTailLengthSeconds()))
+      return false;
+    original.releaseResources();
+    original.prepareToPlay(48'000.0, 64);
+    if (!rendersImmediately(original, 64, 0.25F))
+      return false;
+
+    juce::MemoryBlock state;
+    original.getStateInformation(state);
+    Processor restored(product);
+    restored.setNonRealtime(true);
+    restored.setStateInformation(state.getData(),
+                                 static_cast<int>(state.getSize()));
+    restored.prepareToPlay(44'100.0, 512);
+    if (!rendersImmediately(restored, 512, 0.25F))
+      return false;
+    restored.releaseResources();
+    restored.prepareToPlay(96'000.0, 128);
+    if (!rendersImmediately(restored, 128, 0.25F))
+      return false;
+    // Some hosts restore state after preparing, or change mode at process time.
+    restored.setNonRealtime(false);
+    restored.setStateInformation(state.getData(),
+                                 static_cast<int>(state.getSize()));
+    restored.setNonRealtime(true);
+    if (!rendersImmediately(restored, 128, 0.25F) ||
+        !rendersImmediately(restored, 256, 0.25F))
+      return false;
+    source.remove();
+    restored.setStateInformation(state.getData(),
+                                 static_cast<int>(state.getSize()));
+    restored.prepareToPlay(48'000.0, 64);
+    if (!rendersImmediately(restored, 64, 0.25F) ||
+        !restored.workerStatus().usingProjectImage)
+      return false;
+    restored.unload();
+    if (std::fpclassify(restored.getTailLengthSeconds()) != FP_ZERO)
+      return false;
+  }
+  // Reprepare while an asynchronously loaded engine is queued for default
+  // seeding. No timer may be needed to clear deactivation or set its slots.
+  TemporarySource seededSource;
+  if (!seededSource.write(parameterEffectSource))
+    return false;
+  Processor seeded(Product::effect);
+  seeded.prepareToPlay(48'000.0, 64);
+  seeded.setSlotValue(0, 0.9F);
+  seeded.loadFile(juce::File(seededSource.path().string()), true);
+  if (!waitForPublishedReplacement(seeded))
+    return false;
+  seeded.prepareToPlay(48'000.0, 64);
+  if (!rendersImmediately(seeded, 64, 0.5F))
+    return false;
+
+  // A completed compilation failure must release the readiness waiter too.
+  TemporarySource invalid;
+  if (!invalid.write("invalid source\n"))
+    return false;
+  Processor failed(Product::effect);
+  failed.loadFile(juce::File(invalid.path().string()), true);
+  failed.prepareToPlay(48'000.0, 64);
+  return !failed.workerStatus().active && rendersImmediately(failed, 64, 1.0F);
+}
+
+bool exerciseAutomaticEventReplacement() {
+  using namespace onda::plugin;
+  TemporarySource source;
+  if (!source.write("outs { out1, out2 }\ninit { held = 0.125 }\n"
+                    "event alpha(value: f32) { held = value }\n"
+                    "sample { out1 = held; out2 = held }\n"))
+    return false;
+  Processor processor(Product::effect);
+  processor.loadFile(juce::File(source.path().string()), false);
+  processor.prepareToPlay(48'000.0, 64);
+  if (!rendersImmediately(processor, 64, 0.125F))
+    return false;
+  const auto before = processor.workerStatus();
+  if (!processor.triggerEvent("alpha", juce::Array<juce::var>{0.5}).empty() ||
+      !source.write("outs { out1, out2 }\ninit { held = 0.25 }\n"
+                    "event beta(values: f64[]) { held = 0.875 }\n"
+                    "sample { out1 = held; out2 = held }\n") ||
+      !waitForActiveRevision(processor, before.revision))
+    return false;
+  const auto after = processor.workerStatus();
+  if (before.engineGeneration == after.engineGeneration ||
+      !rendersImmediately(processor, 64, 0.25F)) {
+    std::cerr << "automatic reload reused event identity or dispatched an old "
+                 "payload\n";
+    return false;
+  }
+  return processor
+             .triggerEvent("beta", juce::Array<juce::var>{juce::var{
+                                       juce::Array<juce::var>{1.0, 2.0}}})
+             .empty() &&
+         rendersImmediately(processor, 64, 0.875F);
+}
+
+bool exerciseProjectDirtyNotifications() {
+  using namespace onda::plugin;
+  TemporarySource source;
+  if (!source.write(validSource(Product::effect)))
+    return false;
+  Processor processor(Product::effect);
+  StateChangeListener listener(processor);
+  processor.loadFile(juce::File(source.path().string()), true);
+  processor.prepareToPlay(48'000.0, 64);
+  juce::MessageManager::getInstance()->runDispatchLoopUntil(100);
+  if (listener.nonParameterChanges == 0) {
+    std::cerr
+        << "loading a parameterless project did not mark host state dirty\n";
+    return false;
+  }
+  auto changes = listener.nonParameterChanges;
+  const auto previous = processor.workerStatus().revision;
+  if (!source.write(
+          "outs { out1, out2 }\nsample { out1 = 0.75; out2 = 0.75 }\n") ||
+      !waitForActiveRevision(processor, previous) ||
+      !waitForOutput(processor, 0.75F))
+    return false;
+  juce::MessageManager::getInstance()->runDispatchLoopUntil(100);
+  if (listener.nonParameterChanges <= changes)
+    return false;
+  changes = listener.nonParameterChanges;
+  processor.requestReload();
+  processor.prepareToPlay(48'000.0, 64);
+  juce::MessageManager::getInstance()->runDispatchLoopUntil(100);
+  if (listener.nonParameterChanges != changes) {
+    std::cerr << "identical recompilation dirtied host state\n";
+    return false;
+  }
+  juce::MemoryBlock state;
+  processor.getStateInformation(state);
+  Processor restored(Product::effect);
+  StateChangeListener restoreListener(restored);
+  restored.setStateInformation(state.getData(),
+                               static_cast<int>(state.getSize()));
+  restored.prepareToPlay(44'100.0, 128);
+  juce::MessageManager::getInstance()->runDispatchLoopUntil(100);
+  if (restoreListener.nonParameterChanges != 0) {
+    std::cerr << "restoring host state marked it dirty\n";
+    return false;
+  }
+  processor.unload();
+  juce::MessageManager::getInstance()->runDispatchLoopUntil(100);
+  return listener.nonParameterChanges > changes;
+}
+
 bool exerciseConcurrentInstances() {
   TemporarySource effectSource;
   TemporarySource instrumentSource;
@@ -2347,9 +2600,10 @@ int main() {
   std::signal(SIGPIPE, SIG_IGN);
 #endif
   juce::ScopedJuceInitialiser_GUI juceInitialiser;
-  if (!exerciseRunViewAdapter() || !exerciseScopeCapture() ||
-      !exerciseUserEvents() || !exerciseRuntimeLogging() ||
-      !exercise(onda::plugin::Product::effect) ||
+  if (!exerciseHostPreparation() || !exerciseAutomaticEventReplacement() ||
+      !exerciseProjectDirtyNotifications() || !exerciseRunViewAdapter() ||
+      !exerciseScopeCapture() || !exerciseUserEvents() ||
+      !exerciseRuntimeLogging() || !exercise(onda::plugin::Product::effect) ||
       !exercise(onda::plugin::Product::instrument) || !exerciseStateRestore() ||
       !exerciseEditorLifecycle() || !exerciseAudioFileBuffers() ||
       !exerciseProjectBufferOverrideRestore() ||

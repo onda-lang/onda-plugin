@@ -74,6 +74,8 @@ public:
   Worker &operator=(const Worker &) = delete;
 
   void configure(double sampleRate, int blockSize);
+  // Host lifecycle/offline callers only; never wait on a realtime thread.
+  [[nodiscard]] std::uint64_t waitForPreparation();
   void
   load(std::filesystem::path path, bool seedDefaults,
        ExistingEnginePolicy policy = ExistingEnginePolicy::retainUntilSuccess);
@@ -85,7 +87,7 @@ public:
                std::vector<BufferFileBinding> bufferBindings,
                ExistingEnginePolicy policy =
                    ExistingEnginePolicy::deactivateImmediately);
-  void unload();
+  void unload(bool notifyHost = true);
   void requestRebuild();
   void bindBufferFile(std::string name, std::filesystem::path path);
   void clearBuffer(std::string_view name);
@@ -101,6 +103,10 @@ public:
   [[nodiscard]] std::uint64_t statusRevision() const;
   [[nodiscard]] std::optional<SeedValues> takeSeedValues();
   [[nodiscard]] PersistedProjectState persistedProjectState() const;
+  [[nodiscard]] bool takeProjectStateChange();
+  [[nodiscard]] bool hasPreparedEngine() const noexcept {
+    return hasPreparedEngine_.load(std::memory_order_acquire);
+  }
   [[nodiscard]] std::uint64_t requestGeneration() const noexcept {
     return requestGeneration_.load(std::memory_order_acquire);
   }
@@ -112,6 +118,7 @@ private:
     int blockSize{};
     std::uint64_t generation{};
     bool seedDefaults{};
+    bool notifyProjectChange{true};
     std::vector<BufferFileBinding> bufferBindings;
     ProjectImage fallbackProjectImage;
   };
@@ -129,6 +136,8 @@ private:
   void run() noexcept;
   void build(const Request &request);
   void advanceGeneration() noexcept;
+  void finishRequest(std::uint64_t generation);
+  void publishProjectState(PersistedProjectState state, bool notifyHost);
   void deactivateStatus() noexcept;
   void clearPublishedInterface() noexcept;
   void reportFailure(const char *message) noexcept;
@@ -165,6 +174,7 @@ private:
 
   mutable std::mutex mutex_;
   std::condition_variable wake_;
+  std::condition_variable prepared_;
   Request desired_;
   WorkerStatus status_;
   WorkerStatus retainedStatus_;
@@ -172,14 +182,18 @@ private:
   PersistedProjectState publishedProjectState_;
   bool stopping_{};
   bool forceRebuild_{};
+  bool workerStopped_{};
+  bool projectStateChanged_{};
+  std::atomic<bool> hasPreparedEngine_{};
   std::atomic<std::uint64_t> requestGeneration_{};
   std::atomic<std::uint64_t> activeGeneration_{};
-  std::thread thread_;
 
   std::vector<std::filesystem::path> watchedPaths_;
   std::vector<std::filesystem::path> successfulPaths_;
   std::vector<FileStamp> watchedStamp_;
   std::uint64_t completedGeneration_{};
+  // Start the thread only after all of its state has been initialized.
+  std::thread thread_;
 };
 
 } // namespace onda::plugin

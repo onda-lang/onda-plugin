@@ -2,8 +2,8 @@
 
 `Processor` is the JUCE boundary. It owns the permanent parameters, linked
 project state with an Onda project image, two one-slot realtime
-handoffs, a bounded UI-event queue, and the audio-thread-only active engine
-pointer. The VST3 wrapper
+handoffs, a bounded UI-event queue, and the active engine pointer, accessed
+only by processing or suspended host preparation. The VST3 wrapper
 adds its format-required `Bypass` parameter outside
 the permanent 32-slot Onda set. It also exposes the fixed, non-automatable
 controller mappings that VST3 requires to deliver pitch bend, channel pressure,
@@ -53,7 +53,8 @@ path mapping, syntax-aware directive rewriting, manifest construction, and
 typed asset encoding. The plugin writes the returned materialization plan to a
 sibling staging directory, renames it into place, and links the exported
 `.ondaproject` manifest. It does not parse or reproduce the manifest's entry and
-buffer semantics, and it never partially overwrites a project.
+buffer semantics, and it never partially overwrites a project. Every output stream is explicitly
+closed and checked before its staging directory can be published.
 
 `RunViewHost` owns embedded-resource routing and projection of processor state
 into the shared view's host-message schema. `Editor` owns only the native
@@ -66,13 +67,23 @@ The view lists user-defined events but omits the canonical `plugin_midi` and
 arguments are validated and packed on the message thread into a bounded SPSC
 queue. The callback dispatches them at its next boundary without allocation or
 locking; a build generation on every command prevents stale event indices from
-crossing an engine replacement.
+crossing an engine replacement. Automatic filesystem reloads advance this
+generation as well as explicit requests. The worker atomically replaces and
+destroys an unconsumed queued engine, so a suspended host cannot cause repeated
+compilation or prevent preparation from completing.
+
+Ordinary view updates send event defaults as metadata without overwriting the
+arguments edited in the browser. A new engine generation initializes the
+arguments; the explicit argument-reset command restores their defaults.
 
 Editor dimensions and the parameter-control layout are processor-owned UI
 state. Changes notify the host that non-parameter state is dirty, are serialized
 with the project, and are restored before a recreated editor installs its size
 constraints. The browser bridge projects the saved layout into the shared view
-instead of relying on webview-local storage.
+instead of relying on webview-local storage. Coherent project-image publication,
+buffer changes, export relinking, and unload also notify the host that saved
+state changed. Identical recompilation and initial host-state restoration do not
+mark the host dirty. Notifications are delivered by the message-thread timer.
 
 While an editor exists, the callback writes interleaved output into a bounded,
 lock-free scope ring owned by `Processor`. The editor snapshots its newest
@@ -96,14 +107,26 @@ dispatch: undeclared MIDI does not split processing, undeclared context fields
 do not perform projection or payload work, and an engine without position
 events does not query the JUCE playhead.
 
+Host preparation waits on the worker's completion condition before returning
+and adopts the specialization without needing a GUI timer tick. An unchanged
+configuration retains its eligible engine. Offline callbacks also synchronize
+when state is restored after preparation or the host changes block bounds.
+The preparation mutex serializes these non-realtime paths with timer-driven
+parameter seeding and scratch resizing; realtime callbacks never acquire it.
+Synchronous preparation may reclaim a queued retirement directly; ordinary
+realtime retirement remains the worker's responsibility.
+
 Host configuration is authoritative. A sample-rate/block-size change makes the
 old engine ineligible immediately and requests a new specialization. An
-oversized callback never touches undersized slabs; it uses product fallback,
+oversized realtime callback never touches undersized slabs; it uses product fallback,
 publishes the larger bound atomically, and lets the message-thread timer request
 the replacement.
 
 Fallback is silence for the instrument and same-index dry pass-through for the
-effect. Double-precision processing is not advertised.
+effect. Double-precision processing is not advertised. A loaded program advertises
+an infinite VST3 tail because arbitrary DSP may sustain indefinitely; an unloaded
+plugin reports no tail. MIDI filtering rejects unsupported system/SysEx and
+malformed channel packets before constructing an owning JUCE message.
 
 Generated runtime safety checks return a positive status through the Onda C
 API. On failure the callback restores fallback audio, requests deactivation,

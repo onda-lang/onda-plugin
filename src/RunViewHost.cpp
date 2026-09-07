@@ -149,7 +149,8 @@ std::optional<Resource> runViewResource(const juce::String &request) {
 
 juce::var makeRunViewState(Processor &processor, const WorkerStatus &status,
                            const bool canExportProject,
-                           const std::string &actionError) {
+                           const std::string &actionError,
+                           const bool resetEventArguments) {
   auto state = object();
   set(state, "running", status.active);
   set(state, "connected", status.active);
@@ -285,7 +286,8 @@ juce::var makeRunViewState(Processor &processor, const WorkerStatus &status,
       set(argument, "isSlice", mappingParameter.slice);
       auto defaultValue = defaultEventValue(mappingParameter);
       set(argument, "default", defaultValue);
-      set(argument, "value", std::move(defaultValue));
+      if (resetEventArguments)
+        set(argument, "value", std::move(defaultValue));
       arguments.add(std::move(argument));
     }
     set(event, "args", std::move(arguments));

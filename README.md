@@ -25,7 +25,8 @@ name with a different payload rejects the load. Channels are zero-based,
 ordinary MIDI notes use `id = -1`, and all continuous values except program
 number are normalized to `[0, 1]`. Pitch bend uses `0.5` as its center.
 Incoming messages whose event is not declared are ignored without splitting
-audio processing at their offsets.
+audio processing at their offsets. Unsupported system/SysEx messages are ignored
+without allocating in the audio callback.
 
 JUCE playhead data is exposed through these optional, read-only host-context
 events:
@@ -76,7 +77,14 @@ editor is open. Programs declaring canonical note events also get a read-only
 MIDI keyboard: host note-on/off messages illuminate its keys, while MIDI device
 selection and note input remain owned by the DAW. Editor dimensions and the
 Sliders/Knobs choice are retained when the view is reopened and saved in the DAW
-project.
+project. Event argument edits survive parameter automation and log updates;
+loading a new program or explicitly resetting the arguments restores defaults.
+
+Host preparation finishes the requested specialization before playback begins.
+Offline rendering also waits for state restored after preparation, without
+requiring the editor or its message loop. Loaded programs report an infinite
+tail to the host because arbitrary Onda DSP can sustain indefinitely; configure
+the desired render-tail duration in the DAW.
 
 ## Audio-file buffers
 

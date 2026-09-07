@@ -279,6 +279,9 @@ void Editor::publishState(const bool force) {
     return;
   }
   const auto status = processor_.workerStatus();
+  const auto resetEventArguments =
+      status.engineGeneration != publishedEngineGeneration_;
+  publishedEngineGeneration_ = status.engineGeneration;
   publishedRevision_ = status.revision;
   publishedLogRevision_ = logRevision;
   publishedSlots_ = currentSlots;
@@ -287,7 +290,7 @@ void Editor::publishState(const bool force) {
   browser_->emitEventIfBrowserIsVisible(
       "ondaState",
       makeRunViewState(processor_, status, processor_.canExportProject(),
-                       actionError_));
+                       actionError_, resetEventArguments));
 }
 
 void Editor::publishScope() {

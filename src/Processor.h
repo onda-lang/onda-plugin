@@ -84,7 +84,7 @@ public:
   [[nodiscard]] bool acceptsMidi() const override { return true; }
   [[nodiscard]] bool producesMidi() const override { return false; }
   [[nodiscard]] bool isMidiEffect() const override { return false; }
-  [[nodiscard]] double getTailLengthSeconds() const override { return 0.0; }
+  [[nodiscard]] double getTailLengthSeconds() const override;
 
   [[nodiscard]] bool hasEditor() const override { return true; }
   juce::AudioProcessorEditor *createEditor() override;
@@ -108,7 +108,7 @@ public:
                      std::function<void(std::string)> completion);
   void bindBufferFile(std::string name, const juce::File &file);
   void clearBuffer(std::string_view name);
-  void unload();
+  void unload(bool notifyHost = true);
   void requestReload();
   void resetParametersToDefaults();
   void requestUserReset();
@@ -146,12 +146,15 @@ private:
   static juce::AudioProcessorValueTreeState::ParameterLayout parameters();
   void timerCallback() override;
   void acquireEngine() noexcept;
+  // Caller holds preparationMutex_; host audio is suspended or offline.
+  void synchronizeEngine();
+  void applySeedValues();
   void retireActive() noexcept;
   void drainRuntimeLogs();
   void observeMidiActivity(const juce::MidiMessage &message) noexcept;
   void clearMidiActivity() noexcept;
   [[nodiscard]] static std::optional<MidiEvent>
-  convertMidi(const juce::MidiMessageMetadata &metadata,
+  convertMidi(const juce::MidiMessage &message, int samplePosition,
               const PreparedEngine &engine, int minimumOffset,
               int frames) noexcept;
   void fallback(juce::AudioBuffer<float> &audio) noexcept;
@@ -175,6 +178,7 @@ private:
   juce::ThreadPool exportPool_{1};
   std::atomic<bool> exportPending_{};
   PreparedEngine *active_{};
+  std::uint64_t offlinePreparedGeneration_{};
   RuntimeLogSink runtimeLogSink_;
   ScopeCapture scopeCapture_;
   SpscQueue<UserEventCommand, 8U> userEvents_;
@@ -197,6 +201,7 @@ private:
   std::atomic<int> editorHeight_{720};
   std::atomic<ParamControlLayout> paramControlLayout_{
       ParamControlLayout::sliders};
+  std::mutex preparationMutex_;
   mutable std::mutex stateMutex_;
   std::filesystem::path lastBrowseDirectory_;
   std::vector<RuntimeLogRecord> runtimeLogRecords_;

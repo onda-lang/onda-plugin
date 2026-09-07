@@ -9,6 +9,11 @@ template <typename Item> class SpscSlot final {
   static_assert(std::is_pointer_v<Item>);
 
 public:
+  // Transfers ownership of an unconsumed item back to the producer.
+  [[nodiscard]] Item replace(Item item) noexcept {
+    return value_.exchange(item, std::memory_order_acq_rel);
+  }
+
   [[nodiscard]] bool tryPush(Item item) noexcept {
     Item expected{};
     return value_.compare_exchange_strong(

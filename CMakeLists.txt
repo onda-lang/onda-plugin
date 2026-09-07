@@ -540,7 +540,8 @@ if(BUILD_TESTING AND ONDA_PLUGIN_BUILD_TESTS)
         target_link_libraries(onda_processor_tests PRIVATE
             juce::pkgconfig_JUCE_BROWSER_LINUX_DEPS)
         target_link_options(onda_processor_tests PRIVATE
-            "-Wl,--wrap=pthread_mutex_lock")
+            "-Wl,--wrap=pthread_mutex_lock"
+            "-Wl,--wrap=malloc,--wrap=calloc,--wrap=realloc,--wrap=free")
         juce_link_with_embedded_linux_subprocess(onda_processor_tests)
     endif()
     if(MSVC)

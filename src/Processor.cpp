@@ -344,16 +344,40 @@ juce::AudioProcessorValueTreeState::ParameterLayout Processor::parameters() {
 
 void Processor::prepareToPlay(const double sampleRate,
                               const int maximumBlockSize) {
+  std::lock_guard preparationLock(preparationMutex_);
   const auto safeBlockSize = std::max(maximumBlockSize, 1);
+  const auto changed =
+      !sameSampleRate(sampleRate,
+                      expectedSampleRate_.load(std::memory_order_acquire)) ||
+      safeBlockSize != expectedBlockSize_.load(std::memory_order_acquire);
   expectedSampleRate_.store(sampleRate, std::memory_order_release);
   expectedBlockSize_.store(safeBlockSize, std::memory_order_release);
   for (auto &channel : dryScratch_)
     channel.resize(static_cast<std::size_t>(safeBlockSize));
-  deactivateRequested_.store(true, std::memory_order_release);
-  replacementSeedPending_.store(false, std::memory_order_release);
+  if (changed) {
+    deactivateRequested_.store(true, std::memory_order_release);
+    replacementSeedPending_.store(false, std::memory_order_release);
+  }
   clearMidiActivity();
   worker_->configure(sampleRate, safeBlockSize);
   configuredBlockSize_.store(safeBlockSize, std::memory_order_release);
+  synchronizeEngine();
+}
+
+void Processor::synchronizeEngine() {
+  // Called with audio suspended during host preparation, or from an offline
+  // callback. Neither path needs a message-loop tick to finish preparation.
+  offlinePreparedGeneration_ = worker_->waitForPreparation();
+  applySeedValues();
+  delete retirements_.tryPop();
+  acquireEngine();
+}
+
+double Processor::getTailLengthSeconds() const {
+  // Arbitrary Onda programs can sustain indefinitely. JUCE maps infinity to
+  // VST3's unknown/infinite tail; an unloaded plugin has no tail.
+  return worker_->hasPreparedEngine() ? std::numeric_limits<double>::infinity()
+                                      : 0.0;
 }
 
 void Processor::reset() {
@@ -390,12 +414,8 @@ void Processor::retireActive() noexcept {
 void Processor::acquireEngine() noexcept {
   if (deactivateRequested_.load(std::memory_order_acquire)) {
     retireActive();
-    if (active_ == nullptr && retirements_.empty() &&
-        !replacementSeedPending_.load(std::memory_order_acquire) &&
-        !replacements_.empty()) {
-      if (auto *stale = replacements_.tryPop())
-        static_cast<void>(retirements_.tryPush(stale));
-    }
+    // The worker owns superseded queued engines. Do not consume a replacement
+    // here: publication can race deactivation while its defaults are seeded.
     return;
   }
 
@@ -411,10 +431,8 @@ void Processor::acquireEngine() noexcept {
   }
   if (active_ != nullptr) {
     const auto retired = retirements_.tryPush(active_);
-    if (!retired) {
-      static_cast<void>(replacements_.tryPush(replacement));
-      return;
-    }
+    jassert(retired);
+    juce::ignoreUnused(retired);
   }
   static_cast<void>(runtimeLogSink_.beginEpoch());
   activeLogGeneration_.store(replacement->buildGeneration(),
@@ -428,10 +446,9 @@ void Processor::acquireEngine() noexcept {
 }
 
 std::optional<MidiEvent>
-Processor::convertMidi(const juce::MidiMessageMetadata &metadata,
-                       const PreparedEngine &engine, const int minimumOffset,
-                       const int frames) noexcept {
-  const auto &message = metadata.getMessage();
+Processor::convertMidi(const juce::MidiMessage &message,
+                       const int samplePosition, const PreparedEngine &engine,
+                       const int minimumOffset, const int frames) noexcept {
   MidiEvent event;
   if (message.isNoteOn())
     event.kind = MidiKind::noteOn;
@@ -487,8 +504,7 @@ Processor::convertMidi(const juce::MidiMessageMetadata &metadata,
     return std::nullopt;
   }
   event.sampleOffset = static_cast<std::uint32_t>(
-      std::clamp(metadata.samplePosition, minimumOffset, frames) -
-      minimumOffset);
+      std::clamp(samplePosition, minimumOffset, frames) - minimumOffset);
   return event;
 }
 
@@ -546,6 +562,17 @@ void Processor::processBlock(juce::AudioBuffer<float> &audio,
                              juce::MidiBuffer &midi) {
   juce::ScopedNoDenormals noDenormals;
   const auto frames = audio.getNumSamples();
+  if (isNonRealtime()) {
+    if (runtimeRecoveryRequested_.exchange(false, std::memory_order_acq_rel))
+      worker_->requestRebuild();
+    if (frames > expectedBlockSize_.load(std::memory_order_acquire))
+      prepareToPlay(expectedSampleRate_.load(std::memory_order_acquire),
+                    frames);
+    else if (offlinePreparedGeneration_ != worker_->requestGeneration()) {
+      std::lock_guard preparationLock(preparationMutex_);
+      synchronizeEngine();
+    }
+  }
   const auto maximum = expectedBlockSize_.load(std::memory_order_acquire);
   if (frames < 0 || frames > maximum || maximum <= 0) {
     fallback(audio);
@@ -639,8 +666,23 @@ void Processor::processBlock(juce::AudioBuffer<float> &audio,
   auto succeeded = true;
   auto position = 0;
   for (const auto metadata : midi) {
-    observeMidiActivity(metadata.getMessage());
-    auto event = convertMidi(metadata, *active_, position, frames);
+    // Only channel messages are supported. Reject SysEx/system messages before
+    // getMessage(), which allocates for packets exceeding JUCE's inline
+    // storage.
+    if (metadata.data == nullptr || metadata.numBytes < 2 ||
+        metadata.numBytes > 3)
+      continue;
+    const auto status = metadata.data[0];
+    if (status < 0x80 || status >= 0xf0)
+      continue;
+    const auto requiredBytes = (status & 0xe0) == 0xc0 ? 2 : 3;
+    if (metadata.numBytes != requiredBytes || metadata.data[1] >= 0x80 ||
+        (requiredBytes == 3 && metadata.data[2] >= 0x80))
+      continue;
+    const auto message = metadata.getMessage();
+    observeMidiActivity(message);
+    auto event = convertMidi(message, metadata.samplePosition, *active_,
+                             position, frames);
     if (!event)
       continue;
     const auto eventOffset = position + static_cast<int>(event->sampleOffset);
@@ -768,14 +810,14 @@ void Processor::clearBuffer(const std::string_view name) {
   worker_->clearBuffer(name);
 }
 
-void Processor::unload() {
+void Processor::unload(const bool notifyHost) {
   runtimeFaulted_.store(false, std::memory_order_release);
   runtimeRecoveryRequested_.store(false, std::memory_order_release);
   resetRequested_.store(false, std::memory_order_release);
   activeLogGeneration_.store(0U, std::memory_order_release);
   clearMidiActivity();
   clearRuntimeLog();
-  worker_->unload();
+  worker_->unload(notifyHost);
 }
 
 void Processor::requestReload() { worker_->requestRebuild(); }
@@ -1073,8 +1115,7 @@ void Processor::drainRuntimeLogs() {
   runtimeLogRevision_.fetch_add(1U, std::memory_order_release);
 }
 
-void Processor::timerCallback() {
-  drainRuntimeLogs();
+void Processor::applySeedValues() {
   if (auto seed = worker_->takeSeedValues()) {
     if (seed->revision == worker_->requestGeneration()) {
       for (std::size_t index = 0; index < seed->count; ++index)
@@ -1083,6 +1124,15 @@ void Processor::timerCallback() {
     }
     replacementSeedPending_.store(false, std::memory_order_release);
   }
+}
+
+void Processor::timerCallback() {
+  drainRuntimeLogs();
+  std::unique_lock preparationLock(preparationMutex_, std::try_to_lock);
+  if (!preparationLock.owns_lock())
+    return;
+  applySeedValues();
+  const auto notifyProjectChange = worker_->takeProjectStateChange();
   const auto expected = expectedBlockSize_.load(std::memory_order_acquire);
   if (expected > 0 &&
       expected != configuredBlockSize_.load(std::memory_order_acquire)) {
@@ -1094,6 +1144,11 @@ void Processor::timerCallback() {
   }
   if (runtimeRecoveryRequested_.exchange(false, std::memory_order_acq_rel))
     worker_->requestRebuild();
+  preparationLock.unlock();
+  if (notifyProjectChange) {
+    updateHostDisplay(juce::AudioProcessorListener::ChangeDetails{}
+                          .withNonParameterStateChanged(true));
+  }
 }
 
 void Processor::getStateInformation(juce::MemoryBlock &destination) {
@@ -1170,21 +1225,16 @@ void Processor::setStateInformation(const void *data, const int byteCount) {
     const auto layout = stream.readBool() ? ParamControlLayout::knobs
                                           : ParamControlLayout::sliders;
 
+    std::lock_guard preparationLock(preparationMutex_);
     deactivateRequested_.store(true, std::memory_order_release);
     replacementSeedPending_.store(false, std::memory_order_release);
     for (std::size_t index = 0; index < slotCount; ++index)
       setSlotValue(index, restored[index]);
     if (path->isEmpty() && !projectImage.valid()) {
-      unload();
+      unload(false);
     } else {
-      if (projectImage.valid()) {
-        worker_->restore(pathFromJuce(*path), std::move(projectImage),
-                         std::move(bufferBindings));
-      } else {
-        worker_->loadWithBufferBindings(
-            pathFromJuce(*path), std::move(bufferBindings), false,
-            Worker::ExistingEnginePolicy::deactivateImmediately);
-      }
+      worker_->restore(pathFromJuce(*path), std::move(projectImage),
+                       std::move(bufferBindings));
     }
     editorWidth_.store(std::clamp(width, 360, 1600), std::memory_order_relaxed);
     editorHeight_.store(std::clamp(height, 480, 1400),

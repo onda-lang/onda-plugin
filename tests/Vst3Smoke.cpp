@@ -1,3 +1,5 @@
+#include "TemporaryDirectory.h"
+
 #include <juce_audio_processors_headless/juce_audio_processors_headless.h>
 
 #include <array>
@@ -57,6 +59,64 @@ struct ProductExpectation {
                                  juce::String(expected.controllerCid) + "\""),
                juce::String(expected.name) +
                    " controller CID changed unexpectedly");
+}
+
+// JUCE's host stores the component's opaque bytes in a VST3PluginState
+// envelope. Supply a linked Onda state to exercise the actual exported module,
+// including setupProcessing, host preparation, and VST3's infinite-tail
+// conversion.
+[[nodiscard]] bool smokeLoadedProgram(juce::AudioPluginInstance &instance) {
+  const auto source =
+      juce::File{(testTemporaryRoot() / "hosted.onda").string()};
+  if (!source.replaceWithText(
+          "outs { out1 }\n"
+          "event note_on(id: i32, channel: i32, key: i32, velocity: f32) {}\n"
+          "event note_off(id: i32, channel: i32, key: i32, velocity: f32) {}\n"
+          "sample { out1 = 0.25 }\n"))
+    return false;
+  juce::MemoryBlock componentState;
+  {
+    juce::MemoryOutputStream stream(componentState, false);
+    stream.writeInt(0x41444e4f);
+    stream.writeInt(3);
+    stream.writeString(source.getFullPathName());
+    stream.writeString({});
+    stream.writeInt(0);
+    stream.writeInt64(0);
+    for (int slot = 0; slot < 32; ++slot)
+      stream.writeFloat(0.5F);
+    stream.writeInt(480);
+    stream.writeInt(720);
+    stream.writeBool(false);
+  }
+  juce::XmlElement state("VST3PluginState");
+  state.createNewChildElement("IComponent")
+      ->addTextElement(componentState.toBase64Encoding());
+  juce::MemoryBlock hostState;
+  juce::AudioProcessor::copyXmlToBinary(state, hostState);
+  instance.setNonRealtime(true);
+  instance.setStateInformation(hostState.getData(),
+                               static_cast<int>(hostState.getSize()));
+  const auto channels =
+      juce::jmax(ONDA_PLUGIN_INPUT_CHANNELS, ONDA_PLUGIN_OUTPUT_CHANNELS);
+  for (int activation = 0; activation < 2; ++activation) {
+    instance.prepareToPlay(48'000.0, 64);
+    if (!check(std::isinf(instance.getTailLengthSeconds()),
+               instance.getName() + " did not advertise VST3's infinite tail"))
+      return false;
+    juce::AudioBuffer<float> audio(channels, 64);
+    audio.clear();
+    juce::MidiBuffer midi;
+    instance.processBlock(audio, midi);
+    for (int frame = 0; frame < 64; ++frame) {
+      if (!check(std::abs(audio.getSample(0, frame) - 0.25F) < 1.0e-6F,
+                 instance.getName() +
+                     " rendered fallback after host preparation"))
+        return false;
+    }
+    instance.releaseResources();
+  }
+  return true;
 }
 
 [[nodiscard]] bool smokeProduct(juce::VST3PluginFormatHeadless &format,
@@ -211,6 +271,7 @@ struct ProductExpectation {
                 " produced an unsafe fallback with two concurrent instances");
   instance->releaseResources();
   secondInstance->releaseResources();
+  succeeded &= smokeLoadedProgram(*instance);
 
   return succeeded;
 }

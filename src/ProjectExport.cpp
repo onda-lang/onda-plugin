@@ -118,6 +118,7 @@ exportProject(const ProjectImage &projectImage,
         std::ofstream stream(output, std::ios::binary | std::ios::trunc);
         stream.write(reinterpret_cast<const char *>(file.bytes.data()),
                      static_cast<std::streamsize>(file.bytes.size()));
+        stream.close();
         if (!stream) {
           exportError = "Could not write an exported project file";
           return false;

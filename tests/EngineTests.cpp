@@ -12,6 +12,7 @@
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
+#include <csignal>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -20,6 +21,10 @@
 #include <mutex>
 #include <string_view>
 #include <thread>
+
+#if defined(__linux__)
+#include <sys/resource.h>
+#endif
 
 namespace {
 
@@ -330,6 +335,63 @@ void observeRetirement(onda::plugin::PreparedEngine *) noexcept {
   retirementAuditWake.notify_one();
 }
 
+bool exerciseExportWriteFailure(const onda::plugin::ProjectImage &image) {
+#if defined(__linux__)
+  struct FileSizeLimit {
+    rlimit previous{};
+    using SignalHandler = void (*)(int);
+    SignalHandler previousSignal{SIG_ERR};
+    bool changed{};
+
+    FileSizeLimit() {
+      if (getrlimit(RLIMIT_FSIZE, &previous) != 0)
+        return;
+      previousSignal = std::signal(SIGXFSZ, SIG_IGN);
+      if (previousSignal == SIG_ERR)
+        return;
+      auto limit = previous;
+      limit.rlim_cur = 1;
+      changed = setrlimit(RLIMIT_FSIZE, &limit) == 0;
+    }
+    ~FileSizeLimit() {
+      if (changed)
+        static_cast<void>(setrlimit(RLIMIT_FSIZE, &previous));
+      if (previousSignal != SIG_ERR)
+        std::signal(SIGXFSZ, previousSignal);
+    }
+  };
+  for (const auto existing : {false, true}) {
+    const auto destination =
+        testTemporaryRoot() / (existing ? "limited-empty" : "limited-new");
+    if (existing)
+      std::filesystem::create_directory(destination);
+    FileSizeLimit limit;
+    if (!limit.changed) {
+      std::cerr << "could not establish the export failure test limit\n";
+      return false;
+    }
+    const auto result = onda::plugin::exportProject(image, destination);
+    if (result || result.error.empty() ||
+        std::filesystem::exists(destination) != existing ||
+        (existing && !std::filesystem::is_empty(destination))) {
+      std::cerr << "failed buffered writes published a corrupt export\n";
+      return false;
+    }
+  }
+  for (const auto &entry :
+       std::filesystem::directory_iterator(testTemporaryRoot())) {
+    if (entry.path().filename().string().find(".onda-staging-") !=
+        std::string::npos) {
+      std::cerr << "failed export left a staging directory\n";
+      return false;
+    }
+  }
+#else
+  static_cast<void>(image);
+#endif
+  return true;
+}
+
 } // namespace
 
 int main() {
@@ -352,6 +414,8 @@ int main() {
     std::cerr << "build failed: " << built.diagnostic.message << '\n';
     return 1;
   }
+  if (!exerciseExportWriteFailure(built.projectImage))
+    return 1;
   for (std::size_t index = 0;
        index < static_cast<std::size_t>(onda::plugin::MidiKind::count);
        ++index) {
@@ -1002,7 +1066,7 @@ sample { out1 = in1; out2 = in2 }
       source.path(), onda::plugin::Product::effect, 48'000.0, 8);
   if (!handoffBlocker.engine ||
       !replacements.tryPush(handoffBlocker.engine.release())) {
-    std::cerr << "could not occupy the replacement handoff for backpressure "
+    std::cerr << "could not occupy the replacement handoff for supersession "
                  "coverage\n";
     return 1;
   }
@@ -1013,20 +1077,14 @@ sample { out1 = in1; out2 = in2 }
     worker.configure(48'000.0, 8);
     worker.load(source.path(), true);
 
-    bool observedBackpressure = false;
-    for (int attempt = 0; attempt < 500; ++attempt) {
-      if (worker.status().message ==
-          "Realtime replacement handoff is busy; retrying") {
-        observedBackpressure = true;
-        break;
-      }
-      std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    }
-    if (!observedBackpressure) {
-      std::cerr << "worker did not report replacement backpressure\n";
+    // The worker must replace and destroy an unconsumed engine itself; a
+    // suspended host cannot drain the slot to unblock host preparation.
+    const auto preparedGeneration = worker.waitForPreparation();
+    if (preparedGeneration != worker.requestGeneration() ||
+        !worker.status().active) {
+      std::cerr << "worker did not replace an unconsumed handoff\n";
       return 1;
     }
-    delete replacements.tryPop();
 
     workerEngine = waitForReplacement(replacements);
     const auto seed = worker.takeSeedValues();

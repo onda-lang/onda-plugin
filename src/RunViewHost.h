@@ -17,7 +17,8 @@ runViewResource(const juce::String &request);
 [[nodiscard]] juce::var makeRunViewState(Processor &processor,
                                          const WorkerStatus &status,
                                          bool canExportProject,
-                                         const std::string &actionError);
+                                         const std::string &actionError,
+                                         bool resetEventArguments = false);
 
 [[nodiscard]] juce::var makeRunViewScope(Processor &processor);
 

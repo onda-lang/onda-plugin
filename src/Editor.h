@@ -33,6 +33,7 @@ private:
   juce::Label loadingOverlay_;
   std::unique_ptr<juce::FileChooser> fileChooser_;
   std::uint64_t publishedRevision_{};
+  std::uint64_t publishedEngineGeneration_{};
   std::uint64_t publishedLogRevision_{};
   std::uint64_t publishedMidiRevision_{};
   std::array<float, 32U> publishedSlots_{};
