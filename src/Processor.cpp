@@ -199,6 +199,11 @@ captureHostContext(const juce::AudioPlayHead::PositionInfo &position,
                    const bool realtime, const PreparedEngine &engine) noexcept {
   HostContext context;
   context.realtime = realtime;
+  if (engine.handlesHostContext(HostContextKind::samplePosition) ||
+      engine.handlesHostContext(HostContextKind::timePosition) ||
+      engine.handlesHostContext(HostContextKind::musicalPosition)) {
+    context.timelinePlaying = position.getIsPlaying();
+  }
   if (engine.handlesHostContext(HostContextKind::transport)) {
     context.transport = HostContext::Transport{
         .playing = position.getIsPlaying(),
@@ -565,9 +570,11 @@ void Processor::processBlock(juce::AudioBuffer<float> &audio,
   if (isNonRealtime()) {
     if (runtimeRecoveryRequested_.exchange(false, std::memory_order_acq_rel))
       worker_->requestRebuild();
-    if (frames > expectedBlockSize_.load(std::memory_order_acquire))
+    const auto required =
+        std::max(frames, expectedBlockSize_.load(std::memory_order_acquire));
+    if (required != configuredBlockSize_.load(std::memory_order_acquire))
       prepareToPlay(expectedSampleRate_.load(std::memory_order_acquire),
-                    frames);
+                    required);
     else if (offlinePreparedGeneration_ != worker_->requestGeneration()) {
       std::lock_guard preparationLock(preparationMutex_);
       synchronizeEngine();
@@ -745,24 +752,32 @@ void Processor::loadFile(const juce::File &file, const bool seedDefaults) {
 }
 
 bool Processor::canExportProject() const {
-  const auto project = worker_->persistedProjectState();
-  return project.projectImage.valid();
+  return worker_->projectExportSnapshot().has_value();
 }
 
 std::string Processor::saveProjectAs(const juce::File &directory) {
-  const auto project = worker_->persistedProjectState();
-  if (!project.projectImage.valid())
-    return "There is no compiled Onda project to save";
+  return saveProjectSnapshot(
+      worker_->projectExportSnapshot().value_or(ProjectExportSnapshot{}),
+      directory);
+}
+
+std::string
+Processor::saveProjectSnapshot(const ProjectExportSnapshot &snapshot,
+                               const juce::File &directory) {
+  if (!snapshot.projectImage.valid())
+    return "The current Onda project is not ready to export";
   try {
-    auto exported = exportProject(project.projectImage,
+    auto exported = exportProject(snapshot.projectImage,
                                   pathFromJuce(directory.getFullPathName()));
     if (!exported)
       return exported.error;
+    if (!worker_->relinkExport(snapshot, exported.projectFile))
+      return "Project exported, but not loaded because the current project "
+             "changed";
     {
       std::lock_guard lock(stateMutex_);
       lastBrowseDirectory_ = exported.projectFile.parent_path();
     }
-    worker_->loadWithBufferBindings(exported.projectFile, {}, false);
     return {};
   } catch (const std::bad_alloc &) {
     return "Insufficient memory to export the Onda project";
@@ -777,8 +792,11 @@ bool Processor::saveProjectAsAsync(
   if (exportPending_.exchange(true, std::memory_order_acq_rel))
     return false;
   try {
-    exportPool_.addJob([this, directory, completion = std::move(completion)] {
-      auto result = saveProjectAs(directory);
+    const auto snapshot =
+        worker_->projectExportSnapshot().value_or(ProjectExportSnapshot{});
+    exportPool_.addJob([this, snapshot, directory,
+                        completion = std::move(completion)] {
+      auto result = saveProjectSnapshot(snapshot, directory);
       exportPending_.store(false, std::memory_order_release);
       if (completion) {
         juce::MessageManager::callAsync(
@@ -1042,6 +1060,10 @@ void Processor::drainRuntimeLogs() {
   const auto generation = activeLogGeneration_.load(std::memory_order_acquire);
   const auto epoch = runtimeLogSink_.epoch();
   const auto countersStable = counterEpoch == epoch;
+  std::lock_guard lock(stateMutex_);
+  if (activeLogGeneration_.load(std::memory_order_acquire) != generation ||
+      runtimeLogSink_.epoch() != epoch)
+    return;
   const auto counters =
       countersStable
           ? counterDifference(counterTotals, consumedLogEpoch_ == epoch
@@ -1061,52 +1083,44 @@ void Processor::drainRuntimeLogs() {
   if (!generationChanged && !hasRecords && !hasCounters)
     return;
 
-  {
-    std::lock_guard lock(stateMutex_);
-    const auto currentGeneration =
-        activeLogGeneration_.load(std::memory_order_acquire) == generation;
-    const auto currentEpoch = runtimeLogSink_.epoch() == epoch;
-    if (!currentGeneration || !currentEpoch)
-      return;
-    if (generationChanged) {
-      runtimeLogRecords_.clear();
-      runtimeLogBytes_ = 0U;
-      runtimeLogCounters_ = {};
-      runtimeLogRevealed_ = false;
-      consumedLogGeneration_ = generation;
+  if (generationChanged) {
+    runtimeLogRecords_.clear();
+    runtimeLogBytes_ = 0U;
+    runtimeLogCounters_ = {};
+    runtimeLogRevealed_ = false;
+    consumedLogGeneration_ = generation;
+  }
+  if (generation != 0U) {
+    for (auto &record : records) {
+      runtimeLogBytes_ += runtimeLogPayloadBytes(record.record);
+      runtimeLogRecords_.push_back(std::move(record.record));
     }
-    if (generation != 0U) {
-      for (auto &record : records) {
-        runtimeLogBytes_ += runtimeLogPayloadBytes(record.record);
-        runtimeLogRecords_.push_back(std::move(record.record));
-      }
-      auto discarded = std::size_t{};
-      while (
-          discarded < runtimeLogRecords_.size() &&
-          (runtimeLogRecords_.size() - discarded > maximumRuntimeLogEntries ||
-           runtimeLogBytes_ > maximumRuntimeLogBytes)) {
-        const auto &record = runtimeLogRecords_[discarded];
-        runtimeLogBytes_ -= runtimeLogPayloadBytes(record);
-        auto &dropCounter = record.kind == RuntimeLogKind::print
-                                ? runtimeLogCounters_.printTransportDrops
-                                : runtimeLogCounters_.delegateTransportDrops;
-        addSaturated(dropCounter, 1U);
-        ++discarded;
-      }
-      if (discarded != 0U) {
-        runtimeLogRecords_.erase(runtimeLogRecords_.begin(),
-                                 runtimeLogRecords_.begin() +
-                                     static_cast<std::ptrdiff_t>(discarded));
-      }
-      addSaturated(runtimeLogCounters_.printOverflow, counters.printOverflow);
-      addSaturated(runtimeLogCounters_.printTransportDrops,
-                   counters.printTransportDrops);
-      addSaturated(runtimeLogCounters_.delegateOverflow,
-                   counters.delegateOverflow);
-      addSaturated(runtimeLogCounters_.delegateTransportDrops,
-                   counters.delegateTransportDrops);
-      runtimeLogRevealed_ = runtimeLogRevealed_ || hasRecords || hasCounters;
+    auto discarded = std::size_t{};
+    while (
+        discarded < runtimeLogRecords_.size() &&
+        (runtimeLogRecords_.size() - discarded > maximumRuntimeLogEntries ||
+         runtimeLogBytes_ > maximumRuntimeLogBytes)) {
+      const auto &record = runtimeLogRecords_[discarded];
+      runtimeLogBytes_ -= runtimeLogPayloadBytes(record);
+      auto &dropCounter = record.kind == RuntimeLogKind::print
+                              ? runtimeLogCounters_.printTransportDrops
+                              : runtimeLogCounters_.delegateTransportDrops;
+      addSaturated(dropCounter, 1U);
+      ++discarded;
     }
+    if (discarded != 0U) {
+      runtimeLogRecords_.erase(runtimeLogRecords_.begin(),
+                               runtimeLogRecords_.begin() +
+                                   static_cast<std::ptrdiff_t>(discarded));
+    }
+    addSaturated(runtimeLogCounters_.printOverflow, counters.printOverflow);
+    addSaturated(runtimeLogCounters_.printTransportDrops,
+                 counters.printTransportDrops);
+    addSaturated(runtimeLogCounters_.delegateOverflow,
+                 counters.delegateOverflow);
+    addSaturated(runtimeLogCounters_.delegateTransportDrops,
+                 counters.delegateTransportDrops);
+    runtimeLogRevealed_ = runtimeLogRevealed_ || hasRecords || hasCounters;
   }
   if (countersStable) {
     consumedLogEpoch_ = epoch;

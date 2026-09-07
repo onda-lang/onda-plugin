@@ -58,9 +58,11 @@ callback does not request JUCE playhead position data at all. A declared
 `musical_position` also reads tempo when available because tempo is required to
 project PPQ to an interior logical-block boundary.
 
-Sample and second positions are projected from the host callback start to the
-logical block boundary. Quarter-note position is projected at an interior
-boundary only when the same snapshot also supplies tempo. Bar position and
+While transport is playing, sample and second positions are projected from the
+host callback start to the logical block boundary. Quarter-note position is
+projected at an interior boundary only when the same snapshot also supplies
+tempo. Stopped timeline positions remain unchanged, including when the program
+does not declare a `transport` event. Bar position and
 loop points use the host-provided values. Host context is not stored in plugin
 state and cannot be used to control the DAW.
 
@@ -100,6 +102,8 @@ the loader accepts Onda's canonical `.ondabuffer` container.
 The decoded channel count must match a mono or fixed-channel Onda buffer;
 dynamic-channel buffers accept the file's channel count. Samples are not
 resampled: the file's original sample rate is supplied to Onda with the buffer.
+Audio-file bindings must be read-only: programs that may write a bound buffer
+are rejected during preparation because Onda project assets are immutable.
 The worker watches both source and bound audio files, so an edited audio file
 prepares a new engine while the current one keeps running.
 
@@ -109,6 +113,7 @@ assets for deterministic DAW restore. Moving a linked audio file therefore
 falls back to the saved project image. Clearing a binding restores an available
 `.ondaproject` default; otherwise the current engine remains inactive until
 every declared buffer is bound.
+The source link and remaining bindings are saved even in this incomplete state.
 
 Runtime output retained for the editor is bounded to 1,024 records and 256 KiB
 of text and source metadata. Older records are discarded first and included in

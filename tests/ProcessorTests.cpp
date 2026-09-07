@@ -31,6 +31,9 @@
 #if defined(__linux__)
 #include <pthread.h>
 #endif
+#if defined(_MSC_VER)
+#include <malloc.h>
+#endif
 
 namespace allocation_audit {
 thread_local bool enabled{};
@@ -39,6 +42,28 @@ std::atomic<std::uint64_t> count{};
 void record() noexcept {
   if (enabled)
     count.fetch_add(1, std::memory_order_relaxed);
+}
+
+void *allocateAligned(const std::size_t size, const std::size_t alignment) {
+  const auto requested = std::max(size, std::size_t{1});
+#if defined(_MSC_VER)
+  return _aligned_malloc(requested, alignment);
+#else
+  if (requested > std::numeric_limits<std::size_t>::max() - (alignment - 1U))
+    return nullptr;
+  const auto padded = ((requested + alignment - 1U) / alignment) * alignment;
+  return std::aligned_alloc(alignment, padded);
+#endif
+}
+
+void freeAligned(void *memory) noexcept {
+#if defined(_MSC_VER)
+  if (memory != nullptr)
+    record();
+  _aligned_free(memory);
+#else
+  std::free(memory);
+#endif
 }
 } // namespace allocation_audit
 
@@ -113,10 +138,8 @@ void *operator new[](const std::size_t size) { return ::operator new(size); }
 
 void *operator new(const std::size_t size, const std::align_val_t alignment) {
   allocation_audit::record();
-  const auto align = static_cast<std::size_t>(alignment);
-  const auto requested = std::max(size, std::size_t{1});
-  const auto padded = ((requested + align - 1U) / align) * align;
-  if (auto *memory = std::aligned_alloc(align, padded))
+  if (auto *memory = allocation_audit::allocateAligned(
+          size, static_cast<std::size_t>(alignment)))
     return memory;
   throw std::bad_alloc{};
 }
@@ -159,16 +182,16 @@ void operator delete[](void *memory, std::size_t) noexcept {
   std::free(memory);
 }
 void operator delete(void *memory, std::align_val_t) noexcept {
-  std::free(memory);
+  allocation_audit::freeAligned(memory);
 }
 void operator delete[](void *memory, std::align_val_t) noexcept {
-  std::free(memory);
+  allocation_audit::freeAligned(memory);
 }
 void operator delete(void *memory, std::size_t, std::align_val_t) noexcept {
-  std::free(memory);
+  allocation_audit::freeAligned(memory);
 }
 void operator delete[](void *memory, std::size_t, std::align_val_t) noexcept {
-  std::free(memory);
+  allocation_audit::freeAligned(memory);
 }
 void operator delete(void *memory, const std::nothrow_t &) noexcept {
   std::free(memory);
@@ -178,11 +201,11 @@ void operator delete[](void *memory, const std::nothrow_t &) noexcept {
 }
 void operator delete(void *memory, std::align_val_t,
                      const std::nothrow_t &) noexcept {
-  std::free(memory);
+  allocation_audit::freeAligned(memory);
 }
 void operator delete[](void *memory, std::align_val_t,
                        const std::nothrow_t &) noexcept {
-  std::free(memory);
+  allocation_audit::freeAligned(memory);
 }
 
 namespace {
@@ -1510,7 +1533,21 @@ bool exerciseEditorLifecycle() {
     std::cerr << "editor did not cover the initializing web view\n";
     return false;
   }
+#if JUCE_WINDOWS
+  editor->addToDesktop(0);
+#endif
   editor->setVisible(true);
+#if JUCE_WINDOWS
+  for (int attempt = 0; attempt < 1000 && loadingOverlay->isVisible();
+       ++attempt)
+    juce::MessageManager::getInstance()->runDispatchLoopUntil(10);
+  if (loadingOverlay->isVisible()) {
+    std::cerr << "Windows editor did not complete its WebView2 handshake: "
+              << loadingOverlay->getText() << '\n';
+    processor.editorBeingDeleted(editor.get());
+    return false;
+  }
+#endif
   juce::MessageManager::getInstance()->runDispatchLoopUntil(100);
   editor->setSize(777, 888);
   processor.setParamControlLayout(onda::plugin::ParamControlLayout::knobs);
@@ -1553,6 +1590,57 @@ bool exerciseEditorLifecycle() {
   }
 
   processor.releaseResources();
+  return true;
+}
+
+bool exerciseClearedBufferStateRestore() {
+  TemporarySource source;
+  TemporaryAudioFile clip{"cleared-clip"};
+  TemporaryAudioFile retained{"retained-clip"};
+  if (!source.write(R"(
+buffers { clip: buffer<f32[2]>, retained: buffer<f32[2]> }
+outs { out1, out2 }
+sample { out1 = clip[0, 0] + retained[1, 0]; out2 = clip[0, 0] + retained[1, 0] }
+)") || !clip.write(0.125F, 0.25F) ||
+      !retained.write(0.125F, 0.25F))
+    return false;
+
+  using namespace onda::plugin;
+  Processor processor(Product::effect);
+  processor.loadFile(juce::File(source.path().string()), false);
+  processor.bindBufferFile("clip", juce::File(clip.path().string()));
+  processor.bindBufferFile("retained", juce::File(retained.path().string()));
+  processor.prepareToPlay(48'000.0, 8);
+  if (!waitForOutput(processor, 0.375F, 8))
+    return false;
+  processor.clearBuffer("clip");
+  for (const bool waitForBuild : {false, true}) {
+    if (waitForBuild)
+      processor.prepareToPlay(48'000.0, 8);
+    juce::MemoryBlock saved;
+    processor.getStateInformation(saved);
+    Processor restored(Product::effect);
+    restored.setStateInformation(saved.getData(),
+                                 static_cast<int>(saved.getSize()));
+    restored.prepareToPlay(48'000.0, 8);
+    const auto status = restored.workerStatus();
+    const auto kept =
+        std::ranges::find(status.buffers, "retained", &BufferMapping::name);
+    const auto cleared =
+        std::ranges::find(status.buffers, "clip", &BufferMapping::name);
+    if (status.path != source.path() || status.active ||
+        restored.canExportProject() || kept == status.buffers.end() ||
+        kept->loadedPath != retained.path() ||
+        cleared == status.buffers.end() || !cleared->loadedPath.empty()) {
+      std::cerr
+          << "cleared-buffer state lost its source or remaining binding\n";
+      return false;
+    }
+    restored.bindBufferFile("clip", juce::File(clip.path().string()));
+    restored.prepareToPlay(48'000.0, 8);
+    if (!waitForOutput(restored, 0.375F, 8))
+      return false;
+  }
   return true;
 }
 
@@ -2194,6 +2282,7 @@ bool exerciseHostContext() {
   }
 
   juce::AudioPlayHead::PositionInfo secondPosition;
+  secondPosition.setIsPlaying(true);
   secondPosition.setTimeInSamples(100);
   secondPosition.setTimeInSeconds(2.0);
   secondPosition.setPpqPosition(8.0);
@@ -2211,7 +2300,7 @@ bool exerciseHostContext() {
   }
   const auto projectedExpected =
       0.102F + static_cast<float>((2.0 + 2.0 / 48'000.0) / 100.0) + 0.12F +
-      0.004F + 0.003F + 0.0034F + 0.0018F + 0.25F + 64.0F / 127.0F;
+      0.004F + 0.003F + 0.0034F + 0.0018F + 0.01F + 0.25F + 64.0F / 127.0F;
   for (int frame = 0; frame < secondAudio.getNumSamples(); ++frame) {
     const auto expected = frame < 2 ? firstExpected : projectedExpected;
     const auto expectedSample = frame < 2 ? 0.1F : 0.102F;
@@ -2220,6 +2309,68 @@ bool exerciseHostContext() {
       std::cerr << "host context projection, availability, render mode, or "
                    "MIDI ordering failed\n";
       return false;
+    }
+  }
+  return true;
+}
+
+bool exerciseTimelineProjection() {
+  struct PositionEvent {
+    const char *declaration;
+    double value;
+    double perFrame;
+  };
+  const std::array events{
+      PositionEvent{"event sample_position(sample: i64) { held = f64(sample) }",
+                    100.0, 1.0},
+      PositionEvent{"event time_position(seconds: f64) { held = seconds }",
+                    2.0, 1.0 / 48'000.0},
+      PositionEvent{"event musical_position(quarter_note: f64) { held = quarter_note }",
+                    4.0, 2.0 / 48'000.0},
+  };
+  for (const auto &event : events) {
+    for (const auto playing : {false, true}) {
+      for (const auto declaresTransport : {false, true}) {
+        TemporarySource source;
+        auto text = std::string{"outs { out1, out2 }\ninit { held = f64(0) }\n"} +
+                    event.declaration +
+                    "\nsample { out1 = f32(held); out2 = f32(held) }\n";
+        if (declaresTransport)
+          text += "event transport(playing: bool, recording: bool, looping: bool) {}\n";
+        if (!source.write(text))
+          return false;
+
+        TestPlayHead playHead;
+        juce::AudioPlayHead::PositionInfo position;
+        position.setIsPlaying(playing);
+        position.setTimeInSamples(100);
+        position.setTimeInSeconds(2.0);
+        position.setPpqPosition(4.0);
+        // A stopped timeline needs no tempo to retain its exact PPQ.
+        if (playing)
+          position.setBpm(120.0);
+        playHead.setPosition(position);
+        onda::plugin::Processor processor(onda::plugin::Product::effect);
+        processor.setPlayHead(&playHead);
+        processor.loadFile(juce::File(source.path().string()), false);
+        processor.prepareToPlay(48'000.0, 8);
+        if (!processor.workerStatus().active)
+          return false;
+        juce::AudioBuffer<float> audio(2, 6);
+        juce::MidiBuffer midi;
+        for (int callback = 0; callback < 2; ++callback) {
+          processor.processBlock(audio, midi);
+          for (int frame = 0; frame < 6; ++frame) {
+            const auto offset = callback == 1 && frame >= 2 && playing ? 2.0 : 0.0;
+            const auto expected = static_cast<float>(event.value + offset * event.perFrame);
+            if (std::abs(audio.getSample(0, frame) - expected) > 1.0e-6F) {
+              std::cerr << "timeline projection ignored playback state: "
+                        << event.declaration << '\n';
+              return false;
+            }
+          }
+        }
+      }
     }
   }
   return true;
@@ -2352,6 +2503,16 @@ bool exerciseSupersededHandoff() {
         std::cerr << "superseded replacement displaced the running interface\n";
         return false;
       }
+      juce::MemoryBlock saved;
+      processor.getStateInformation(saved);
+      onda::plugin::Processor restored(onda::plugin::Product::effect);
+      restored.setStateInformation(saved.getData(),
+                                   static_cast<int>(saved.getSize()));
+      restored.prepareToPlay(48'000.0, 64);
+      if (!waitForProjectImageOutput(restored, 0.25F)) {
+        std::cerr << "superseded replacement displaced the running checkpoint\n";
+        return false;
+      }
       return true;
     }
     juce::MessageManager::getInstance()->runDispatchLoopUntil(10);
@@ -2422,6 +2583,16 @@ bool exerciseHostPreparation() {
     restored.setNonRealtime(true);
     if (!rendersImmediately(restored, 128, 0.25F) ||
         !rendersImmediately(restored, 256, 0.25F))
+      return false;
+    // A realtime callback can raise the required bound before the timer has
+    // configured it. Offline rendering must finish that deferred work itself.
+    restored.setNonRealtime(false);
+    if (!rendersImmediately(restored, 512,
+                            product == Product::effect ? 1.0F : 0.0F))
+      return false;
+    restored.setNonRealtime(true);
+    if (!rendersImmediately(restored, 128, 0.25F) ||
+        !rendersImmediately(restored, 512, 0.25F))
       return false;
     source.remove();
     restored.setStateInformation(state.getData(),
@@ -2542,6 +2713,43 @@ bool exerciseProjectDirtyNotifications() {
   return listener.nonParameterChanges > changes;
 }
 
+bool exerciseConcurrentStateRestoreAndLogDrain() {
+  onda::plugin::Processor processor(onda::plugin::Product::effect);
+  std::array<float, onda::plugin::slotCount> values{};
+  const auto state = makeState({}, {}, values, 480, 720);
+  std::atomic<bool> done{};
+  std::thread host([&] {
+    for (int iteration = 0; iteration < 300; ++iteration) {
+      processor.setStateInformation(state.getData(),
+                                     static_cast<int>(state.getSize()));
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    done.store(true, std::memory_order_release);
+  });
+  while (!done.load(std::memory_order_acquire))
+    juce::MessageManager::getInstance()->runDispatchLoopUntil(10);
+  host.join();
+  juce::MessageManager::getInstance()->runDispatchLoopUntil(100);
+  const auto log = processor.runtimeLogSnapshot();
+  return log.records.empty() && log.counters.printOverflow == 0 &&
+         log.counters.printTransportDrops == 0 &&
+         log.counters.delegateOverflow == 0 &&
+         log.counters.delegateTransportDrops == 0;
+}
+
+bool exerciseAlignedAllocation() {
+  constexpr auto alignment = std::align_val_t{64};
+  auto *scalar = ::operator new(17, alignment);
+  auto *array = ::operator new[](129, alignment, std::nothrow);
+  const auto aligned = [](const void *pointer) {
+    return pointer != nullptr && reinterpret_cast<std::uintptr_t>(pointer) % 64U == 0;
+  };
+  const auto valid = aligned(scalar) && aligned(array);
+  ::operator delete(scalar, alignment);
+  ::operator delete[](array, alignment, std::nothrow);
+  return valid;
+}
+
 bool exerciseConcurrentInstances() {
   TemporarySource effectSource;
   TemporarySource instrumentSource;
@@ -2600,17 +2808,21 @@ int main() {
   std::signal(SIGPIPE, SIG_IGN);
 #endif
   juce::ScopedJuceInitialiser_GUI juceInitialiser;
-  if (!exerciseHostPreparation() || !exerciseAutomaticEventReplacement() ||
+  if (!exerciseAlignedAllocation() || !exerciseHostPreparation() ||
+      !exerciseConcurrentStateRestoreAndLogDrain() ||
+      !exerciseAutomaticEventReplacement() ||
       !exerciseProjectDirtyNotifications() || !exerciseRunViewAdapter() ||
       !exerciseScopeCapture() || !exerciseUserEvents() ||
       !exerciseRuntimeLogging() || !exercise(onda::plugin::Product::effect) ||
       !exercise(onda::plugin::Product::instrument) || !exerciseStateRestore() ||
       !exerciseEditorLifecycle() || !exerciseAudioFileBuffers() ||
       !exerciseProjectBufferOverrideRestore() ||
+      !exerciseClearedBufferStateRestore() ||
       !exerciseSourceGraphFallbackAndDiskAuthority() ||
       !exerciseProjectExportRelinksAuthority() || !exerciseExtendedMidi() ||
       !exerciseMidiKeyboardMonitor() || !exerciseEventMetadataGating() ||
-      !exerciseHostContext() || !exerciseExplicitReset() ||
+      !exerciseHostContext() || !exerciseTimelineProjection() ||
+      !exerciseExplicitReset() ||
       !exerciseSupersededHandoff() || !exerciseConcurrentInstances()) {
     return 1;
   }

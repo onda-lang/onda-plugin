@@ -1,8 +1,8 @@
 #pragma once
 
-#include <array>
 #include <atomic>
 #include <cstddef>
+#include <memory>
 
 namespace onda::plugin {
 
@@ -36,7 +36,7 @@ private:
     return value + 1U == storageSize ? 0U : value + 1U;
   }
 
-  std::array<Item, storageSize> items_{};
+  std::unique_ptr<Item[]> items_{std::make_unique<Item[]>(storageSize)};
   std::atomic<std::size_t> write_{};
   std::atomic<std::size_t> read_{};
 };

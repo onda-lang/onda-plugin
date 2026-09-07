@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <memory>
 #include <string>
 #include <utility>
 #include <vector>
@@ -211,7 +212,9 @@ private:
                                          : delegateTransportDrops_;
   }
 
-  std::array<RuntimeLogEntry, runtimeLogQueueCapacity> entries_{};
+  // Allocate once at construction; callback access never resizes the queue.
+  std::unique_ptr<RuntimeLogEntry[]> entries_{
+      std::make_unique<RuntimeLogEntry[]>(runtimeLogQueueCapacity)};
   std::atomic<std::size_t> read_{};
   std::atomic<std::size_t> write_{};
   std::atomic<std::uint64_t> epoch_{1U};

@@ -392,6 +392,59 @@ bool exerciseExportWriteFailure(const onda::plugin::ProjectImage &image) {
   return true;
 }
 
+bool exerciseExportRelinkConflicts(const onda::plugin::ProjectImage &image,
+                                   const std::filesystem::path &source) {
+  using namespace onda::plugin;
+  const auto exported =
+      exportProject(image, testTemporaryRoot() / "relink-conflicts");
+  if (!exported)
+    return false;
+  for (const auto action :
+       {"unload", "load", "restore", "bind", "clear", "reload", "configure"}) {
+    SpscSlot<PreparedEngine *> replacements;
+    SpscSlot<PreparedEngine *> retirements;
+    std::atomic<bool> deactivate{}, seedPending{};
+    bool succeeded = false;
+    {
+      Worker worker(Product::effect, replacements, retirements, deactivate,
+                    seedPending);
+      worker.configure(48'000.0, 8);
+      worker.restore(source, image, {});
+      static_cast<void>(worker.waitForPreparation());
+      const auto snapshot = worker.projectExportSnapshot();
+      if (!snapshot)
+        return false;
+      const std::string_view operation(action);
+      if (operation == "unload")
+        worker.unload();
+      else if (operation == "load")
+        worker.load(testTemporaryRoot() / "new-selection.onda", false);
+      else if (operation == "restore")
+        worker.restore({}, image, {});
+      else if (operation == "bind")
+        worker.bindBufferFile("clip", testTemporaryRoot() / "new-audio.wav");
+      else if (operation == "clear")
+        worker.clearBuffer("clip");
+      else if (operation == "reload")
+        worker.requestRebuild();
+      else
+        worker.configure(44'100.0, 16);
+      const auto expectedPath = worker.status().path;
+      succeeded = !worker.relinkExport(*snapshot, exported.projectFile) &&
+                  worker.status().path == expectedPath;
+      if (operation == "load" && worker.projectExportSnapshot())
+        succeeded = false;
+    }
+    delete replacements.tryPop();
+    delete retirements.tryPop();
+    if (!succeeded) {
+      std::cerr << "export replaced a newer " << action << " request\n";
+      return false;
+    }
+  }
+  return true;
+}
+
 } // namespace
 
 int main() {
@@ -414,7 +467,8 @@ int main() {
     std::cerr << "build failed: " << built.diagnostic.message << '\n';
     return 1;
   }
-  if (!exerciseExportWriteFailure(built.projectImage))
+  if (!exerciseExportWriteFailure(built.projectImage) ||
+      !exerciseExportRelinkConflicts(built.projectImage, source.path()))
     return 1;
   for (std::size_t index = 0;
        index < static_cast<std::size_t>(onda::plugin::MidiKind::count);
@@ -1034,6 +1088,27 @@ sample { out1 = in1; out2 = in2 }
   std::filesystem::remove_all(assetExportRoot);
   buffered.engine.reset();
 
+  for (const auto writer : {
+           "sample { clip[0, 0] = 0.5; out1 = clip[0, 0] }",
+           "init { clip[0, 0] = 0.5 }\nsample { out1 = clip[0, 0] }",
+           "event overwrite() { clip[0, 0] = 0.5 }\n"
+           "sample { out1 = clip[0, 0] }"}) {
+    source.writeText(std::string{"buffers { clip: buffer<f32[2]> }\n"
+                                 "outs { out1 }\n"} + writer);
+    const auto writable = onda::plugin::PreparedEngine::build(
+        source.path(), onda::plugin::Product::effect, 48'000.0, 8,
+        bufferBindings);
+    if (writable.engine || writable.projectImage.valid() ||
+        writable.diagnostic.message.find("must be read-only") ==
+            std::string::npos ||
+        std::ranges::find(writable.watchPaths, audioFile.path()) ==
+            writable.watchPaths.end()) {
+      std::cerr << "writable audio-file binding was not rejected: "
+                << writable.diagnostic.message << '\n';
+      return 1;
+    }
+  }
+
   source.writeText(
       "buffers { clip: buffer<f32> }\nouts { out1 }\nsample { out1 = 0.0 }\n");
   const auto wrongChannels = onda::plugin::PreparedEngine::build(
@@ -1381,6 +1456,76 @@ sample { out1 = in1; out2 = in2 }
     }
     std::error_code ignored;
     std::filesystem::remove(invalidPath, ignored);
+  }
+
+  // Claim B while A is still reported as active, then finish adoption while
+  // C is compiling. A failure must recover B's checkpoint and interface even
+  // though C's initial status update observed A.
+  source.writeConstantEffect("0.25");
+  {
+    using namespace onda::plugin;
+    SpscSlot<PreparedEngine *> publications;
+    SpscSlot<PreparedEngine *> retired;
+    std::atomic<bool> deactivate{}, seedPending{};
+    std::mutex gateMutex;
+    std::condition_variable gateWake;
+    bool blockBuild{}, entered{}, release{};
+    Worker worker(
+        Product::effect, publications, retired, deactivate, seedPending,
+        [&](const auto &path, const auto product, const auto rate,
+            const auto blockSize, const auto bindings) {
+          {
+            std::unique_lock lock(gateMutex);
+            if (blockBuild) {
+              entered = true;
+              gateWake.notify_one();
+              gateWake.wait(lock, [&] { return release; });
+            }
+          }
+          return PreparedEngine::build(path, product, rate, blockSize, bindings);
+        });
+    worker.configure(48'000.0, 8);
+    worker.load(source.path(), false);
+    static_cast<void>(worker.waitForPreparation());
+    std::unique_ptr<PreparedEngine> first{publications.tryPop()};
+    if (!first)
+      return 1;
+    worker.setActiveGeneration(first->buildGeneration());
+    source.writeConstantEffect("0.75");
+    worker.load(source.path(), false);
+    static_cast<void>(worker.waitForPreparation());
+    std::unique_ptr<PreparedEngine> second{publications.tryPop()};
+    if (!second)
+      return 1;
+    const auto secondProject = worker.persistedProjectState();
+    {
+      std::lock_guard lock(gateMutex);
+      blockBuild = true;
+    }
+    source.writeInvalid();
+    worker.load(source.path(), false);
+    bool started{};
+    {
+      std::unique_lock lock(gateMutex);
+      started = gateWake.wait_for(lock, std::chrono::seconds(5),
+                                  [&] { return entered; });
+      worker.setActiveGeneration(second->buildGeneration());
+      first.reset();
+      release = true;
+    }
+    gateWake.notify_one();
+    if (!started)
+      return 1;
+    static_cast<void>(worker.waitForPreparation());
+    const auto retained = worker.persistedProjectState();
+    auto restored = PreparedEngine::build(retained.projectImage,
+                                          Product::effect, 48'000.0, 8);
+    if (worker.status().engineGeneration != second->buildGeneration() ||
+        retained.projectImage != secondProject.projectImage ||
+        !restored.engine || !produces(*restored.engine, 0.75F)) {
+      std::cerr << "late adoption lost its interface or checkpoint\n";
+      return 1;
+    }
   }
 
   source.writeConstantEffect("0.5");

@@ -149,6 +149,9 @@ private:
   // Caller holds preparationMutex_; host audio is suspended or offline.
   void synchronizeEngine();
   void applySeedValues();
+  [[nodiscard]] std::string
+  saveProjectSnapshot(const ProjectExportSnapshot &snapshot,
+                      const juce::File &directory);
   void retireActive() noexcept;
   void drainRuntimeLogs();
   void observeMidiActivity(const juce::MidiMessage &message) noexcept;

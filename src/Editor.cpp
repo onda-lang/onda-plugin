@@ -181,13 +181,28 @@ bool hasBuffer(const WorkerStatus &status, const std::string_view name) {
       [name](const BufferMapping &buffer) { return buffer.name == name; });
 }
 
+juce::WebBrowserComponent::Options browserOptions() {
+  juce::WebBrowserComponent::Options options;
+#if JUCE_WINDOWS
+  const auto dataFolder =
+      juce::File::getSpecialLocation(juce::File::userApplicationDataDirectory)
+          .getChildFile("Onda/VST3/WebView2");
+  options =
+      options.withBackend(juce::WebBrowserComponent::Options::Backend::webview2)
+          .withWinWebView2Options(
+              juce::WebBrowserComponent::Options::WinWebView2{}
+                  .withUserDataFolder(dataFolder));
+#endif
+  return options;
+}
+
 } // namespace
 
 class Editor::Browser final : public juce::WebBrowserComponent {
 public:
   explicit Browser(Editor &owner)
       : WebBrowserComponent(
-            Options{}
+            browserOptions()
                 .withNativeIntegrationEnabled()
                 .withKeepPageLoadedWhenBrowserIsHidden()
                 .withUserScript(juceHostBridgeScript)
@@ -197,13 +212,39 @@ public:
                                    })
                 .withResourceProvider([](const juce::String &path) {
                   return runViewResource(path);
-                })) {}
+                })),
+        owner_(owner) {}
+
+  [[nodiscard]] juce::String initializationError() const {
+#if JUCE_WINDOWS
+    const auto options = browserOptions();
+    if (const auto result = options.getWinWebView2BackendOptions()
+                                .getUserDataFolder()
+                                .createDirectory();
+        result.failed())
+      return "Could not create the Onda browser data folder: " +
+             result.getErrorMessage();
+    if (!areOptionsSupported(options))
+      return "The Onda editor requires Microsoft Edge WebView2 Runtime";
+#endif
+    return {};
+  }
 
   bool pageAboutToLoad(const juce::String &url) override {
     return url.startsWith(getResourceProviderRoot());
   }
 
   void newWindowAttemptingToLoad(const juce::String &) override {}
+
+  bool pageLoadHadNetworkError(const juce::String &error) override {
+    owner_.loadingOverlay_.setText("Could not load the Onda editor: " + error,
+                                   juce::dontSendNotification);
+    owner_.loadingOverlay_.setVisible(true);
+    return false;
+  }
+
+private:
+  Editor &owner_;
 };
 
 Editor::Editor(Processor &owner)
@@ -223,7 +264,10 @@ Editor::Editor(Processor &owner)
   setSize(width, height);
   setResizeLimits(360, 480, 1600, 1400);
   processor_.setScopeCaptureEnabled(true);
-  browser_->goToURL(juce::WebBrowserComponent::getResourceProviderRoot());
+  if (const auto error = browser_->initializationError(); error.isNotEmpty())
+    loadingOverlay_.setText(error, juce::dontSendNotification);
+  else
+    browser_->goToURL(juce::WebBrowserComponent::getResourceProviderRoot());
   startTimerHz(20);
 }
 

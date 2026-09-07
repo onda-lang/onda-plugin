@@ -147,28 +147,32 @@ bool Worker::takeProjectStateChange() {
   return std::exchange(projectStateChanged_, false);
 }
 
+void Worker::loadLocked(std::filesystem::path path, const bool seedDefaults,
+                        const ExistingEnginePolicy policy) {
+  desired_.path = std::move(path);
+  desired_.fallbackProjectImage = {};
+  desired_.seedDefaults = seedDefaults;
+  desired_.notifyProjectChange = true;
+  advanceGeneration();
+  forceRebuild_ = true;
+  status_.path = desired_.path;
+  status_.message = "Waiting to compile";
+  status_.compiling = false;
+  status_.usingProjectImage = false;
+  if (policy == ExistingEnginePolicy::deactivateImmediately) {
+    publishProjectState({}, true);
+    clearPublishedInterface();
+    deactivateRequested_.store(true, std::memory_order_release);
+    replacementSeedPending_.store(false, std::memory_order_release);
+  }
+  ++status_.revision;
+}
+
 void Worker::load(std::filesystem::path path, const bool seedDefaults,
                   const ExistingEnginePolicy policy) {
   {
     std::lock_guard lock(mutex_);
-    desired_.path = std::move(path);
-    desired_.fallbackProjectImage = {};
-    desired_.seedDefaults = seedDefaults;
-    desired_.notifyProjectChange = true;
-    advanceGeneration();
-    forceRebuild_ = true;
-    status_.path = desired_.path;
-    status_.message = "Waiting to compile";
-    status_.compiling = false;
-    status_.usingProjectImage = false;
-    if (policy == ExistingEnginePolicy::deactivateImmediately) {
-      publishProjectState({}, true);
-      seedValues_.reset();
-      clearPublishedInterface();
-      deactivateRequested_.store(true, std::memory_order_release);
-      replacementSeedPending_.store(false, std::memory_order_release);
-    }
-    ++status_.revision;
+    loadLocked(std::move(path), seedDefaults, policy);
   }
   wake_.notify_one();
 }
@@ -179,27 +183,37 @@ void Worker::loadWithBufferBindings(
   normalizeBindings(bufferBindings);
   {
     std::lock_guard lock(mutex_);
-    desired_.path = std::move(path);
     desired_.bufferBindings = std::move(bufferBindings);
-    desired_.fallbackProjectImage = {};
-    desired_.seedDefaults = seedDefaults;
-    desired_.notifyProjectChange = true;
-    advanceGeneration();
-    forceRebuild_ = true;
-    status_.path = desired_.path;
-    status_.message = "Waiting to compile";
-    status_.compiling = false;
-    status_.usingProjectImage = false;
-    if (policy == ExistingEnginePolicy::deactivateImmediately) {
-      publishProjectState({}, true);
-      seedValues_.reset();
-      clearPublishedInterface();
-      deactivateRequested_.store(true, std::memory_order_release);
-      replacementSeedPending_.store(false, std::memory_order_release);
-    }
-    ++status_.revision;
+    loadLocked(std::move(path), seedDefaults, policy);
   }
   wake_.notify_one();
+}
+
+std::optional<ProjectExportSnapshot> Worker::projectExportSnapshot() const {
+  std::lock_guard lock(mutex_);
+  // Do not export an older published project over a pending user selection.
+  if (!publishedProjectState_.projectImage.valid() ||
+      desired_.path != publishedProjectState_.path ||
+      desired_.bufferBindings != publishedProjectState_.bufferBindings ||
+      desired_.fallbackProjectImage != publishedProjectState_.projectImage)
+    return std::nullopt;
+  return ProjectExportSnapshot{publishedProjectState_.projectImage,
+                               desired_.generation};
+}
+
+bool Worker::relinkExport(const ProjectExportSnapshot &snapshot,
+                          std::filesystem::path path) {
+  {
+    std::lock_guard lock(mutex_);
+    if (stopping_ || snapshot.generation != desired_.generation ||
+        snapshot.projectImage != publishedProjectState_.projectImage)
+      return false;
+    desired_.bufferBindings.clear();
+    loadLocked(std::move(path), false,
+               ExistingEnginePolicy::retainUntilSuccess);
+  }
+  wake_.notify_one();
+  return true;
 }
 
 void Worker::restore(std::filesystem::path path, ProjectImage projectImage,
@@ -319,7 +333,10 @@ void Worker::clearBuffer(const std::string_view name) {
     status_.message = "Waiting for buffer binding";
     status_.compiling = false;
     deactivateStatus();
-    publishProjectState({}, true);
+    publishProjectState({.path = desired_.path,
+                         .bufferBindings = desired_.bufferBindings,
+                         .projectImage = {}},
+                        true);
     for (auto &buffer : status_.buffers) {
       if (buffer.name == name) {
         buffer.loadedPath.clear();
@@ -410,36 +427,45 @@ void Worker::destroy(PreparedEngine *const engine) noexcept {
 
 void Worker::collectRetired() noexcept { destroy(retirements_.tryPop()); }
 
+std::shared_ptr<const EnginePublication> Worker::activePublication() const {
+  if (deactivateRequested_.load(std::memory_order_acquire))
+    return {};
+  const auto generation = activeGeneration_.load(std::memory_order_acquire);
+  if (generation != 0) {
+    for (const auto &entry : publications_) {
+      auto publication = entry.lock();
+      if (publication && publication->status.engineGeneration == generation)
+        return publication;
+    }
+  }
+  return {};
+}
+
 bool Worker::updateStatus(const Request &request, std::string message,
-                          const bool compiling, const bool active,
-                          std::optional<std::vector<ParameterMapping>> mappings,
-                          std::optional<std::vector<BufferMapping>> buffers,
-                          std::optional<std::vector<EventMapping>> events) {
+                          const bool compiling,
+                          std::vector<BufferMapping> buffers) {
   std::lock_guard lock(mutex_);
   if (!matchesDesiredLocked(request)) {
     return false;
   }
+  const auto retained = activePublication();
+  if (retained) {
+    status_.engineGeneration = retained->status.engineGeneration;
+    status_.mappings = retained->status.mappings;
+    status_.buffers = retained->status.buffers;
+    status_.events = retained->status.events;
+    status_.midi = retained->status.midi;
+    status_.usingProjectImage = retained->status.usingProjectImage;
+    publishProjectState(retained->project, desired_.notifyProjectChange);
+    status_.active = true;
+    hasPreparedEngine_.store(true, std::memory_order_release);
+  } else {
+    clearPublishedInterface();
+    status_.buffers = std::move(buffers);
+  }
   status_.path = desired_.path;
   status_.message = std::move(message);
   status_.compiling = compiling;
-  if (active)
-    status_.active = true;
-  else
-    deactivateStatus();
-  if (mappings)
-    status_.mappings = std::move(*mappings);
-  else if (!active)
-    status_.mappings.clear();
-  if (buffers)
-    status_.buffers = std::move(*buffers);
-  else if (!active)
-    status_.buffers.clear();
-  if (events)
-    status_.events = std::move(*events);
-  else if (!active)
-    status_.events.clear();
-  if (!active)
-    status_.midi = {};
   ++status_.revision;
   return true;
 }
@@ -528,24 +554,9 @@ void Worker::build(const Request &request) {
     std::lock_guard lock(mutex_);
     if (!matchesDesiredLocked(request))
       return;
-    const auto active = activeGeneration_.load(std::memory_order_acquire);
-    hadActiveEngine =
-        active != 0 && !deactivateRequested_.load(std::memory_order_acquire);
-    // Publication precedes adoption. Keep the interface of the engine that
-    // actually runs, so a superseded queued replacement cannot become fallback.
-    if (hadActiveEngine) {
-      if (status_.engineGeneration == active)
-        retainedStatus_ = status_;
-      if (retainedStatus_.engineGeneration == active) {
-        status_.engineGeneration = active;
-        status_.mappings = retainedStatus_.mappings;
-        status_.buffers = retainedStatus_.buffers;
-        status_.events = retainedStatus_.events;
-        status_.midi = retainedStatus_.midi;
-      }
-    }
+    hadActiveEngine = activePublication() != nullptr;
   }
-  if (!updateStatus(request, "Compiling", true, hadActiveEngine))
+  if (!updateStatus(request, "Compiling", true))
     return;
 
   auto prePaths = watchedPaths_;
@@ -600,7 +611,7 @@ void Worker::build(const Request &request) {
     }
     static_cast<void>(
         updateStatus(request, "Sources changed during compilation; retrying",
-                     false, hadActiveEngine));
+                     false));
     wake_.notify_one();
     return;
   }
@@ -613,8 +624,7 @@ void Worker::build(const Request &request) {
       request.fallbackProjectImage.valid() && !buildFunction_) {
     attemptedProjectImage = true;
     static_cast<void>(updateStatus(
-        request, "Linked project failed; restoring saved project image", true,
-        hadActiveEngine));
+        request, "Linked project failed; restoring saved project image", true));
     try {
       std::lock_guard compileLock(compileMutex);
       result = PreparedEngine::build(request.fallbackProjectImage, product_,
@@ -639,10 +649,8 @@ void Worker::build(const Request &request) {
     auto message = diagnosticMessage(result.diagnostic);
     if (attemptedProjectImage)
       message = diskFailure + "; saved project image also failed: " + message;
-    static_cast<void>(updateStatus(
-        request, std::move(message), false, hadActiveEngine, std::nullopt,
-        hadActiveEngine ? std::nullopt
-                        : std::make_optional(std::move(result.buffers))));
+    static_cast<void>(updateStatus(request, std::move(message), false,
+                                   std::move(result.buffers)));
     finishRequest(request.generation);
     return;
   }
@@ -683,15 +691,6 @@ void Worker::build(const Request &request) {
             static_cast<float>(mappings[index].defaultNormalized);
     }
 
-    result.engine->buildGeneration_ = request.generation;
-    destroy(replacements_.replace(result.engine.release()));
-
-    if (seed) {
-      seedValues_ = std::move(seed);
-      desired_.seedDefaults = false;
-    } else {
-      deactivateRequested_.store(false, std::memory_order_release);
-    }
     publishProjectState(
         {
             .path = desired_.path,
@@ -713,6 +712,19 @@ void Worker::build(const Request &request) {
     status_.buffers = std::move(buffers);
     status_.events = std::move(events);
     status_.midi = midi;
+    result.engine->buildGeneration_ = request.generation;
+    result.engine->publication_ = std::make_shared<const EnginePublication>(
+        EnginePublication{status_, publishedProjectState_});
+    std::erase_if(publications_, [](const auto &entry) { return entry.expired(); });
+    publications_.push_back(result.engine->publication_);
+    destroy(replacements_.replace(result.engine.release()));
+
+    if (seed) {
+      seedValues_ = std::move(seed);
+      desired_.seedDefaults = false;
+    } else {
+      deactivateRequested_.store(false, std::memory_order_release);
+    }
     ++status_.revision;
     completedGeneration_ = request.generation;
   }

@@ -993,6 +993,15 @@ PreparedEngine::build(CompileResult compiled, const Product product,
     }
 
     result.watchPaths.push_back(binding->path);
+    if (onda_buffer_may_write(compiled.program.get(), index) != 0) {
+      if (bufferError.empty()) {
+        bufferError = "Buffer '" + mapping.name +
+                      "' is writable; audio-file bindings must be read-only "
+                      "so the project can be saved and restored";
+      }
+      bufferMappings.push_back(std::move(mapping));
+      continue;
+    }
     if (onda_buffer_elem_type(compiled.program.get(), index) !=
         ONDA_PRIMITIVE_F32) {
       if (bufferError.empty()) {
@@ -1288,6 +1297,7 @@ bool PreparedEngine::dispatch(const MidiEvent &event) noexcept {
 
 bool PreparedEngine::dispatchHostContext(
     const HostContext &hostContext, const int hostCallbackOffset) noexcept {
+  const auto positionOffset = hostContext.timelinePlaying ? hostCallbackOffset : 0;
   const auto binding = [this](const HostContextKind event) -> const auto & {
     return hostContextEvents_[static_cast<std::size_t>(event)];
   };
@@ -1302,11 +1312,11 @@ bool PreparedEngine::dispatchHostContext(
   if (handlesHostContext(HostContextKind::samplePosition) &&
       hostContext.samplePosition) {
     const auto sample = *hostContext.samplePosition;
-    if (hostCallbackOffset <= 0 ||
+    if (positionOffset <= 0 ||
         sample <=
-            std::numeric_limits<std::int64_t>::max() - hostCallbackOffset) {
+            std::numeric_limits<std::int64_t>::max() - positionOffset) {
       const auto projected =
-          sample + static_cast<std::int64_t>(std::max(hostCallbackOffset, 0));
+          sample + static_cast<std::int64_t>(std::max(positionOffset, 0));
       if (!trigger(binding(HostContextKind::samplePosition), projected)) {
         return false;
       }
@@ -1314,13 +1324,13 @@ bool PreparedEngine::dispatchHostContext(
   }
 
   const auto needsSecondsOffset =
-      hostCallbackOffset != 0 &&
+      positionOffset != 0 &&
       ((handlesHostContext(HostContextKind::timePosition) &&
         hostContext.timePosition.has_value()) ||
        (handlesHostContext(HostContextKind::musicalPosition) &&
         hostContext.musicalPosition.has_value()));
   const auto secondsOffset =
-      needsSecondsOffset ? static_cast<double>(hostCallbackOffset) / sampleRate_
+      needsSecondsOffset ? static_cast<double>(positionOffset) / sampleRate_
                          : 0.0;
   if (handlesHostContext(HostContextKind::timePosition) &&
       hostContext.timePosition) {
@@ -1340,7 +1350,7 @@ bool PreparedEngine::dispatchHostContext(
   if (handlesHostContext(HostContextKind::musicalPosition) &&
       hostContext.musicalPosition) {
     auto projected = *hostContext.musicalPosition;
-    if (hostCallbackOffset != 0) {
+    if (positionOffset != 0) {
       if (!hostContext.tempo || !std::isfinite(*hostContext.tempo) ||
           *hostContext.tempo <= 0.0) {
         projected = std::numeric_limits<double>::quiet_NaN();

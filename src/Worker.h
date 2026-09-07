@@ -50,6 +50,16 @@ struct PersistedProjectState {
   ProjectImage projectImage;
 };
 
+struct EnginePublication {
+  WorkerStatus status;
+  PersistedProjectState project;
+};
+
+struct ProjectExportSnapshot {
+  ProjectImage projectImage;
+  std::uint64_t generation{};
+};
+
 class Worker final {
 public:
   enum class ExistingEnginePolicy : std::uint8_t {
@@ -103,6 +113,10 @@ public:
   [[nodiscard]] std::uint64_t statusRevision() const;
   [[nodiscard]] std::optional<SeedValues> takeSeedValues();
   [[nodiscard]] PersistedProjectState persistedProjectState() const;
+  [[nodiscard]] std::optional<ProjectExportSnapshot>
+  projectExportSnapshot() const;
+  [[nodiscard]] bool relinkExport(const ProjectExportSnapshot &snapshot,
+                                  std::filesystem::path path);
   [[nodiscard]] bool takeProjectStateChange();
   [[nodiscard]] bool hasPreparedEngine() const noexcept {
     return hasPreparedEngine_.load(std::memory_order_acquire);
@@ -136,6 +150,9 @@ private:
   void run() noexcept;
   void build(const Request &request);
   void advanceGeneration() noexcept;
+  // Caller holds mutex_; preserves the current desired buffer bindings.
+  void loadLocked(std::filesystem::path path, bool seedDefaults,
+                  ExistingEnginePolicy policy);
   void finishRequest(std::uint64_t generation);
   void publishProjectState(PersistedProjectState state, bool notifyHost);
   void deactivateStatus() noexcept;
@@ -143,11 +160,13 @@ private:
   void reportFailure(const char *message) noexcept;
   void collectRetired() noexcept;
   void destroy(PreparedEngine *engine) noexcept;
+  // Caller holds mutex_. Engine ownership keeps the snapshot alive even while
+  // adoption races a newer publication; expired entries are pruned on publish.
+  [[nodiscard]] std::shared_ptr<const EnginePublication>
+  activePublication() const;
   [[nodiscard]] bool updateStatus(
-      const Request &request, std::string message, bool compiling, bool active,
-      std::optional<std::vector<ParameterMapping>> mappings = std::nullopt,
-      std::optional<std::vector<BufferMapping>> buffers = std::nullopt,
-      std::optional<std::vector<EventMapping>> events = std::nullopt);
+      const Request &request, std::string message, bool compiling,
+      std::vector<BufferMapping> buffers = {});
   [[nodiscard]] bool matchesDesiredLocked(const Request &request) const;
   [[nodiscard]] bool stillCurrent(const Request &request) const;
   [[nodiscard]] static std::vector<FileStamp>
@@ -177,7 +196,7 @@ private:
   std::condition_variable prepared_;
   Request desired_;
   WorkerStatus status_;
-  WorkerStatus retainedStatus_;
+  std::vector<std::weak_ptr<const EnginePublication>> publications_;
   std::optional<SeedValues> seedValues_;
   PersistedProjectState publishedProjectState_;
   bool stopping_{};

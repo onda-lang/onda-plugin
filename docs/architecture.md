@@ -28,7 +28,7 @@ Construction validates:
 - audio flattens to no more than the compile-time plug-in input and output
   channel counts and every channel is `f32`;
 - every buffer has either an Onda-owned immutable project default or an explicit
-  `f32` audio-file binding with a compatible channel count;
+  read-only `f32` audio-file binding with a compatible channel count;
 - canonical MIDI and host-context payload names, order, scalar shapes, and
   types match;
 - instruments declare exact `note_on` and `note_off` events.
@@ -47,6 +47,9 @@ workspace, and owns source and asset decoding. Buffer names and absolute
 override paths remain in plugin state for live disk loading; the image carries
 canonical typed assets for filesystem-free fallback. A disk restore either
 prepares every source and buffer or compiles the complete image.
+Clearing a required binding invalidates the complete image but retains the
+source link and remaining binding paths in saved state, even while preparation
+is incomplete.
 
 Project export is derived only from that coherent image. Onda owns portable
 path mapping, syntax-aware directive rewriting, manifest construction, and
@@ -55,12 +58,17 @@ sibling staging directory, renames it into place, and links the exported
 `.ondaproject` manifest. It does not parse or reproduce the manifest's entry and
 buffer semantics, and it never partially overwrites a project. Every output stream is explicitly
 closed and checked before its staging directory can be published.
+An export captures its image and request generation before background work
+begins. The worker checks both under its mutex before relinking; a newer user
+request leaves the exported files intact without changing the current project.
 
 `RunViewHost` owns embedded-resource routing and projection of processor state
 into the shared view's host-message schema. `Editor` owns only the native
 browser lifetime, periodic publication, and command routing. Processor tests
 exercise the editor lifecycle through JUCE's real browser component; resource
 bytes and capability state are tested directly through `RunViewHost`.
+Windows explicitly uses WebView2 with a writable per-user data folder, and its
+editor lifecycle test requires the native browser's ready handshake.
 
 The view lists user-defined events but omits the canonical `plugin_midi` and
 `plugin_host` families, which the host drives. Scalar, fixed-array, and slice
@@ -71,6 +79,11 @@ crossing an engine replacement. Automatic filesystem reloads advance this
 generation as well as explicit requests. The worker atomically replaces and
 destroys an unconsumed queued engine, so a suspended host cannot cause repeated
 compilation or prevent preparation from completing.
+Each published engine owns an immutable snapshot of its interface and project
+checkpoint. The worker keeps weak references to these snapshots and selects
+the audio thread's active generation when retaining a previous engine after a
+failed reload. This preserves the matching checkpoint even if adoption overlaps
+another build. Snapshot copying and destruction stay off the audio thread.
 
 Ordinary view updates send event defaults as metadata without overwriting the
 arguments edited in the browser. A new engine generation initializes the
@@ -106,6 +119,9 @@ unconditionally when declared. Prevalidated event-presence metadata gates captur
 dispatch: undeclared MIDI does not split processing, undeclared context fields
 do not perform projection or payload work, and an engine without position
 events does not query the JUCE playhead.
+Position projection also captures whether the timeline is playing, independently
+of whether a transport event is declared. Stopped sample, time, and musical
+positions remain unchanged at interior logical-block boundaries.
 
 Host preparation waits on the worker's completion condition before returning
 and adopts the specialization without needing a GUI timer tick. An unchanged
@@ -113,6 +129,8 @@ configuration retains its eligible engine. Offline callbacks also synchronize
 when state is restored after preparation or the host changes block bounds.
 The preparation mutex serializes these non-realtime paths with timer-driven
 parameter seeding and scratch resizing; realtime callbacks never acquire it.
+Offline processing also reconciles block bounds raised by a previous oversized
+realtime callback before waiting for the specialization.
 Synchronous preparation may reclaim a queued retirement directly; ordinary
 realtime retirement remains the worker's responsibility.
 

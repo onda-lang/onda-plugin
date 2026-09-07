@@ -76,6 +76,7 @@ struct HostContext {
   std::optional<double> barPosition;
   std::optional<TimeSignature> timeSignature;
   std::optional<LoopRegion> loopRegion;
+  bool timelinePlaying{};
   bool realtime{true};
 };
 
@@ -137,6 +138,7 @@ struct BufferMapping {
 };
 
 struct BuildResult;
+struct EnginePublication;
 
 class PreparedEngine final {
 public:
@@ -264,6 +266,9 @@ private:
 
   Product product_{};
   std::uint64_t buildGeneration_{};
+  // Worker metadata lives until this engine is retired. Audio never accesses
+  // or copies it; destruction happens on the worker or during host preparation.
+  std::shared_ptr<const EnginePublication> publication_;
   double sampleRate_{};
   int blockSize_{};
   ProgramHandle program_;
