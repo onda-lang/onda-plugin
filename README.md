@@ -5,6 +5,30 @@ Release builds expose 2 audio inputs and 2 audio outputs. `OndaSynth` clears
 its outputs while inactive; `OndaFX` passes through corresponding input
 channels and clears any additional outputs.
 
+## Examples
+
+[`examples`](examples) contains tested, plug-in-ready instruments and effects
+that exercise MIDI, host tempo, polyphony, dynamics, nonlinear processing, and
+modulated delay. Load instrument patches in `OndaSynth` and effects in `OndaFX`
+through the embedded run view. The complete collection is included in every
+release archive.
+
+The embedded run view also shows a live scope of the plug-in output while its
+editor is open. Programs declaring canonical note events also get a read-only
+MIDI keyboard: host note-on/off messages illuminate its keys, while MIDI device
+selection and note input remain owned by the DAW. Editor dimensions and the
+Sliders/Knobs choice are retained when the view is reopened and saved in the DAW
+project. Event argument edits survive parameter automation and log updates;
+loading a new program or explicitly resetting the arguments restores defaults.
+
+Host preparation finishes the requested specialization before playback begins.
+Restores and rebuilds initialize ordinary and pinned state from a snapshot of
+the current host parameters. Selecting a new patch uses its declared defaults.
+Offline rendering also waits for state restored after preparation, without
+requiring the editor or its message loop. Loaded programs report an infinite
+tail to the host because arbitrary Onda DSP can sustain indefinitely; configure
+the desired render-tail duration in the DAW.
+
 ## DSP events
 
 The plugin recognizes this canonical MIDI surface:
@@ -66,29 +90,6 @@ does not declare a `transport` event. Bar position and
 loop points use the host-provided values. Host context is not stored in plugin
 state and cannot be used to control the DAW.
 
-## Examples
-
-[`examples`](examples) contains tested, plug-in-ready instruments and effects
-that exercise MIDI, host tempo, polyphony, dynamics, nonlinear processing, and
-modulated delay. Load instrument patches in `OndaSynth` and effects in `OndaFX`
-through the embedded run view. The complete collection is included in every
-release archive.
-
-The embedded run view also shows a live scope of the plug-in output while its
-editor is open. Programs declaring canonical note events also get a read-only
-MIDI keyboard: host note-on/off messages illuminate its keys, while MIDI device
-selection and note input remain owned by the DAW. Editor dimensions and the
-Sliders/Knobs choice are retained when the view is reopened and saved in the DAW
-project. Event argument edits survive parameter automation and log updates;
-loading a new program or explicitly resetting the arguments restores defaults.
-
-Host preparation finishes the requested specialization before playback begins.
-Restores and rebuilds initialize ordinary and pinned state from a snapshot of
-the current host parameters. Selecting a new patch uses its declared defaults.
-Offline rendering also waits for state restored after preparation, without
-requiring the editor or its message loop. Loaded programs report an infinite
-tail to the host because arbitrary Onda DSP can sustain indefinitely; configure
-the desired render-tail duration in the DAW.
 
 ## Audio-file buffers
 
