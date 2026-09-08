@@ -95,6 +95,17 @@ public:
       ++nonParameterChanges;
   }
 
+  bool waitForChangeSince(const int previous) const {
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (nonParameterChanges <= previous &&
+           std::chrono::steady_clock::now() < deadline) {
+      if (!juce::MessageManager::getInstance()->runDispatchLoopUntil(10))
+        return false;
+    }
+    return nonParameterChanges > previous;
+  }
+
   int nonParameterChanges{};
 
 private:
@@ -3362,8 +3373,7 @@ bool exerciseProjectDirtyNotifications() {
   StateChangeListener listener(processor);
   processor.loadFile(juce::File(source.path().string()), true);
   processor.prepareToPlay(48'000.0, 64);
-  juce::MessageManager::getInstance()->runDispatchLoopUntil(100);
-  if (listener.nonParameterChanges == 0) {
+  if (!listener.waitForChangeSince(0)) {
     std::cerr
         << "loading a parameterless project did not mark host state dirty\n";
     return false;
@@ -3375,8 +3385,7 @@ bool exerciseProjectDirtyNotifications() {
       !waitForActiveRevision(processor, previous) ||
       !waitForOutput(processor, 0.75F))
     return false;
-  juce::MessageManager::getInstance()->runDispatchLoopUntil(100);
-  if (listener.nonParameterChanges <= changes)
+  if (!listener.waitForChangeSince(changes))
     return false;
   changes = listener.nonParameterChanges;
   processor.requestReload();
@@ -3399,8 +3408,7 @@ bool exerciseProjectDirtyNotifications() {
     return false;
   }
   processor.unload();
-  juce::MessageManager::getInstance()->runDispatchLoopUntil(100);
-  return listener.nonParameterChanges > changes;
+  return listener.waitForChangeSince(changes);
 }
 
 bool exerciseConcurrentStateRestoreAndLogDrain() {
