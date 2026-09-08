@@ -49,10 +49,14 @@ void *allocateAligned(const std::size_t size, const std::size_t alignment) {
 #if defined(_MSC_VER)
   return _aligned_malloc(requested, alignment);
 #else
-  if (requested > std::numeric_limits<std::size_t>::max() - (alignment - 1U))
+  // Darwin rejects small alignments even when malloc would satisfy them.
+  const auto effectiveAlignment = std::max(alignment, alignof(std::max_align_t));
+  if (requested >
+      std::numeric_limits<std::size_t>::max() - (effectiveAlignment - 1U))
     return nullptr;
-  const auto padded = ((requested + alignment - 1U) / alignment) * alignment;
-  return std::aligned_alloc(alignment, padded);
+  const auto padded = ((requested + effectiveAlignment - 1U) /
+                       effectiveAlignment) * effectiveAlignment;
+  return std::aligned_alloc(effectiveAlignment, padded);
 #endif
 }
 
@@ -3421,16 +3425,26 @@ bool exerciseConcurrentStateRestoreAndLogDrain() {
 }
 
 bool exerciseAlignedAllocation() {
-  constexpr auto alignment = std::align_val_t{64};
-  auto *scalar = ::operator new(17, alignment);
-  auto *array = ::operator new[](129, alignment, std::nothrow);
-  const auto aligned = [](const void *pointer) {
-    return pointer != nullptr && reinterpret_cast<std::uintptr_t>(pointer) % 64U == 0;
-  };
-  const auto valid = aligned(scalar) && aligned(array);
-  ::operator delete(scalar, alignment);
-  ::operator delete[](array, alignment, std::nothrow);
-  return valid;
+  for (std::size_t bytes = 1; bytes <= 64; bytes *= 2) {
+    const auto alignment = static_cast<std::align_val_t>(bytes);
+    for (const std::size_t size : {0U, 17U, 129U}) {
+      auto *scalar = ::operator new(size, alignment);
+      auto *array = ::operator new[](size, alignment, std::nothrow);
+      const auto aligned = [bytes](const void *pointer) {
+        return pointer != nullptr &&
+               reinterpret_cast<std::uintptr_t>(pointer) % bytes == 0;
+      };
+      const auto valid = aligned(scalar) && aligned(array);
+      ::operator delete(scalar, alignment);
+      ::operator delete[](array, alignment, std::nothrow);
+      if (!valid) {
+        std::cerr << "aligned allocation failed for size " << size
+                  << " and alignment " << bytes << '\n';
+        return false;
+      }
+    }
+  }
+  return true;
 }
 
 bool exerciseConcurrentInstances() {
