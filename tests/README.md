@@ -55,6 +55,12 @@ timeout, including teardown. The remaining 600 ms watcher observations and 250 m
 compiler-overlap observation are explicitly integration checks over finite windows;
 they are not scheduler-independent proofs that an event can never happen.
 
+Watcher rebuild counts are measured from the first published engine. Initial
+compilation may retry after discovering imports or canonical path aliases; it is
+not required to take exactly one compiler call. Both standalone and imported-source
+fixtures require no additional compilation for a timestamp-only edit and exactly
+one additional compilation for the tested content edit.
+
 ## Platform assumptions
 
 - Every test process owns a canonical temporary root containing spaces and Unicode.

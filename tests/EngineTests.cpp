@@ -1627,8 +1627,16 @@ sample { out1 = in1; out2 = in2 }
     }
   }
 
-  source.writeConstantEffect("0.5");
-  {
+  for (const bool withDependency : {false, true}) {
+    if (withDependency) {
+      source.writeDependency("def dependency_gain() { return 0.5 }\n");
+      source.writeText("import onda_plugin_dependency_test\n"
+                       "outs { out1, out2 }\n"
+                       "sample { out1 = dependency_gain(); "
+                       "out2 = dependency_gain() }\n");
+    } else {
+      source.writeConstantEffect("0.5");
+    }
     onda::plugin::SpscSlot<onda::plugin::PreparedEngine *> watchReplacements;
     onda::plugin::SpscSlot<onda::plugin::PreparedEngine *> watchRetirements;
     std::atomic<bool> watchDeactivate{};
@@ -1651,9 +1659,14 @@ sample { out1 = in1; out2 = in2 }
     worker.load(source.path(), false);
     std::unique_ptr<onda::plugin::PreparedEngine> initial{
         waitForReplacement(watchReplacements)};
-    if (!initial || buildCalls.load(std::memory_order_relaxed) != 1) {
-      std::cerr
-          << "metadata-gated watcher did not complete its initial build\n";
+    // Initial compilation may discover imports or canonical path aliases and
+    // retry to validate the expanded watch set. Measure edits after publication.
+    const auto initialBuildCalls = buildCalls.load(std::memory_order_relaxed);
+    if (!initial || !produces(*initial, 0.5F)) {
+      std::cerr << "metadata-gated watcher did not publish the initial program "
+                << "(imported " << withDependency << ", build calls "
+                << initialBuildCalls << ", status " << worker.status().message
+                << ")\n";
       return 1;
     }
 
@@ -1671,18 +1684,24 @@ sample { out1 = in1; out2 = in2 }
       return 1;
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(600));
-    if (buildCalls.load(std::memory_order_relaxed) != 1 ||
+    if (buildCalls.load(std::memory_order_relaxed) != initialBuildCalls ||
         watchReplacements.tryPop() != nullptr) {
-      std::cerr << "timestamp-only edit triggered an unnecessary rebuild\n";
+      std::cerr << "timestamp-only edit triggered an unnecessary rebuild "
+                << "(initial " << initialBuildCalls << ", current "
+                << buildCalls.load(std::memory_order_relaxed) << ")\n";
       return 1;
     }
 
     source.writeConstantEffect("0.75");
     std::unique_ptr<onda::plugin::PreparedEngine> changed{
         waitForReplacement(watchReplacements)};
-    if (!changed || buildCalls.load(std::memory_order_relaxed) != 2 ||
+    if (!changed ||
+        buildCalls.load(std::memory_order_relaxed) != initialBuildCalls + 1 ||
         !produces(*changed, 0.75F)) {
-      std::cerr << "metadata-gated watcher missed a content edit\n";
+      std::cerr << "metadata-gated watcher did not rebuild a content edit once "
+                << "(initial " << initialBuildCalls << ", current "
+                << buildCalls.load(std::memory_order_relaxed) << ", status "
+                << worker.status().message << ")\n";
       return 1;
     }
   }
