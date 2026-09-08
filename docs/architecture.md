@@ -121,9 +121,11 @@ lock-free scope ring owned by `Processor`. The editor snapshots its newest
 never allocates, locks, or interacts with the browser.
 
 Host note-on/off state is retained per MIDI channel in atomic bitsets and
-published separately as `midiActivity`. The shared keyboard is configured as a
-read-only monitor: it exposes no MIDI device or note-input surface, and notes
-remain lit while any host channel holds the corresponding key.
+published separately as `midiActivity`. Notes remain lit while any host channel holds the corresponding key.
+OndaSynth also accepts the shared keyboard's virtual note commands through a
+bounded SPSC queue, dispatched on MIDI channel 1 at the next callback. Commands
+are scoped to the compiled engine generation. Closing the editor or overflowing
+the queue releases its held notes. MIDI device selection remains host-owned.
 
 The callback captures aliased host input before clearing output. Logical blocks
 continue across host callbacks without added latency. JUCE playhead state is

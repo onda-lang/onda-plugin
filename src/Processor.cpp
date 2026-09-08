@@ -687,9 +687,39 @@ void Processor::processBlock(juce::AudioBuffer<float> &audio,
                                 offset);
       };
 
+  if (keyboardGeneration_ != active_->buildGeneration()) {
+    keyboardHeldNotes_.fill(false);
+    keyboardGeneration_ = active_->buildGeneration();
+  }
+  const auto dispatchKeyboardNote = [&](const int key, const float velocity) {
+    const MidiEvent event{velocity > 0.0F ? MidiKind::noteOn : MidiKind::noteOff,
+                          0, 0, key, velocity};
+    if (!processRange(0, 0, std::span<const MidiEvent>{&event, 1U}))
+      return false;
+    keyboardHeldNotes_[static_cast<std::size_t>(key)] = velocity > 0.0F;
+    return true;
+  };
   auto succeeded = true;
+  const auto epoch = keyboardEpoch_.load(std::memory_order_acquire);
+  if (consumedKeyboardEpoch_ != epoch) {
+    for (std::size_t key = 0; key < keyboardHeldNotes_.size() && succeeded; ++key) {
+      if (keyboardHeldNotes_[key])
+        succeeded = dispatchKeyboardNote(static_cast<int>(key), 0.0F);
+    }
+    consumedKeyboardEpoch_ = epoch;
+  }
+  KeyboardNoteCommand keyboardNote;
+  // Bound callback work even if the producer continues submitting notes.
+  for (std::size_t count = 0; count < 256U && keyboardNotes_.tryPop(keyboardNote);
+       ++count) {
+    if (keyboardNote.generation == keyboardGeneration_ &&
+        keyboardNote.epoch == epoch && succeeded)
+      succeeded = dispatchKeyboardNote(keyboardNote.key, keyboardNote.velocity);
+  }
   auto position = 0;
   for (const auto metadata : midi) {
+    if (!succeeded)
+      break;
     // Only channel messages are supported. Reject SysEx/system messages before
     // getMessage(), which allocates for packets exceeding JUCE's inline
     // storage.
@@ -936,6 +966,25 @@ RuntimeLogSnapshot Processor::runtimeLogSnapshot() const {
 
 std::uint64_t Processor::runtimeLogRevision() const noexcept {
   return runtimeLogRevision_.load(std::memory_order_acquire);
+}
+
+void Processor::triggerMidiNote(const int key, const float velocity,
+                                const bool pressed) {
+  if (product_ != Product::instrument || key < 0 ||
+      key >= static_cast<int>(midiNoteCount) || !std::isfinite(velocity))
+    return;
+  const auto status = workerStatus();
+  if (!status.active || !status.midi.noteOn || !status.midi.noteOff)
+    return;
+  if (!keyboardNotes_.tryPush({status.engineGeneration,
+                               keyboardEpoch_.load(std::memory_order_acquire), key,
+                               pressed ? std::clamp(velocity, 0.0F, 1.0F)
+                                       : 0.0F}))
+    releaseKeyboardNotes();
+}
+
+void Processor::releaseKeyboardNotes() noexcept {
+  keyboardEpoch_.fetch_add(1U, std::memory_order_release);
 }
 
 MidiActivitySnapshot Processor::midiActivitySnapshot() const noexcept {

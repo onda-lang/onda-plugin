@@ -2194,6 +2194,63 @@ bool exerciseExtendedMidi() {
   return true;
 }
 
+bool exerciseClickableMidiKeyboard() {
+  TemporarySource source;
+  if (!source.write(R"(
+outs { out1, out2 }
+init { level = 0.0 }
+event note_on(id: i32, channel: i32, key: i32, velocity: f32) {
+  level = velocity
+}
+event note_off(id: i32, channel: i32, key: i32, velocity: f32) {
+  level = 0.0
+}
+sample { out1 = level; out2 = level }
+)"))
+    return false;
+  onda::plugin::Processor processor(onda::plugin::Product::instrument);
+  processor.prepareToPlay(48'000.0, 8);
+  processor.loadFile(juce::File(onda::plugin::pathToJuce(source.path())), false);
+  if (!waitForPublishedReplacement(processor) ||
+      !waitForOutput(processor, 0.0F, 8))
+    return false;
+  const auto state = onda::plugin::makeRunViewState(
+      processor, processor.workerStatus(), false, {});
+  if (!static_cast<bool>(state["state"]["midiKeyboardInteractive"]))
+    return false;
+  const auto renders = [&](const float expected) {
+    juce::AudioBuffer<float> audio(2, 8);
+    audio.clear();
+    juce::MidiBuffer midi;
+    processor.processBlock(audio, midi);
+    for (int frame = 0; frame < 8; ++frame) {
+      if (std::abs(audio.getSample(0, frame) - expected) > 0.0001F)
+        return false;
+    }
+    return true;
+  };
+  processor.triggerMidiNote(60, 0.75F, true);
+  if (!renders(0.75F)) return false;
+  processor.triggerMidiNote(60, 0.0F, false);
+  if (!renders(0.0F)) return false;
+  processor.triggerMidiNote(60, 0.5F, true);
+  if (!renders(0.5F)) return false;
+  processor.releaseKeyboardNotes();
+  if (!renders(0.0F)) return false;
+  // Pending presses must also be cancelled when the editor closes.
+  processor.triggerMidiNote(60, 0.5F, true);
+  processor.releaseKeyboardNotes();
+  if (!renders(0.0F)) return false;
+  processor.triggerMidiNote(60, 0.5F, true);
+  if (!renders(0.5F)) return false;
+  for (int index = 0; index < 257; ++index)
+    processor.triggerMidiNote(60, 0.5F, true);
+  if (!renders(0.0F)) return false;
+  processor.triggerMidiNote(-1, 1.0F, true);
+  processor.triggerMidiNote(128, 1.0F, true);
+  return renders(0.0F);
+}
+
 bool exerciseMidiKeyboardMonitor() {
   TemporarySource source;
   if (!source.write(validSource(onda::plugin::Product::instrument)))
@@ -3625,6 +3682,7 @@ int main(const int argc, const char *const *argv) {
       {"ProjectExportRelinksAuthority", exerciseProjectExportRelinksAuthority},
       {"ExtendedMidi", exerciseExtendedMidi},
       {"MidiKeyboardMonitor", exerciseMidiKeyboardMonitor},
+      {"ClickableMidiKeyboard", exerciseClickableMidiKeyboard},
       {"EventMetadataGating", exerciseEventMetadataGating},
       {"HostContext", exerciseHostContext},
       {"TimelineProjection", exerciseTimelineProjection},

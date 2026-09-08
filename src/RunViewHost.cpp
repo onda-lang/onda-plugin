@@ -194,7 +194,8 @@ juce::var makeRunViewState(Processor &processor, const WorkerStatus &status,
   set(midi, "noteOn", noteOn);
   set(midi, "noteOff", noteOff);
   set(state, "midi", std::move(midi));
-  set(state, "midiKeyboardInteractive", false);
+  set(state, "midiKeyboardInteractive",
+      processor.product() == Product::instrument && noteOn && noteOff);
   set(state, "midiInputDevices", juce::Array<juce::var>{});
   set(state, "currentMidiInputDevice", juce::var{});
   set(state, "paramLayout",

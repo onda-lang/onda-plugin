@@ -275,6 +275,7 @@ Editor::Editor(Processor &owner)
 
 Editor::~Editor() {
   stopTimer();
+  processor_.releaseKeyboardNotes();
   processor_.setScopeCaptureEnabled(false);
   for (std::size_t index = 0; index < activeGestures_.size(); ++index) {
     if (activeGestures_[index])
@@ -360,6 +361,14 @@ void Editor::handleCommand(const juce::var &command) {
     loadingOverlay_.setVisible(false);
     publishState(true);
     publishMidiActivity(true);
+  } else if (type == "midiNote") {
+    const auto key = input->getProperty("key");
+    const auto velocity = input->getProperty("velocity");
+    const auto pressed = input->getProperty("pressed");
+    if (key.isInt() && (velocity.isDouble() || velocity.isInt()) && pressed.isBool())
+      processor_.triggerMidiNote(static_cast<int>(key),
+                                 static_cast<float>(velocity),
+                                 static_cast<bool>(pressed));
   } else if (type == "clearLog") {
     processor_.clearRuntimeLog();
     publishState(true);

@@ -119,6 +119,9 @@ public:
   [[nodiscard]] RuntimeLogSnapshot runtimeLogSnapshot() const;
   [[nodiscard]] std::uint64_t runtimeLogRevision() const noexcept;
   [[nodiscard]] MidiActivitySnapshot midiActivitySnapshot() const noexcept;
+  // Called on the message thread; notes are dispatched by the audio callback.
+  void triggerMidiNote(int key, float velocity, bool pressed);
+  void releaseKeyboardNotes() noexcept;
   void clearRuntimeLog();
   void setScopeCaptureEnabled(bool enabled) noexcept;
   [[nodiscard]] ScopeSnapshot scopeSnapshot() const;
@@ -201,6 +204,18 @@ private:
              midiChannelCount>
       midiActiveNotes_{};
   std::atomic<std::uint64_t> midiActivityRevision_{};
+  struct KeyboardNoteCommand {
+    std::uint64_t generation{};
+    std::uint64_t epoch{};
+    int key{};
+    float velocity{};
+  };
+  SpscQueue<KeyboardNoteCommand, 256U> keyboardNotes_;
+  std::atomic<std::uint64_t> keyboardEpoch_{};
+  std::uint64_t consumedKeyboardEpoch_{};
+  // Audio-thread ownership, reset whenever the engine generation changes.
+  std::array<bool, midiNoteCount> keyboardHeldNotes_{};
+  std::uint64_t keyboardGeneration_{};
 
   std::array<std::vector<float>,
              static_cast<std::size_t>(pluginPassthroughChannels)>
