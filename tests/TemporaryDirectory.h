@@ -16,8 +16,9 @@ inline const std::filesystem::path &testTemporaryRoot() {
           std::filesystem::canonical(std::filesystem::temp_directory_path());
       for (int attempt = 0; attempt < 100; ++attempt) {
         path = temporary /
-               ("onda-plugin-test-" + juce::Uuid{}.toString().toStdString());
-        if (std::filesystem::create_directory(path))
+               ("onda-plugin-test-" + juce::Uuid{}.toString().toStdString()) /
+               std::filesystem::path{u8"\u00d8nda test \u72b6\u614b"};
+        if (std::filesystem::create_directories(path))
           return;
       }
       throw std::runtime_error("Could not create the test temporary directory");
@@ -25,7 +26,7 @@ inline const std::filesystem::path &testTemporaryRoot() {
 
     ~Root() {
       std::error_code ignored;
-      std::filesystem::remove_all(path, ignored);
+      std::filesystem::remove_all(path.parent_path(), ignored);
     }
   };
   static const Root root;

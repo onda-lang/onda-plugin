@@ -560,6 +560,7 @@ if(BUILD_TESTING AND ONDA_PLUGIN_BUILD_TESTS)
     endif()
 
     add_executable(onda_vst3_smoke tests/Vst3Smoke.cpp)
+    target_include_directories(onda_vst3_smoke PRIVATE src)
     target_compile_features(onda_vst3_smoke PRIVATE cxx_std_20)
     target_link_libraries(onda_vst3_smoke PRIVATE
         juce::juce_audio_processors_headless
@@ -611,4 +612,8 @@ if(BUILD_TESTING AND ONDA_PLUGIN_BUILD_TESTS)
                 "${CMAKE_CURRENT_BINARY_DIR}/OndaFX_artefacts/$<CONFIG>/VST3/OndaFX.vst3"
         )
     endif()
+    # Deadlocks must produce a bounded CI failure, including during teardown.
+    get_property(onda_registered_tests DIRECTORY PROPERTY TESTS)
+    set_tests_properties(${onda_registered_tests} PROPERTIES TIMEOUT 180)
+
 endif()

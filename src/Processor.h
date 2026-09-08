@@ -142,6 +142,7 @@ public:
   void setParamControlLayout(ParamControlLayout layout);
 
 private:
+  friend struct ProcessorTestAccess;
   static BusesProperties buses();
   static juce::AudioProcessorValueTreeState::ParameterLayout parameters();
   void timerCallback() override;

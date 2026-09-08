@@ -4,6 +4,7 @@
 
 #include <juce_audio_formats/juce_audio_formats.h>
 
+#include "JucePath.h"
 #include <filesystem>
 #include <memory>
 #include <string>
@@ -22,8 +23,8 @@ public:
   bool write(const float left, const float right) const {
     std::error_code ignored;
     std::filesystem::remove(path_, ignored);
-    auto fileOutput =
-        std::make_unique<juce::FileOutputStream>(juce::File(path_.string()));
+    auto fileOutput = std::make_unique<juce::FileOutputStream>(
+        juce::File(onda::plugin::pathToJuce(path_)));
     if (!fileOutput->openedOk())
       return false;
     std::unique_ptr<juce::OutputStream> output = std::move(fileOutput);

@@ -1,4 +1,6 @@
+#include "JucePath.h"
 #include "TemporaryDirectory.h"
+#include "TestNumeric.h"
 
 #include <juce_audio_processors_headless/juce_audio_processors_headless.h>
 
@@ -43,7 +45,7 @@ struct ProductExpectation {
 }
 
 [[nodiscard]] bool checkBundleLookup() {
-  const juce::File root{testTemporaryRoot().string()};
+  const juce::File root{onda::plugin::pathToJuce(testTemporaryRoot())};
   const auto bundle = root.getChildFile("Lookup.vst3");
   const auto module = bundle.getChildFile("Contents/x86_64-win/Lookup.vst3");
   if (!check(module.getParentDirectory().createDirectory().wasOk() &&
@@ -87,7 +89,7 @@ struct ProductExpectation {
 // conversion.
 [[nodiscard]] bool smokeLoadedProgram(juce::AudioPluginInstance &instance) {
   const auto source =
-      juce::File{(testTemporaryRoot() / "hosted.onda").string()};
+      juce::File{onda::plugin::pathToJuce(testTemporaryRoot() / "hosted.onda")};
   if (!source.replaceWithText(
           "outs { out1 }\n"
           "event note_on(id: i32, channel: i32, key: i32, velocity: f32) {}\n"
@@ -272,8 +274,9 @@ struct ProductExpectation {
             expected.dryFallback && channel < ONDA_PLUGIN_INPUT_CHANNELS ? 1.0F
                                                                          : 0.0F;
         for (int frame = 0; frame < audio.getNumSamples(); ++frame) {
-          if (std::abs(audio.getSample(channel, frame) - expectedSample) >=
-              0.000001F) {
+          if (!test::withinTolerance(audio.getSample(channel, frame) -
+                                         expectedSample,
+                                     0.000001F)) {
             concurrentProcessingSucceeded.store(false,
                                                 std::memory_order_relaxed);
           }

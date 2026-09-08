@@ -1,4 +1,6 @@
 #include "TemporaryDirectory.h"
+#include "TestNumeric.h"
+#include "TestWait.h"
 
 #include "AudioFile.h"
 #include "Engine.h"
@@ -279,7 +281,9 @@ bool exerciseDiagnosticOwnership() {
 
 onda::plugin::PreparedEngine *waitForReplacement(
     onda::plugin::SpscSlot<onda::plugin::PreparedEngine *> &replacements) {
-  for (int attempt = 0; attempt < 500; ++attempt) {
+  for (const auto deadline =
+           std::chrono::steady_clock::now() + test::waitTimeout;
+       std::chrono::steady_clock::now() < deadline;) {
     if (auto *engine = replacements.tryPop())
       return engine;
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
@@ -502,7 +506,9 @@ bool exerciseDiskRepairDuringFallback() {
       }
       gateWake.notify_all();
       if (started) {
-        for (int attempt = 0; attempt < 500; ++attempt) {
+        for (const auto deadline =
+                 std::chrono::steady_clock::now() + test::waitTimeout;
+             std::chrono::steady_clock::now() < deadline;) {
           std::unique_ptr<PreparedEngine> replacement{replacements.tryPop()};
           if (replacement && produces(*replacement, 0.75F)) {
             repaired = !worker.status().usingProjectImage;
@@ -573,9 +579,9 @@ int main() {
   const auto mappings = built.engine->parameterMappings();
   if (mappings.size() != 1U || mappings[0].name != "gain" ||
       mappings[0].type != "f32" ||
-      std::abs(mappings[0].defaultPlain - 0.5) >= 1.0e-5 ||
-      std::abs(mappings[0].rangeMin) >= 1.0e-5 ||
-      std::abs(mappings[0].rangeMax - 1.0) >= 1.0e-5 ||
+      !test::withinTolerance(mappings[0].defaultPlain - 0.5, 1.0e-5) ||
+      !test::withinTolerance(mappings[0].rangeMin, 1.0e-5) ||
+      !test::withinTolerance(mappings[0].rangeMax - 1.0, 1.0e-5) ||
       mappings[0].scale != "linear" || mappings[0].curve || mappings[0].step ||
       mappings[0].stepCount || !mappings[0].unit.empty()) {
     std::cerr << "parameter mapping is incorrect\n";
@@ -1113,8 +1119,8 @@ sample { out1 = in1; out2 = in2 }
   }
   for (std::size_t index = 0; index < bufferLeft.size(); ++index) {
     const auto offset = static_cast<float>(index) * 0.01F;
-    if (std::abs(bufferLeft[index] - (0.1F + offset)) >= 5.0e-4F ||
-        std::abs(bufferRight[index] - (0.5F + offset)) >= 5.0e-4F) {
+    if (!test::withinTolerance(bufferLeft[index] - (0.1F + offset), 5.0e-4F) ||
+        !test::withinTolerance(bufferRight[index] - (0.5F + offset), 5.0e-4F)) {
       std::cerr << "decoded interleaved buffer data is incorrect\n";
       return 1;
     }
@@ -1129,8 +1135,8 @@ sample { out1 = in1; out2 = in2 }
   if (!restoredBuffer.engine ||
       !restoredBuffer.engine->process(nullptr, bufferOutputs.data(), 8, {},
                                       slots) ||
-      std::abs(bufferLeft[0] - 0.1F) >= 5.0e-4F ||
-      std::abs(bufferRight[0] - 0.5F) >= 5.0e-4F) {
+      !test::withinTolerance(bufferLeft[0] - 0.1F, 5.0e-4F) ||
+      !test::withinTolerance(bufferRight[0] - 0.5F, 5.0e-4F)) {
     std::cerr << "project image did not restore independently of disk\n";
     return 1;
   }
@@ -1158,8 +1164,8 @@ sample { out1 = in1; out2 = in2 }
   if (!exportedBufferBuild.engine ||
       !exportedBufferBuild.engine->process(nullptr, bufferOutputs.data(), 8, {},
                                            slots) ||
-      std::abs(bufferLeft[0] - 0.1F) >= 5.0e-4F ||
-      std::abs(bufferRight[0] - 0.5F) >= 5.0e-4F) {
+      !test::withinTolerance(bufferLeft[0] - 0.1F, 5.0e-4F) ||
+      !test::withinTolerance(bufferRight[0] - 0.5F, 5.0e-4F)) {
     std::cerr << "exported buffer asset did not reproduce its checkpoint: "
               << exportedBufferBuild.diagnostic.message << " (samples "
               << bufferLeft[0] << ", " << bufferRight[0] << ")\n";
@@ -1285,7 +1291,9 @@ sample { out1 = in1; out2 = in2 }
 
     source.writeInvalid();
     bool observedFailure = false;
-    for (int attempt = 0; attempt < 500; ++attempt) {
+    for (const auto deadline =
+             std::chrono::steady_clock::now() + test::waitTimeout;
+         std::chrono::steady_clock::now() < deadline;) {
       const auto status = worker.status();
       if (!status.compiling && status.message != "Active" &&
           status.message != "Waiting to compile") {
@@ -1339,7 +1347,9 @@ sample { out1 = in1; out2 = in2 }
     worker.configure(48'000.0, 8);
     worker.load(source.path(), false);
     bool observedMissingDependency = false;
-    for (int attempt = 0; attempt < 500; ++attempt) {
+    for (const auto deadline =
+             std::chrono::steady_clock::now() + test::waitTimeout;
+         std::chrono::steady_clock::now() < deadline;) {
       const auto status = worker.status();
       if (!status.compiling && status.message != "Waiting to compile" &&
           status.message != "Waiting for host specialization") {
@@ -1379,7 +1389,9 @@ sample { out1 = in1; out2 = in2 }
     worker.load(source.path(), false);
 
     bool failureContained = false;
-    for (int attempt = 0; attempt < 500; ++attempt) {
+    for (const auto deadline =
+             std::chrono::steady_clock::now() + test::waitTimeout;
+         std::chrono::steady_clock::now() < deadline;) {
       const auto status = worker.status();
       if (!status.compiling &&
           status.message == "Onda worker stopped after an unknown failure") {
@@ -1424,14 +1436,18 @@ sample { out1 = in1; out2 = in2 }
             std::unique_lock lock(gateMutex);
             firstResultReady = true;
             gateWake.notify_all();
-            gateWake.wait(lock, [&] { return releaseFirst; });
+            if (!gateWake.wait_for(lock, test::waitTimeout,
+                                   [&] { return releaseFirst; }))
+              return onda::plugin::BuildResult{};
             return result;
           }
           if (call == 2) {
             std::unique_lock lock(gateMutex);
             secondStarted = true;
             gateWake.notify_all();
-            gateWake.wait(lock, [&] { return releaseSecond; });
+            if (!gateWake.wait_for(lock, test::waitTimeout,
+                                   [&] { return releaseSecond; }))
+              return onda::plugin::BuildResult{};
           }
           return onda::plugin::PreparedEngine::build(
               path, product, sampleRate, blockSize, bindings, parameters);
@@ -1517,7 +1533,9 @@ sample { out1 = in1; out2 = in2 }
       return 1;
     }
     bool failed = false;
-    for (int attempt = 0; attempt < 500; ++attempt) {
+    for (const auto deadline =
+             std::chrono::steady_clock::now() + test::waitTimeout;
+         std::chrono::steady_clock::now() < deadline;) {
       const auto status = worker.status();
       if (status.path == invalidPath && !status.compiling &&
           status.message != "Waiting to compile") {
@@ -1557,7 +1575,9 @@ sample { out1 = in1; out2 = in2 }
                       if (blockBuild) {
                         entered = true;
                         gateWake.notify_one();
-                        gateWake.wait(lock, [&] { return release; });
+                        if (!gateWake.wait_for(lock, test::waitTimeout,
+                                               [&] { return release; }))
+                          return onda::plugin::BuildResult{};
                       }
                     }
                     return PreparedEngine::build(path, product, rate, blockSize,
@@ -1694,7 +1714,9 @@ sample { out1 = in1; out2 = in2 }
             ++concurrent;
             maximumConcurrent = std::max(maximumConcurrent, concurrent);
             compileGateWake.notify_all();
-            compileGateWake.wait(lock, [&] { return releaseCompiles; });
+            if (!compileGateWake.wait_for(lock, test::waitTimeout,
+                                          [&] { return releaseCompiles; }))
+              return onda::plugin::BuildResult{};
           }
           auto result = onda::plugin::PreparedEngine::build(
               path, product, sampleRate, blockSize, bindings, parameters);

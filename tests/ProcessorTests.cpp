@@ -1,8 +1,10 @@
 #include "TemporaryDirectory.h"
+#include "TestNumeric.h"
 
 #include "AudioFile.h"
 #include "JucePath.h"
 #include "Processor.h"
+#include "ProcessorTestSupport.h"
 #include "RunViewHost.h"
 #include "TestAudioFile.h"
 
@@ -96,14 +98,7 @@ public:
   }
 
   bool waitForChangeSince(const int previous) const {
-    const auto deadline =
-        std::chrono::steady_clock::now() + std::chrono::seconds(5);
-    while (nonParameterChanges <= previous &&
-           std::chrono::steady_clock::now() < deadline) {
-      if (!juce::MessageManager::getInstance()->runDispatchLoopUntil(10))
-        return false;
-    }
-    return nonParameterChanges > previous;
+    return test::waitForMessage([&] { return nonParameterChanges > previous; });
   }
 
   int nonParameterChanges{};
@@ -566,72 +561,73 @@ bool waitForOutput(onda::plugin::Processor &processor, const float expected,
                    const int frames = 64) {
   juce::AudioBuffer<float> audio(2, frames);
   juce::MidiBuffer midi;
-  for (int attempt = 0; attempt < 500; ++attempt) {
-    for (int channel = 0; channel < audio.getNumChannels(); ++channel)
-      std::fill_n(audio.getWritePointer(channel), audio.getNumSamples(), 1.0F);
-    processor.processBlock(audio, midi);
-
-    auto matches = true;
-    for (int channel = 0; channel < audio.getNumChannels(); ++channel) {
-      for (int frame = 0; frame < audio.getNumSamples(); ++frame)
-        matches &=
-            std::abs(audio.getSample(channel, frame) - expected) < 1.0e-5F;
-    }
-    juce::MessageManager::getInstance()->runDispatchLoopUntil(10);
-    if (matches)
-      return true;
-  }
-  return false;
+  return test::waitUntil(
+      [&] {
+        for (int channel = 0; channel < audio.getNumChannels(); ++channel)
+          std::fill_n(audio.getWritePointer(channel), audio.getNumSamples(),
+                      1.0F);
+        processor.processBlock(audio, midi);
+        test::service(processor);
+        for (int channel = 0; channel < audio.getNumChannels(); ++channel) {
+          for (int frame = 0; frame < audio.getNumSamples(); ++frame) {
+            if (!(std::abs(audio.getSample(channel, frame) - expected) <
+                  1.0e-5F))
+              return false;
+          }
+        }
+        return true;
+      },
+      test::yieldToWorker);
 }
 
 bool waitForActiveRevision(onda::plugin::Processor &processor,
                            const std::uint64_t previousRevision) {
-  for (int attempt = 0; attempt < 500; ++attempt) {
-    juce::MessageManager::getInstance()->runDispatchLoopUntil(10);
-    const auto status = processor.workerStatus();
-    if (status.revision > previousRevision && status.active &&
-        !status.compiling && status.message == "Active") {
-      return true;
-    }
-  }
-  return false;
+  return test::waitUntil(
+      [&] {
+        test::service(processor);
+        const auto status = processor.workerStatus();
+        return status.revision > previousRevision && status.active &&
+               !status.compiling && status.message == "Active";
+      },
+      test::yieldToWorker);
 }
 
+// Publication must be observable without adopting the engine or seeding slots.
+// Do not pump the message loop or service processor updates here.
 bool waitForPublishedReplacement(onda::plugin::Processor &processor) {
-  for (int attempt = 0; attempt < 500; ++attempt) {
-    const auto status = processor.workerStatus();
-    if (status.active && !status.compiling && status.message == "Active")
-      return true;
-    std::this_thread::sleep_for(std::chrono::milliseconds(10));
-  }
-  return false;
+  return test::waitUntil(
+      [&] {
+        const auto status = processor.workerStatus();
+        return status.active && !status.compiling && status.message == "Active";
+      },
+      test::yieldToWorker);
 }
 
 bool waitForSafeEffectBypass(onda::plugin::Processor &processor) {
   juce::AudioBuffer<float> audio(2, 64);
   juce::MidiBuffer midi;
-  for (int attempt = 0; attempt < 500; ++attempt) {
-    for (int channel = 0; channel < audio.getNumChannels(); ++channel)
-      std::fill_n(audio.getWritePointer(channel), audio.getNumSamples(), 1.0F);
-    processor.processBlock(audio, midi);
-    const auto dry = std::all_of(
-        audio.getArrayOfReadPointers(),
-        audio.getArrayOfReadPointers() + audio.getNumChannels(),
-        [&audio](const float *channel) {
-          return std::all_of(channel, channel + audio.getNumSamples(),
-                             [](const float sample) {
-                               return std::abs(sample - 1.0F) < 1.0e-6F;
-                             });
-        });
-    juce::MessageManager::getInstance()->runDispatchLoopUntil(10);
-    const auto status = processor.workerStatus();
-    if (dry && !status.active && !status.compiling &&
-        status.message != "Waiting to compile" &&
-        status.message != "Waiting for host specialization") {
-      return true;
-    }
-  }
-  return false;
+  return test::waitUntil(
+      [&] {
+        for (int channel = 0; channel < audio.getNumChannels(); ++channel)
+          std::fill_n(audio.getWritePointer(channel), audio.getNumSamples(),
+                      1.0F);
+        processor.processBlock(audio, midi);
+        test::service(processor);
+        const auto dry = std::all_of(
+            audio.getArrayOfReadPointers(),
+            audio.getArrayOfReadPointers() + audio.getNumChannels(),
+            [&audio](const float *channel) {
+              return std::all_of(channel, channel + audio.getNumSamples(),
+                                 [](const float sample) {
+                                   return std::abs(sample - 1.0F) < 1.0e-6F;
+                                 });
+            });
+        const auto status = processor.workerStatus();
+        return dry && !status.active && !status.compiling &&
+               status.message != "Waiting to compile" &&
+               status.message != "Waiting for host specialization";
+      },
+      test::yieldToWorker);
 }
 
 bool waitForProjectImageOutput(onda::plugin::Processor &processor,
@@ -701,7 +697,8 @@ bool processWithoutAllocation(onda::plugin::Processor &processor,
   }
   for (int channel = 0; channel < audio.getNumChannels(); ++channel) {
     for (int frame = 0; frame < audio.getNumSamples(); ++frame) {
-      if (std::abs(audio.getSample(channel, frame) - expected) >= 1.0e-5F)
+      if (!test::withinTolerance(audio.getSample(channel, frame) - expected,
+                                 1.0e-5F))
         return false;
     }
   }
@@ -824,7 +821,8 @@ bool exerciseUserEvents() {
 
   onda::plugin::Processor processor(onda::plugin::Product::effect);
   processor.prepareToPlay(48'000.0, 64);
-  processor.loadFile(juce::File(source.path().string()), false);
+  processor.loadFile(juce::File(onda::plugin::pathToJuce(source.path())),
+                     false);
   if (!waitForOutput(processor, 0.125F)) {
     std::cerr << "user-event processor did not become active\n";
     return false;
@@ -921,7 +919,8 @@ bool exerciseScopeCapture() {
 
   onda::plugin::Processor processor(onda::plugin::Product::effect);
   processor.prepareToPlay(48'000.0, 64);
-  processor.loadFile(juce::File(source.path().string()), false);
+  processor.loadFile(juce::File(onda::plugin::pathToJuce(source.path())),
+                     false);
   if (!waitForOutput(processor, 0.25F)) {
     std::cerr << "scope processor did not become active\n";
     return false;
@@ -966,8 +965,10 @@ bool exerciseScopeCapture() {
     const auto expected =
         static_cast<float>(firstCapturedFrame + static_cast<int>(frame)) /
         16384.0F;
-    if (std::abs(snapshot.samples[frame * 2U] - expected) >= 1.0e-6F ||
-        std::abs(snapshot.samples[frame * 2U + 1U] + expected) >= 1.0e-6F) {
+    if (!test::withinTolerance(snapshot.samples[frame * 2U] - expected,
+                               1.0e-6F) ||
+        !test::withinTolerance(snapshot.samples[frame * 2U + 1U] + expected,
+                               1.0e-6F)) {
       std::cerr << "scope snapshot was not the latest interleaved output\n";
       return false;
     }
@@ -1002,22 +1003,18 @@ bool exerciseRuntimeLogging() {
 
   onda::plugin::Processor processor(onda::plugin::Product::effect);
   processor.prepareToPlay(48'000.0, 64);
-  processor.loadFile(juce::File(source.path().string()), false);
+  processor.loadFile(juce::File(onda::plugin::pathToJuce(source.path())),
+                     false);
   if (!waitForOutput(processor, 0.25F)) {
     std::cerr << "logging processor did not become active\n";
     return false;
   }
 
-  const auto waitForRecords = [&processor](const std::size_t count) {
-    for (int attempt = 0; attempt < 100; ++attempt) {
-      juce::MessageManager::getInstance()->runDispatchLoopUntil(10);
-      auto snapshot = processor.runtimeLogSnapshot();
-      if (snapshot.records.size() >= count)
-        return snapshot;
-    }
+  const auto drainedLog = [&processor] {
+    test::service(processor);
     return processor.runtimeLogSnapshot();
   };
-  auto snapshot = waitForRecords(3U);
+  auto snapshot = drainedLog();
   if (!snapshot.revealed || snapshot.records.size() != 3U ||
       snapshot.records[0].text != "init: 0 0" ||
       snapshot.records[1].text != "sample: 1 1" ||
@@ -1090,7 +1087,7 @@ bool exerciseRuntimeLogging() {
     if (!processWithoutAllocation(processor, 0.25F))
       return false;
   }
-  snapshot = waitForRecords(3U);
+  snapshot = drainedLog();
   if (snapshot.records.size() < 3U || snapshot.records[0].text != "init: 1 0" ||
       snapshot.records[1].text != "sample: 2 1" ||
       snapshot.records[2].text != "delegate observed: value=2" ||
@@ -1103,7 +1100,7 @@ bool exerciseRuntimeLogging() {
   if (!processWithoutAllocation(processor, 0.25F))
     return false;
   processor.clearRuntimeLog();
-  juce::MessageManager::getInstance()->runDispatchLoopUntil(100);
+  test::service(processor);
   snapshot = processor.runtimeLogSnapshot();
   if (!snapshot.revealed || !snapshot.records.empty() ||
       snapshot.counters.printTransportDrops != 0U ||
@@ -1115,7 +1112,7 @@ bool exerciseRuntimeLogging() {
   for (int block = 0; block < 18; ++block) {
     if (!processWithoutAllocation(processor, 0.25F))
       return false;
-    juce::MessageManager::getInstance()->runDispatchLoopUntil(60);
+    test::service(processor);
   }
   snapshot = processor.runtimeLogSnapshot();
   if (snapshot.records.size() > 1024U ||
@@ -1133,24 +1130,21 @@ bool exerciseRuntimeLogging() {
   if (!source.write(replacementLoggingEffectSource))
     return false;
   processor.requestReload();
-  auto replacementReady = false;
-  for (int attempt = 0; attempt < 500; ++attempt) {
-    const auto status = processor.workerStatus();
-    if (status.revision > previousRevision && status.active &&
-        !status.compiling && status.message == "Active") {
-      replacementReady = true;
-      break;
-    }
-    std::this_thread::sleep_for(std::chrono::milliseconds(10));
-  }
+  const auto replacementReady = test::waitUntil(
+      [&] {
+        const auto status = processor.workerStatus();
+        return status.revision > previousRevision && status.active &&
+               !status.compiling && status.message == "Active";
+      },
+      test::yieldToWorker);
   if (!replacementReady || !processWithoutAllocation(processor, 0.5F)) {
     std::cerr << "replacement logging processor did not become active\n";
     return false;
   }
-  juce::MessageManager::getInstance()->runDispatchLoopUntil(100);
+  test::service(processor);
   if (!processWithoutAllocation(processor, 0.5F))
     return false;
-  snapshot = waitForRecords(1U);
+  snapshot = drainedLog();
   if (!snapshot.revealed || snapshot.records.size() != 1U ||
       snapshot.records[0].text != "replacement init") {
     std::cerr << "replacement init log was crowded out by stale output\n";
@@ -1171,7 +1165,8 @@ bool exercise(const onda::plugin::Product product) {
     return false;
   }
   processor.prepareToPlay(48'000.0, 64);
-  processor.loadFile(juce::File(source.path().string()), false);
+  processor.loadFile(juce::File(onda::plugin::pathToJuce(source.path())),
+                     false);
   if (!waitForOutput(processor, 0.25F)) {
     std::cerr << "valid processor did not become active\n";
     return false;
@@ -1194,18 +1189,18 @@ bool exercise(const onda::plugin::Product product) {
     const auto revisionBeforeInitFailure = processor.workerStatus().revision;
     if (!source.write(initFaultingEffectSource))
       return false;
-    bool retainedLastGood = false;
-    for (int attempt = 0; attempt < 500; ++attempt) {
-      if (!waitForOutput(processor, 0.25F))
-        return false;
-      const auto status = processor.workerStatus();
-      if (status.revision > revisionBeforeInitFailure && status.active &&
-          !status.compiling && status.message != "Active") {
-        retainedLastGood = true;
-        break;
-      }
-    }
-    if (!retainedLastGood) {
+    bool validOutput = true;
+    const auto retainedLastGood = test::waitUntil(
+        [&] {
+          validOutput = processWithoutAllocation(processor, 0.25F);
+          test::service(processor);
+          const auto status = processor.workerStatus();
+          return !validOutput || (status.revision > revisionBeforeInitFailure &&
+                                  status.active && !status.compiling &&
+                                  status.message != "Active");
+        },
+        test::yieldToWorker);
+    if (!retainedLastGood || !validOutput) {
       std::cerr << "init-time failure did not retain the last-good engine\n";
       return false;
     }
@@ -1234,7 +1229,7 @@ bool exercise(const onda::plugin::Product product) {
     processor.processBlock(audio, midi);
     for (int channel = 0; channel < audio.getNumChannels(); ++channel) {
       for (int frame = 0; frame < audio.getNumSamples(); ++frame) {
-        if (std::abs(audio.getSample(channel, frame)) >= 1.0e-6F) {
+        if (!test::withinTolerance(audio.getSample(channel, frame), 1.0e-6F)) {
           std::cerr << "event runtime failure did not silence the instrument\n";
           return false;
         }
@@ -1263,7 +1258,7 @@ bool exercise(const onda::plugin::Product product) {
     std::cerr << "runtime failure did not activate product fallback\n";
     return false;
   }
-  juce::MessageManager::getInstance()->runDispatchLoopUntil(100);
+  test::service(processor);
   const auto failed = processor.workerStatus();
   if (failed.active ||
       failed.message.find("runtime safety check") == std::string::npos) {
@@ -1308,7 +1303,8 @@ bool exerciseStateRestore() {
   {
     onda::plugin::Processor original(onda::plugin::Product::effect);
     original.prepareToPlay(48'000.0, 64);
-    original.loadFile(juce::File(source.path().string()), false);
+    original.loadFile(juce::File(onda::plugin::pathToJuce(source.path())),
+                      false);
     if (!waitForOutput(original, 0.5F))
       return false;
     original.setSlotValue(0, 0.8125F);
@@ -1320,16 +1316,7 @@ bool exerciseStateRestore() {
     if (!source.write(std::string{parameterEffectSource} + "\n# reload\n"))
       return false;
     original.requestReload();
-    bool reloaded = false;
-    for (int attempt = 0; attempt < 500; ++attempt) {
-      juce::MessageManager::getInstance()->runDispatchLoopUntil(10);
-      const auto status = original.workerStatus();
-      if (status.revision > revisionBeforeReload && status.active &&
-          !status.compiling && status.message == "Active") {
-        reloaded = true;
-        break;
-      }
-    }
+    const auto reloaded = waitForActiveRevision(original, revisionBeforeReload);
     if (!reloaded || !waitForOutput(original, 0.8125F)) {
       std::cerr << "host slot value was not preserved across reload\n";
       return false;
@@ -1411,7 +1398,7 @@ bool exerciseStateRestore() {
     std::array<float, onda::plugin::slotCount> invalidValues{};
     invalidValues.fill(0.25F);
     const auto invalidState =
-        makeState(juce::String(invalidSource.path().string()), {},
+        makeState(onda::plugin::pathToJuce(invalidSource.path()), {},
                   invalidValues, 480, 720);
     original.setStateInformation(invalidState.getData(),
                                  static_cast<int>(invalidState.getSize()));
@@ -1446,8 +1433,8 @@ bool exerciseStateRestore() {
       return false;
     }
     const auto [width, height] = restored.editorSize();
-    if (std::abs(restored.slotValue(0) - 0.8125F) >= 1.0e-6F || width != 777 ||
-        height != 888 ||
+    if (!test::withinTolerance(restored.slotValue(0) - 0.8125F, 1.0e-6F) ||
+        width != 777 || height != 888 ||
         restored.paramControlLayout() !=
             onda::plugin::ParamControlLayout::knobs ||
         restored.workerStatus().path != source.path()) {
@@ -1481,11 +1468,11 @@ bool exerciseStateRestore() {
     normalized.setStateInformation(hostileState.getData(),
                                    static_cast<int>(hostileState.getSize()));
     const auto [width, height] = normalized.editorSize();
-    if (std::abs(normalized.slotValue(0) - 0.5F) >= 1.0e-6F ||
-        std::abs(normalized.slotValue(1) - 0.5F) >= 1.0e-6F ||
-        std::abs(normalized.slotValue(2)) >= 1.0e-6F ||
-        std::abs(normalized.slotValue(3) - 1.0F) >= 1.0e-6F || width != 360 ||
-        height != 1400 ||
+    if (!test::withinTolerance(normalized.slotValue(0) - 0.5F, 1.0e-6F) ||
+        !test::withinTolerance(normalized.slotValue(1) - 0.5F, 1.0e-6F) ||
+        !test::withinTolerance(normalized.slotValue(2), 1.0e-6F) ||
+        !test::withinTolerance(normalized.slotValue(3) - 1.0F, 1.0e-6F) ||
+        width != 360 || height != 1400 ||
         normalized.lastBrowseDirectory() != unicodeDirectory) {
       std::cerr << "hostile finite, non-finite, or Unicode state was not "
                    "normalized safely\n";
@@ -1525,12 +1512,12 @@ bool exerciseEditorLifecycle() {
 
   onda::plugin::Processor processor(onda::plugin::Product::effect);
   processor.prepareToPlay(48'000.0, 64);
-  processor.loadFile(juce::File(source.path().string()), false);
+  processor.loadFile(juce::File(onda::plugin::pathToJuce(source.path())),
+                     false);
   if (!waitForOutput(processor, 0.5F) ||
       !waitForPublishedReplacement(processor)) {
     return false;
   }
-  juce::MessageManager::getInstance()->runDispatchLoopUntil(50);
   const auto activeRevision = processor.workerStatus().revision;
   auto *const parameter = processor.getParameters()[0];
 
@@ -1539,7 +1526,7 @@ bool exerciseEditorLifecycle() {
     const auto reachedDsp = waitForOutput(processor, value);
     const auto slot = processor.slotValue(0);
     const auto revision = processor.workerStatus().revision;
-    if (!reachedDsp || std::abs(slot - value) >= 1.0e-6F ||
+    if (!reachedDsp || !test::withinTolerance(slot - value, 1.0e-6F) ||
         revision != activeRevision) {
       std::cerr << "host automation failed " << phase << " (DSP " << reachedDsp
                 << ", slot " << slot << ", revision " << revision
@@ -1576,20 +1563,16 @@ bool exerciseEditorLifecycle() {
 #endif
   editor->setVisible(true);
 #if JUCE_WINDOWS
-  for (int attempt = 0; attempt < 1000 && loadingOverlay->isVisible();
-       ++attempt)
-    juce::MessageManager::getInstance()->runDispatchLoopUntil(10);
-  if (loadingOverlay->isVisible()) {
+  if (!test::waitForMessage([&] { return !loadingOverlay->isVisible(); },
+                            std::chrono::seconds(10))) {
     std::cerr << "Windows editor did not complete its WebView2 handshake: "
               << loadingOverlay->getText() << '\n';
     processor.editorBeingDeleted(editor.get());
     return false;
   }
 #endif
-  juce::MessageManager::getInstance()->runDispatchLoopUntil(100);
   editor->setSize(777, 888);
   processor.setParamControlLayout(onda::plugin::ParamControlLayout::knobs);
-  juce::MessageManager::getInstance()->runDispatchLoopUntil(50);
   const auto [resizedWidth, resizedHeight] = processor.editorSize();
   if (resizedWidth != 777 || resizedHeight != 888 ||
       processor.paramControlLayout() !=
@@ -1601,13 +1584,11 @@ bool exerciseEditorLifecycle() {
   }
 
   editor->setVisible(false);
-  juce::MessageManager::getInstance()->runDispatchLoopUntil(50);
   if (!automate(0.6F, "with the editor unavailable"))
     return false;
 
   processor.editorBeingDeleted(editor.get());
   editor.reset();
-  juce::MessageManager::getInstance()->runDispatchLoopUntil(50);
   if (processor.getActiveEditor() != nullptr)
     return false;
 
@@ -1647,21 +1628,24 @@ sample { out1 = clip[0, 0] + retained[1, 0]; out2 = clip[0, 0] + retained[1, 0] 
   for (const bool clearPreviouslyBound : {false, true}) {
     Processor processor(Product::effect);
     StateChangeListener listener(processor);
-    processor.loadFile(juce::File(source.path().string()), false);
-    juce::MessageManager::getInstance()->runDispatchLoopUntil(100);
+    processor.loadFile(juce::File(onda::plugin::pathToJuce(source.path())),
+                       false);
+    test::service(processor);
     if (listener.nonParameterChanges == 0) {
       std::cerr << "incomplete source selection did not mark host state dirty\n";
       return false;
     }
     const auto changes = listener.nonParameterChanges;
-    processor.bindBufferFile("retained", juce::File(retained.path().string()));
-    juce::MessageManager::getInstance()->runDispatchLoopUntil(100);
+    processor.bindBufferFile(
+        "retained", juce::File(onda::plugin::pathToJuce(retained.path())));
+    test::service(processor);
     if (listener.nonParameterChanges <= changes) {
       std::cerr << "incomplete buffer selection did not mark host state dirty\n";
       return false;
     }
     if (clearPreviouslyBound) {
-      processor.bindBufferFile("clip", juce::File(clip.path().string()));
+      processor.bindBufferFile(
+          "clip", juce::File(onda::plugin::pathToJuce(clip.path())));
       processor.prepareToPlay(48'000.0, 8);
       if (!waitForOutput(processor, 0.375F, 8))
         return false;
@@ -1690,12 +1674,13 @@ sample { out1 = clip[0, 0] + retained[1, 0]; out2 = clip[0, 0] + retained[1, 0] 
             << "incomplete buffer state lost its source or remaining binding\n";
         return false;
       }
-      juce::MessageManager::getInstance()->runDispatchLoopUntil(100);
+      test::service(restored);
       if (restoreListener.nonParameterChanges != 0) {
         std::cerr << "restoring incomplete state marked host state dirty\n";
         return false;
       }
-      restored.bindBufferFile("clip", juce::File(clip.path().string()));
+      restored.bindBufferFile(
+          "clip", juce::File(onda::plugin::pathToJuce(clip.path())));
       restored.prepareToPlay(48'000.0, 8);
       if (!waitForOutput(restored, 0.375F, 8))
         return false;
@@ -1742,19 +1727,21 @@ sample {
     onda::plugin::Processor processor(onda::plugin::Product::effect);
     StateChangeListener listener(processor);
     processor.prepareToPlay(48'000.0, 8);
-    processor.loadFile(juce::File(projectPath.string()), false);
+    processor.loadFile(juce::File(onda::plugin::pathToJuce(projectPath)),
+                       false);
     if (!waitForOutput(processor, 0.625F, 8)) {
       std::cerr << "project default failed: " << processor.workerStatus().message << '\n';
       return false;
     }
-    juce::MessageManager::getInstance()->runDispatchLoopUntil(100);
+    test::service(processor);
     auto changes = listener.nonParameterChanges;
-    processor.bindBufferFile("clip", juce::File(audio.path().string()));
+    processor.bindBufferFile(
+        "clip", juce::File(onda::plugin::pathToJuce(audio.path())));
     if (!waitForOutput(processor, expectedOverride, 8)) {
       std::cerr << "project override failed: " << processor.workerStatus().message << '\n';
       return false;
     }
-    juce::MessageManager::getInstance()->runDispatchLoopUntil(100);
+    test::service(processor);
     if (listener.nonParameterChanges <= changes) {
       std::cerr << "buffer override did not mark host state dirty\n";
       return false;
@@ -1766,7 +1753,7 @@ sample {
       std::cerr << "clearing an override did not restore the project default\n";
       return false;
     }
-    juce::MessageManager::getInstance()->runDispatchLoopUntil(100);
+    test::service(processor);
     if (listener.nonParameterChanges <= changes) {
       std::cerr << "clearing a buffer override did not mark host state dirty\n";
       return false;
@@ -1822,15 +1809,16 @@ sample {
 
   const auto waitForBufferStatus = [](onda::plugin::Processor &processor,
                                       const bool active) {
-    for (int attempt = 0; attempt < 500; ++attempt) {
-      juce::MessageManager::getInstance()->runDispatchLoopUntil(10);
-      const auto status = processor.workerStatus();
-      if (!status.compiling && status.buffers.size() == 1U &&
-          status.active == active) {
-        return status;
-      }
-    }
-    return onda::plugin::WorkerStatus{};
+    onda::plugin::WorkerStatus status;
+    const auto ready = test::waitUntil(
+        [&] {
+          test::service(processor);
+          status = processor.workerStatus();
+          return !status.compiling && status.buffers.size() == 1U &&
+                 status.active == active;
+        },
+        test::yieldToWorker);
+    return ready ? status : onda::plugin::WorkerStatus{};
   };
   const auto processFirstFrame = [](onda::plugin::Processor &processor) {
     juce::AudioBuffer<float> audio(2, 8);
@@ -1846,7 +1834,8 @@ sample {
   {
     onda::plugin::Processor processor(onda::plugin::Product::effect);
     processor.prepareToPlay(48'000.0, 8);
-    processor.loadFile(juce::File(source.path().string()), false);
+    processor.loadFile(juce::File(onda::plugin::pathToJuce(source.path())),
+                       false);
     const auto unbound = waitForBufferStatus(processor, false);
     if (unbound.buffers.size() != 1U ||
         unbound.message.find("not bound") == std::string::npos) {
@@ -1854,7 +1843,8 @@ sample {
       return false;
     }
 
-    processor.bindBufferFile("clip", juce::File(audioFile.path().string()));
+    processor.bindBufferFile(
+        "clip", juce::File(onda::plugin::pathToJuce(audioFile.path())));
     const auto bound = waitForBufferStatus(processor, true);
     if (bound.buffers.size() != 1U ||
         bound.buffers[0].loadedPath != audioFile.path() ||
@@ -1864,7 +1854,8 @@ sample {
       return false;
     }
     const auto [left, right] = processFirstFrame(processor);
-    if (std::abs(left - 0.1F) >= 5.0e-4F || std::abs(right - 0.5F) >= 5.0e-4F) {
+    if (!test::withinTolerance(left - 0.1F, 5.0e-4F) ||
+        !test::withinTolerance(right - 0.5F, 5.0e-4F)) {
       std::cerr << "processor did not render the bound FLAC file\n";
       return false;
     }
@@ -1879,18 +1870,16 @@ sample {
     const auto revision = processor.workerStatus().revision;
     if (!audioFile.write(0.2F, 0.6F))
       return false;
-    auto reloaded = false;
-    for (int attempt = 0; attempt < 500; ++attempt) {
-      juce::MessageManager::getInstance()->runDispatchLoopUntil(10);
-      const auto status = processor.workerStatus();
-      const auto output = processFirstFrame(processor);
-      if (status.revision > revision && status.active && !status.compiling &&
-          std::abs(output.first - 0.2F) < 5.0e-4F &&
-          std::abs(output.second - 0.6F) < 5.0e-4F) {
-        reloaded = true;
-        break;
-      }
-    }
+    const auto reloaded = test::waitUntil(
+        [&] {
+          test::service(processor);
+          const auto status = processor.workerStatus();
+          const auto output = processFirstFrame(processor);
+          return status.revision > revision && status.active &&
+                 !status.compiling && std::abs(output.first - 0.2F) < 5.0e-4F &&
+                 std::abs(output.second - 0.6F) < 5.0e-4F;
+        },
+        test::yieldToWorker);
     if (!reloaded) {
       std::cerr << "audio-file change did not trigger an engine replacement\n";
       return false;
@@ -1898,8 +1887,8 @@ sample {
 
     processor.clearBuffer("clip");
     const auto fallback = processFirstFrame(processor);
-    if (std::abs(fallback.first - 1.0F) >= 1.0e-6F ||
-        std::abs(fallback.second - 1.0F) >= 1.0e-6F) {
+    if (!test::withinTolerance(fallback.first - 1.0F, 1.0e-6F) ||
+        !test::withinTolerance(fallback.second - 1.0F, 1.0e-6F)) {
       std::cerr << "clearing a buffer did not deactivate the engine\n";
       return false;
     }
@@ -1920,8 +1909,8 @@ sample {
     const auto output = processFirstFrame(restored);
     if (status.buffers.size() != 1U ||
         status.buffers[0].loadedPath != audioFile.path() ||
-        std::abs(output.first - 0.2F) >= 5.0e-4F ||
-        std::abs(output.second - 0.6F) >= 5.0e-4F) {
+        !test::withinTolerance(output.first - 0.2F, 5.0e-4F) ||
+        !test::withinTolerance(output.second - 0.6F, 5.0e-4F)) {
       std::cerr << "buffer path did not restore from plugin state\n";
       return false;
     }
@@ -1935,8 +1924,9 @@ sample {
     restored.prepareToPlay(48'000.0, 8);
     const auto status = waitForBufferStatus(restored, true);
     const auto output = processFirstFrame(restored);
-    if (status.usingProjectImage || std::abs(output.first - 0.2F) >= 5.0e-4F ||
-        std::abs(output.second - 0.6F) >= 5.0e-4F) {
+    if (status.usingProjectImage ||
+        !test::withinTolerance(output.first - 0.2F, 5.0e-4F) ||
+        !test::withinTolerance(output.second - 0.6F, 5.0e-4F)) {
       std::cerr << "valid disk buffers did not override embedded state\n";
       return false;
     }
@@ -1955,8 +1945,9 @@ sample {
     restored.prepareToPlay(48'000.0, 8);
     const auto status = waitForBufferStatus(restored, true);
     const auto output = processFirstFrame(restored);
-    if (!status.usingProjectImage || std::abs(output.first - 0.1F) >= 5.0e-4F ||
-        std::abs(output.second - 0.5F) >= 5.0e-4F) {
+    if (!status.usingProjectImage ||
+        !test::withinTolerance(output.first - 0.1F, 5.0e-4F) ||
+        !test::withinTolerance(output.second - 0.5F, 5.0e-4F)) {
       std::cerr
           << "portable state did not restore source and buffer checkpoint\n";
       return false;
@@ -1981,9 +1972,10 @@ sample {
         viewBuffer->getProperty("loadedPath").toString().isNotEmpty() ||
         static_cast<int>(viewBuffer->getProperty("loadedFrames")) != 8 ||
         static_cast<int>(viewBuffer->getProperty("loadedChannels")) != 2 ||
-        std::abs(
+        !test::withinTolerance(
             static_cast<double>(viewBuffer->getProperty("loadedSampleRate")) -
-            48'000.0) >= 1.0e-6) {
+                48'000.0,
+            1.0e-6)) {
       std::cerr << "run view did not expose embedded project-buffer metadata\n";
       return false;
     }
@@ -1993,29 +1985,28 @@ sample {
         ("onda-portable-buffer-project-" +
          std::to_string(
              std::chrono::steady_clock::now().time_since_epoch().count()));
-    const auto saveError =
-        restored.saveProjectAs(juce::File(exportDirectory.string()));
-    auto relinked = false;
-    for (int attempt = 0; attempt < 500; ++attempt) {
-      juce::MessageManager::getInstance()->runDispatchLoopUntil(10);
-      const auto relinkedStatus = restored.workerStatus();
-      if (relinkedStatus.active && !relinkedStatus.compiling &&
-          !relinkedStatus.usingProjectImage &&
-          relinkedStatus.path == exportDirectory / "project.ondaproject" &&
-          relinkedStatus.buffers.size() == 1U &&
-          relinkedStatus.buffers[0].loadedPath.empty() &&
-          relinkedStatus.buffers[0].loadedFrames == 8 &&
-          relinkedStatus.buffers[0].loadedChannels == 2) {
-        relinked = true;
-        break;
-      }
-    }
+    const auto saveError = restored.saveProjectAs(
+        juce::File(onda::plugin::pathToJuce(exportDirectory)));
+    const auto relinked = test::waitUntil(
+        [&] {
+          test::service(restored);
+          const auto relinkedStatus = restored.workerStatus();
+          return relinkedStatus.active && !relinkedStatus.compiling &&
+                 !relinkedStatus.usingProjectImage &&
+                 relinkedStatus.path ==
+                     exportDirectory / "project.ondaproject" &&
+                 relinkedStatus.buffers.size() == 1U &&
+                 relinkedStatus.buffers[0].loadedPath.empty() &&
+                 relinkedStatus.buffers[0].loadedFrames == 8 &&
+                 relinkedStatus.buffers[0].loadedChannels == 2;
+        },
+        test::yieldToWorker);
     const auto relinkedOutput = processFirstFrame(restored);
     std::error_code ignored;
     std::filesystem::remove_all(exportDirectory, ignored);
     if (!saveError.empty() || !relinked ||
-        std::abs(relinkedOutput.first - 0.1F) >= 5.0e-4F ||
-        std::abs(relinkedOutput.second - 0.5F) >= 5.0e-4F) {
+        !test::withinTolerance(relinkedOutput.first - 0.1F, 5.0e-4F) ||
+        !test::withinTolerance(relinkedOutput.second - 0.5F, 5.0e-4F)) {
       std::cerr << "Save Project As did not materialize and relink buffers: "
                 << saveError << '\n';
       return false;
@@ -2029,8 +2020,9 @@ sample {
     restored.prepareToPlay(48'000.0, 8);
     const auto status = waitForBufferStatus(restored, true);
     const auto output = processFirstFrame(restored);
-    if (!status.usingProjectImage || std::abs(output.first - 0.2F) >= 5.0e-4F ||
-        std::abs(output.second - 0.6F) >= 5.0e-4F) {
+    if (!status.usingProjectImage ||
+        !test::withinTolerance(output.first - 0.2F, 5.0e-4F) ||
+        !test::withinTolerance(output.second - 0.6F, 5.0e-4F)) {
       std::cerr << "disk buffer authority did not refresh the checkpoint\n";
       return false;
     }
@@ -2047,7 +2039,8 @@ bool exerciseSourceGraphFallbackAndDiskAuthority() {
   {
     onda::plugin::Processor processor(onda::plugin::Product::effect);
     processor.prepareToPlay(48'000.0, 64);
-    processor.loadFile(juce::File(project.entry().string()), false);
+    processor.loadFile(juce::File(onda::plugin::pathToJuce(project.entry())),
+                       false);
     if (!waitForOutput(processor, 0.25F))
       return false;
     processor.getStateInformation(saved);
@@ -2112,33 +2105,36 @@ bool exerciseProjectExportRelinksAuthority() {
   onda::plugin::Processor processor(onda::plugin::Product::effect);
   StateChangeListener listener(processor);
   processor.prepareToPlay(48'000.0, 64);
-  processor.loadFile(juce::File(project.entry().string()), false);
+  processor.loadFile(juce::File(onda::plugin::pathToJuce(project.entry())),
+                     false);
   if (!waitForOutput(processor, 0.25F)) {
     cleanup();
     return false;
   }
-  juce::MessageManager::getInstance()->runDispatchLoopUntil(100);
+  test::service(processor);
   const auto changes = listener.nonParameterChanges;
-  std::optional<std::string> saveError;
+  const auto saveError = std::make_shared<std::optional<std::string>>();
   if (!processor.saveProjectAsAsync(
-          juce::File(exportRoot.string()),
-          [&saveError](std::string error) { saveError = std::move(error); })) {
+          juce::File(onda::plugin::pathToJuce(exportRoot)),
+          [saveError](std::string error) { *saveError = std::move(error); })) {
     std::cerr << "Save Project As could not start asynchronously\n";
     cleanup();
     return false;
   }
-  for (int attempt = 0; attempt < 500 && !saveError; ++attempt)
-    juce::MessageManager::getInstance()->runDispatchLoopUntil(10);
-  if (!saveError || !saveError->empty() || !waitForOutput(processor, 0.25F) ||
+  const auto exportCompleted =
+      test::waitForMessage([&] { return saveError->has_value(); });
+  if (!exportCompleted || !saveError->value().empty() ||
+      !waitForOutput(processor, 0.25F) ||
       processor.workerStatus().path != exportRoot / "project.ondaproject") {
     std::cerr << "Save Project As did not relink the exported disk project: "
-              << (saveError ? *saveError : "timed out") << '\n';
+              << (saveError->has_value() ? saveError->value() : "timed out")
+              << '\n';
     cleanup();
     return false;
   }
 
   processor.prepareToPlay(48'000.0, 64);
-  juce::MessageManager::getInstance()->runDispatchLoopUntil(100);
+  test::service(processor);
   if (listener.nonParameterChanges <= changes) {
     std::cerr << "project export relinking did not mark host state dirty\n";
     cleanup();
@@ -2171,7 +2167,8 @@ bool exerciseExtendedMidi() {
 
   onda::plugin::Processor processor(onda::plugin::Product::instrument);
   processor.prepareToPlay(48'000.0, 8);
-  processor.loadFile(juce::File(source.path().string()), false);
+  processor.loadFile(juce::File(onda::plugin::pathToJuce(source.path())),
+                     false);
   if (!waitForPublishedReplacement(processor)) {
     std::cerr << "extended MIDI instrument did not become active\n";
     return false;
@@ -2187,7 +2184,8 @@ bool exerciseExtendedMidi() {
                           : frame < 5 ? 64.0F / 127.0F
                                       : 63.0F / 127.0F;
     for (int channel = 0; channel < audio.getNumChannels(); ++channel) {
-      if (std::abs(audio.getSample(channel, frame) - expected) >= 1.0e-5F) {
+      if (!test::withinTolerance(audio.getSample(channel, frame) - expected,
+                                 1.0e-5F)) {
         std::cerr << "poly pressure or program change scheduling failed\n";
         return false;
       }
@@ -2203,7 +2201,8 @@ bool exerciseMidiKeyboardMonitor() {
 
   onda::plugin::Processor processor(onda::plugin::Product::instrument);
   processor.prepareToPlay(48'000.0, 8);
-  processor.loadFile(juce::File(source.path().string()), false);
+  processor.loadFile(juce::File(onda::plugin::pathToJuce(source.path())),
+                     false);
   if (!waitForOutput(processor, 0.25F, 8)) {
     std::cerr << "MIDI keyboard monitor instrument did not become active\n";
     return false;
@@ -2277,7 +2276,8 @@ bool exerciseEventMetadataGating() {
   onda::plugin::Processor processor(onda::plugin::Product::effect);
   processor.setPlayHead(&playHead);
   processor.prepareToPlay(48'000.0, 8);
-  processor.loadFile(juce::File(source.path().string()), false);
+  processor.loadFile(juce::File(onda::plugin::pathToJuce(source.path())),
+                     false);
   if (!waitForPublishedReplacement(processor)) {
     std::cerr << "metadata-gating effect did not become active\n";
     return false;
@@ -2318,7 +2318,8 @@ bool exerciseHostContext() {
   onda::plugin::Processor processor(onda::plugin::Product::effect);
   processor.setPlayHead(&playHead);
   processor.prepareToPlay(48'000.0, 8);
-  processor.loadFile(juce::File(source.path().string()), false);
+  processor.loadFile(juce::File(onda::plugin::pathToJuce(source.path())),
+                     false);
   if (!waitForPublishedReplacement(processor)) {
     std::cerr << "host-context effect did not become active: "
               << processor.workerStatus().message << '\n';
@@ -2334,8 +2335,10 @@ bool exerciseHostContext() {
   }
   constexpr auto firstExpected = 0.8022F;
   for (int frame = 0; frame < firstAudio.getNumSamples(); ++frame) {
-    if (std::abs(firstAudio.getSample(0, frame) - firstExpected) >= 1.0e-5F ||
-        std::abs(firstAudio.getSample(1, frame) - 0.1F) >= 1.0e-6F) {
+    if (!test::withinTolerance(firstAudio.getSample(0, frame) - firstExpected,
+                               1.0e-5F) ||
+        !test::withinTolerance(firstAudio.getSample(1, frame) - 0.1F,
+                               1.0e-6F)) {
       std::cerr << "available host context was not dispatched at BEGIN_BLOCK\n";
       return false;
     }
@@ -2364,8 +2367,10 @@ bool exerciseHostContext() {
   for (int frame = 0; frame < secondAudio.getNumSamples(); ++frame) {
     const auto expected = frame < 2 ? firstExpected : projectedExpected;
     const auto expectedSample = frame < 2 ? 0.1F : 0.102F;
-    if (std::abs(secondAudio.getSample(0, frame) - expected) >= 1.0e-5F ||
-        std::abs(secondAudio.getSample(1, frame) - expectedSample) >= 1.0e-6F) {
+    if (!test::withinTolerance(secondAudio.getSample(0, frame) - expected,
+                               1.0e-5F) ||
+        !test::withinTolerance(secondAudio.getSample(1, frame) - expectedSample,
+                               1.0e-6F)) {
       std::cerr << "host context projection, availability, render mode, or "
                    "MIDI ordering failed\n";
       return false;
@@ -2412,7 +2417,8 @@ bool exerciseTimelineProjection() {
         playHead.setPosition(position);
         onda::plugin::Processor processor(onda::plugin::Product::effect);
         processor.setPlayHead(&playHead);
-        processor.loadFile(juce::File(source.path().string()), false);
+        processor.loadFile(juce::File(onda::plugin::pathToJuce(source.path())),
+                           false);
         processor.prepareToPlay(48'000.0, 8);
         if (!processor.workerStatus().active)
           return false;
@@ -2443,7 +2449,8 @@ bool exerciseExplicitReset() {
 
   onda::plugin::Processor processor(onda::plugin::Product::effect);
   processor.prepareToPlay(48'000.0, 64);
-  processor.loadFile(juce::File(source.path().string()), false);
+  processor.loadFile(juce::File(onda::plugin::pathToJuce(source.path())),
+                     false);
   if (!waitForOutput(processor, 0.5F))
     return false;
 
@@ -2458,7 +2465,7 @@ bool exerciseExplicitReset() {
     std::fill_n(audio.getWritePointer(channel), audio.getNumSamples(), 1.0F);
   processor.processBlock(audio, midi);
   const auto changedState = 0.8F * (64.0F / 127.0F);
-  if (std::abs(audio.getSample(0, 0) - changedState) >= 1.0e-5F) {
+  if (!test::withinTolerance(audio.getSample(0, 0) - changedState, 1.0e-5F)) {
     std::cerr << "reset test did not establish modified instance state\n";
     return false;
   }
@@ -2466,12 +2473,12 @@ bool exerciseExplicitReset() {
   processor.resetParametersToDefaults();
   const auto parameterResetOutput = 0.25F * (64.0F / 127.0F);
   if (!waitForOutput(processor, parameterResetOutput) ||
-      std::abs(processor.slotValue(0) - 0.25F) >= 1.0e-6F) {
+      !test::withinTolerance(processor.slotValue(0) - 0.25F, 1.0e-6F)) {
     std::cerr << "parameter reset did not restore the declared default\n";
     return false;
   }
   for (std::size_t index = 1; index < onda::plugin::slotCount; ++index) {
-    if (std::abs(processor.slotValue(index) - 0.5F) >= 1.0e-6F) {
+    if (!test::withinTolerance(processor.slotValue(index) - 0.5F, 1.0e-6F)) {
       std::cerr << "parameter reset did not restore an unmapped host slot\n";
       return false;
     }
@@ -2483,13 +2490,13 @@ bool exerciseExplicitReset() {
 
   processor.requestUserReset();
   if (!waitForOutput(processor, 0.25F) ||
-      std::abs(processor.slotValue(0) - 0.25F) >= 1.0e-6F) {
+      !test::withinTolerance(processor.slotValue(0) - 0.25F, 1.0e-6F)) {
     std::cerr
         << "explicit Reset did not restore parameters and instance state\n";
     return false;
   }
   for (std::size_t index = 1; index < onda::plugin::slotCount; ++index) {
-    if (std::abs(processor.slotValue(index) - 0.5F) >= 1.0e-6F) {
+    if (!test::withinTolerance(processor.slotValue(index) - 0.5F, 1.0e-6F)) {
       std::cerr << "explicit Reset did not restore an unmapped host slot\n";
       return false;
     }
@@ -2509,7 +2516,7 @@ sample { out1 = held; out2 = held }
 
   using namespace onda::plugin;
   Processor processor(Product::effect);
-  processor.loadFile(juce::File(source.path().string()), true);
+  processor.loadFile(juce::File(onda::plugin::pathToJuce(source.path())), true);
   processor.prepareToPlay(48'000.0, 64);
   // The new value has not reached the instance through processing yet.
   processor.setSlotValue(0, 0.8F);
@@ -2520,7 +2527,7 @@ sample { out1 = held; out2 = held }
   }
   processor.requestUserReset();
   if (!processWithoutAllocation(processor, 0.25F) ||
-      std::abs(processor.slotValue(0) - 0.25F) >= 1.0e-6F) {
+      !test::withinTolerance(processor.slotValue(0) - 0.25F, 1.0e-6F)) {
     std::cerr << "user reset initializer did not read parameter defaults\n";
     return false;
   }
@@ -2546,7 +2553,8 @@ sample {
 
   using namespace onda::plugin;
   Processor processor(Product::effect);
-  processor.loadFile(juce::File(source.path().string()), false);
+  processor.loadFile(juce::File(onda::plugin::pathToJuce(source.path())),
+                     false);
   processor.prepareToPlay(48'000.0, 64);
   // Audit a successful reset before sample processing changes pinned state.
   processor.reset();
@@ -2606,7 +2614,8 @@ bool exerciseReplacementDuringRuntimeFailure() {
       return false;
     }
     Processor processor(Product::effect);
-    processor.loadFile(juce::File(source.path().string()), false);
+    processor.loadFile(juce::File(onda::plugin::pathToJuce(source.path())),
+                       false);
     processor.prepareToPlay(48'000.0, 64);
     if (!processWithoutAllocation(
             processor, failure == Failure::process ? 1.0F : 0.25F)) {
@@ -2634,7 +2643,8 @@ bool exerciseReplacementDuringRuntimeFailure() {
     }
     auto published = false;
     if (playhead.entered.load(std::memory_order_acquire)) {
-      processor.loadFile(juce::File(replacement.path().string()), false);
+      processor.loadFile(
+          juce::File(onda::plugin::pathToJuce(replacement.path())), false);
       while (std::chrono::steady_clock::now() < deadline) {
         const auto status = processor.workerStatus();
         if (status.active && !status.compiling &&
@@ -2666,7 +2676,8 @@ bool exerciseSupersededHandoff() {
 
   onda::plugin::Processor processor(onda::plugin::Product::effect);
   processor.prepareToPlay(48'000.0, 64);
-  processor.loadFile(juce::File(source.path().string()), false);
+  processor.loadFile(juce::File(onda::plugin::pathToJuce(source.path())),
+                     false);
   if (!waitForPublishedReplacement(processor)) {
     std::cerr << "initial replacement was not published\n";
     return false;
@@ -2674,7 +2685,8 @@ bool exerciseSupersededHandoff() {
 
   if (!source.write("this is not valid Onda source\n"))
     return false;
-  processor.loadFile(juce::File(source.path().string()), false);
+  processor.loadFile(juce::File(onda::plugin::pathToJuce(source.path())),
+                     false);
 
   juce::AudioBuffer<float> audio(2, 64);
   juce::MidiBuffer midi;
@@ -2683,7 +2695,8 @@ bool exerciseSupersededHandoff() {
   processor.processBlock(audio, midi);
   for (int channel = 0; channel < audio.getNumChannels(); ++channel) {
     for (int frame = 0; frame < audio.getNumSamples(); ++frame) {
-      if (std::abs(audio.getSample(channel, frame) - 1.0F) >= 1.0e-6F) {
+      if (!test::withinTolerance(audio.getSample(channel, frame) - 1.0F,
+                                 1.0e-6F)) {
         std::cerr << "superseded replacement became active\n";
         return false;
       }
@@ -2698,20 +2711,24 @@ bool exerciseSupersededHandoff() {
   // interface, not those of the superseded replacement.
   if (!source.write(validSource(onda::plugin::Product::effect)))
     return false;
-  processor.loadFile(juce::File(source.path().string()), false);
+  processor.loadFile(juce::File(onda::plugin::pathToJuce(source.path())),
+                     false);
   if (!waitForOutput(processor, 0.25F))
     return false;
   const auto running = processor.workerStatus();
   if (!source.write(
           "outs { out1, out2 }\nsample { out1 = 0.75; out2 = 0.75 }\n"))
     return false;
-  processor.loadFile(juce::File(source.path().string()), false);
+  processor.loadFile(juce::File(onda::plugin::pathToJuce(source.path())),
+                     false);
   if (!waitForPublishedReplacement(processor))
     return false;
   if (!source.write("this is not valid Onda source\n"))
     return false;
-  processor.loadFile(juce::File(source.path().string()), false);
-  for (int attempt = 0; attempt < 500; ++attempt) {
+  processor.loadFile(juce::File(onda::plugin::pathToJuce(source.path())),
+                     false);
+  const auto deadline = std::chrono::steady_clock::now() + test::waitTimeout;
+  while (std::chrono::steady_clock::now() < deadline) {
     for (int channel = 0; channel < audio.getNumChannels(); ++channel)
       std::fill_n(audio.getWritePointer(channel), audio.getNumSamples(), 1.0F);
     processor.processBlock(audio, midi);
@@ -2721,7 +2738,7 @@ bool exerciseSupersededHandoff() {
       if (!status.active ||
           status.engineGeneration != running.engineGeneration ||
           status.mappings.size() != running.mappings.size() ||
-          std::abs(audio.getSample(0, 0) - 0.25F) >= 1.0e-5F) {
+          !test::withinTolerance(audio.getSample(0, 0) - 0.25F, 1.0e-5F)) {
         std::cerr << "superseded replacement displaced the running interface\n";
         return false;
       }
@@ -2737,7 +2754,8 @@ bool exerciseSupersededHandoff() {
       }
       return true;
     }
-    juce::MessageManager::getInstance()->runDispatchLoopUntil(10);
+    test::service(processor);
+    test::yieldToWorker();
   }
   std::cerr << "superseded replacement failure did not finish\n";
   return false;
@@ -2761,14 +2779,16 @@ bool exerciseSeededHandoff() {
         return false;
 
       Processor processor(product);
-      processor.loadFile(juce::File(first.path().string()), true);
+      processor.loadFile(juce::File(onda::plugin::pathToJuce(first.path())),
+                         true);
       processor.prepareToPlay(48'000.0, 64);
       processor.setSlotValue(0, 0.4F);
       if (!processWithoutAllocation(processor, 0.4F))
         return false;
       const auto firstGeneration = processor.workerStatus().engineGeneration;
 
-      processor.loadFile(juce::File(replacement.path().string()), true);
+      processor.loadFile(
+          juce::File(onda::plugin::pathToJuce(replacement.path())), true);
       if (!waitForPublishedReplacement(processor))
         return false;
       const auto replacementGeneration =
@@ -2776,14 +2796,15 @@ bool exerciseSeededHandoff() {
       // Neither publication nor saving may write B's defaults into A's slots.
       juce::MemoryBlock pending;
       processor.getStateInformation(pending);
-      if (std::abs(processor.slotValue(0) - 0.4F) >= 1.0e-6F)
+      if (!test::withinTolerance(processor.slotValue(0) - 0.4F, 1.0e-6F))
         return false;
       if (adoptReplacement && !processWithoutAllocation(processor, 0.75F)) {
         std::cerr << "adopted replacement did not use its unseeded defaults\n";
         return false;
       }
 
-      processor.loadFile(juce::File(invalid.path().string()), true);
+      processor.loadFile(juce::File(onda::plugin::pathToJuce(invalid.path())),
+                         true);
       const auto expected = adoptReplacement ? 0.75F : 0.4F;
       // Exercise a callback immediately after cancellation, before waiting
       // for compilation or allowing the parameter-seeding timer to run.
@@ -2792,13 +2813,13 @@ bool exerciseSeededHandoff() {
         return false;
       }
       processor.prepareToPlay(48'000.0, 64);
-      juce::MessageManager::getInstance()->runDispatchLoopUntil(100);
+      test::service(processor);
       const auto status = processor.workerStatus();
       if (!status.active ||
-          status.engineGeneration != (adoptReplacement ? replacementGeneration
-                                                       : firstGeneration) ||
+          status.engineGeneration !=
+              (adoptReplacement ? replacementGeneration : firstGeneration) ||
           !processWithoutAllocation(processor, expected) ||
-          std::abs(processor.slotValue(0) - expected) >= 1.0e-6F) {
+          !test::withinTolerance(processor.slotValue(0) - expected, 1.0e-6F)) {
         std::cerr << "failed selection lost the committed engine or parameters\n";
         return false;
       }
@@ -2838,7 +2859,7 @@ bool exerciseReplacementDuringSeeding() {
   processor.prepareToPlay(48'000.0, 64);
   processor.setSlotValue(0, 0.4F);
   processor.setSlotValue(1, 0.1F);
-  processor.loadFile(juce::File(source.path().string()), true);
+  processor.loadFile(juce::File(onda::plugin::pathToJuce(source.path())), true);
   if (!waitForPublishedReplacement(processor) ||
       !processWithoutAllocation(processor, 1.0F))
     return false;
@@ -2859,17 +2880,18 @@ bool exerciseReplacementDuringSeeding() {
   listener.callback = [&] {
     if (!processWithoutAllocation(processor, 1.0F))
       return;
-    processor.loadFile(juce::File(replacement.path().string()), false);
+    processor.loadFile(juce::File(onda::plugin::pathToJuce(replacement.path())),
+                       false);
     succeeded = waitForPublishedReplacement(processor) &&
                 processWithoutAllocation(processor, 2.0F);
   };
   auto *parameter = processor.getParameters()[0];
   parameter->addListener(&listener);
-  juce::MessageManager::getInstance()->runDispatchLoopUntil(100);
+  test::service(processor);
   parameter->removeListener(&listener);
   if (!listener.called || !succeeded ||
-      std::abs(processor.slotValue(0) - 0.25F) >= 1.0e-6F ||
-      std::abs(processor.slotValue(1) - 0.75F) >= 1.0e-6F ||
+      !test::withinTolerance(processor.slotValue(0) - 0.25F, 1.0e-6F) ||
+      !test::withinTolerance(processor.slotValue(1) - 0.75F, 1.0e-6F) ||
       !processWithoutAllocation(processor, 2.0F)) {
     std::cerr << "replacement observed partially applied host defaults (callback "
               << listener.called << ", success " << succeeded << ", slots "
@@ -2914,7 +2936,8 @@ bool exerciseHostPreparation() {
     Processor original(product);
     if (std::fpclassify(original.getTailLengthSeconds()) != FP_ZERO)
       return false;
-    original.loadFile(juce::File(source.path().string()), true);
+    original.loadFile(juce::File(onda::plugin::pathToJuce(source.path())),
+                      true);
     original.prepareToPlay(48'000.0, 64);
     if (!rendersImmediately(original, 64, 0.25F) ||
         !std::isinf(original.getTailLengthSeconds()))
@@ -2974,7 +2997,8 @@ bool exerciseHostPreparation() {
   Processor seeded(Product::effect);
   seeded.prepareToPlay(48'000.0, 64);
   seeded.setSlotValue(0, 0.9F);
-  seeded.loadFile(juce::File(seededSource.path().string()), true);
+  seeded.loadFile(juce::File(onda::plugin::pathToJuce(seededSource.path())),
+                  true);
   if (!waitForPublishedReplacement(seeded))
     return false;
   seeded.prepareToPlay(48'000.0, 64);
@@ -2986,7 +3010,7 @@ bool exerciseHostPreparation() {
   if (!invalid.write("invalid source\n"))
     return false;
   Processor failed(Product::effect);
-  failed.loadFile(juce::File(invalid.path().string()), true);
+  failed.loadFile(juce::File(onda::plugin::pathToJuce(invalid.path())), true);
   failed.prepareToPlay(48'000.0, 64);
   return !failed.workerStatus().active && rendersImmediately(failed, 64, 1.0F);
 }
@@ -3004,7 +3028,7 @@ sample { out1 = held; out2 = pinned }
     return false;
   Processor original(Product::effect);
   original.setSlotValue(0, 0.8F);
-  original.loadFile(juce::File(source.path().string()), false);
+  original.loadFile(juce::File(onda::plugin::pathToJuce(source.path())), false);
   original.prepareToPlay(48'000.0, 64);
   if (!processWithoutAllocation(original, 0.8F)) {
     std::cerr << "initial preparation ignored current host parameters\n";
@@ -3064,12 +3088,12 @@ sample { out1 = held; out2 = pinned }
   Processor seeded(Product::effect);
   seeded.prepareToPlay(48'000.0, 64);
   seeded.setSlotValue(0, 0.9F);
-  seeded.loadFile(juce::File(source.path().string()), true);
+  seeded.loadFile(juce::File(onda::plugin::pathToJuce(source.path())), true);
   if (!waitForPublishedReplacement(seeded))
     return false;
   seeded.prepareToPlay(96'000.0, 128);
   if (!rendersImmediately(seeded, 128, 0.25F) ||
-      std::abs(seeded.slotValue(0) - 0.25F) >= 1.0e-6F) {
+      !test::withinTolerance(seeded.slotValue(0) - 0.25F, 1.0e-6F)) {
     std::cerr << "superseding a queued build lost default initialization\n";
     return false;
   }
@@ -3087,7 +3111,8 @@ bool exerciseStateSaveDuringNotification() {
       return false;
     Processor processor(Product::effect);
     processor.prepareToPlay(48'000.0, 64);
-    processor.loadFile(juce::File(source.path().string()), true);
+    processor.loadFile(juce::File(onda::plugin::pathToJuce(source.path())),
+                       true);
     if (!waitForPublishedReplacement(processor))
       return false;
     class Listener final : public juce::AudioProcessorParameter::Listener {
@@ -3108,7 +3133,7 @@ bool exerciseStateSaveDuringNotification() {
     } else if (mode == 1) {
       if (!processWithoutAllocation(processor, 1.0F))
         return false;
-      juce::MessageManager::getInstance()->runDispatchLoopUntil(100);
+      test::service(processor);
     } else if (mode == 2) {
       processor.setNonRealtime(true);
       if (!rendersImmediately(processor, 64, 1.0F))
@@ -3127,8 +3152,8 @@ bool exerciseStateSaveDuringNotification() {
                                 static_cast<int>(listener.saved.getSize()));
     restored.prepareToPlay(48'000.0, 64);
     if (!rendersImmediately(restored, 64, 1.0F) ||
-        std::abs(restored.slotValue(0) - 0.25F) >= 1.0e-6F ||
-        std::abs(restored.slotValue(1) - 0.75F) >= 1.0e-6F)
+        !test::withinTolerance(restored.slotValue(0) - 0.25F, 1.0e-6F) ||
+        !test::withinTolerance(restored.slotValue(1) - 0.75F, 1.0e-6F))
       return false;
   }
   return true;
@@ -3144,14 +3169,14 @@ bool exerciseFailedSelectionReconfiguration() {
       !broken.write("this is not valid Onda"))
     return false;
   Processor processor(Product::effect);
-  processor.loadFile(juce::File(source.path().string()), true);
+  processor.loadFile(juce::File(onda::plugin::pathToJuce(source.path())), true);
   processor.prepareToPlay(48'000.0, 64);
   if (!rendersImmediately(processor, 64, 0.25F))
     return false;
   processor.setSlotValue(0, 0.6F);
   juce::MemoryBlock checkpoint;
   processor.getStateInformation(checkpoint);
-  processor.loadFile(juce::File(broken.path().string()), true);
+  processor.loadFile(juce::File(onda::plugin::pathToJuce(broken.path())), true);
   processor.prepareToPlay(48'000.0, 64);
   if (!rendersImmediately(processor, 64, 0.25F))
     return false;
@@ -3193,7 +3218,7 @@ sample { out1 = held; out2 = pinned }
   original.prepareToPlay(48'000.0, 64);
   original.setSlotValue(0, 0.9F);
   original.setSlotValue(slotCount - 1U, 0.7F);
-  original.loadFile(juce::File(source.path().string()), true);
+  original.loadFile(juce::File(onda::plugin::pathToJuce(source.path())), true);
   if (!waitForPublishedReplacement(original))
     return false;
 
@@ -3204,7 +3229,7 @@ sample { out1 = held; out2 = pinned }
       original.requestReload();
     juce::MemoryBlock saved;
     original.getStateInformation(saved);
-    if (std::abs(original.slotValue(0) - 0.9F) >= 1.0e-6F) {
+    if (!test::withinTolerance(original.slotValue(0) - 0.9F, 1.0e-6F)) {
       std::cerr << "saving state unexpectedly applied pending defaults\n";
       return false;
     }
@@ -3213,7 +3238,8 @@ sample { out1 = held; out2 = pinned }
                                  static_cast<int>(saved.getSize()));
     restored.prepareToPlay(48'000.0, 64);
     if (!processWithoutAllocation(restored, 0.25F) ||
-        std::abs(restored.slotValue(slotCount - 1U) - 0.7F) >= 1.0e-6F) {
+        !test::withinTolerance(restored.slotValue(slotCount - 1U) - 0.7F,
+                               1.0e-6F)) {
       std::cerr << "saved checkpoint lost pending defaults or unmapped slots\n";
       return false;
     }
@@ -3249,7 +3275,7 @@ sample { out1 = gain; out2 = gain }
 )") || !clip.write(0.375F, 0.375F))
     return false;
   Processor processor(Product::effect);
-  processor.loadFile(juce::File(source.path().string()), true);
+  processor.loadFile(juce::File(onda::plugin::pathToJuce(source.path())), true);
   processor.prepareToPlay(48'000.0, 64);
   if (!rendersImmediately(processor, 64, 0.25F))
     return false;
@@ -3301,7 +3327,8 @@ sample { out1 = clip[0, 0] + extra[0, 0]; out2 = clip[0, 0] + extra[0, 0] }
                           &BufferMapping::name) ==
         selectable.bufferChoices().end())
       return false;
-    processor.bindBufferFile(name, juce::File(clip.path().string()));
+    processor.bindBufferFile(name,
+                             juce::File(onda::plugin::pathToJuce(clip.path())));
     processor.prepareToPlay(48'000.0, 64);
     if (index == 0) {
       const auto partial = processor.workerStatus();
@@ -3316,7 +3343,8 @@ sample { out1 = clip[0, 0] + extra[0, 0]; out2 = clip[0, 0] + extra[0, 0] }
       processor.getStateInformation(retained);
       if (retained != checkpoint || !rendersImmediately(processor, 64, 0.25F))
         return false;
-      processor.bindBufferFile(name, juce::File(clip.path().string()));
+      processor.bindBufferFile(
+          name, juce::File(onda::plugin::pathToJuce(clip.path())));
       processor.prepareToPlay(48'000.0, 64);
     }
   }
@@ -3339,7 +3367,8 @@ bool exerciseAutomaticEventReplacement() {
                     "sample { out1 = held; out2 = held }\n"))
     return false;
   Processor processor(Product::effect);
-  processor.loadFile(juce::File(source.path().string()), false);
+  processor.loadFile(juce::File(onda::plugin::pathToJuce(source.path())),
+                     false);
   processor.prepareToPlay(48'000.0, 64);
   if (!rendersImmediately(processor, 64, 0.125F))
     return false;
@@ -3364,6 +3393,42 @@ bool exerciseAutomaticEventReplacement() {
          rendersImmediately(processor, 64, 0.875F);
 }
 
+// This is intentionally the integration test for real timer delivery. Semantic
+// tests service updates explicitly and must not inherit a timer latency budget.
+bool exerciseMessageThreadDelivery() {
+  using namespace onda::plugin;
+  TemporarySource source;
+  if (!source.write("outs { out1, out2 }\n"
+                    "params { gain = 0.75 { 0.0, 1.0 } }\n"
+                    "init { print(\"timer ready\") }\n"
+                    "sample { out1 = gain; out2 = gain }\n"))
+    return false;
+  Processor processor(Product::effect);
+  processor.prepareToPlay(48'000.0, 64);
+  StateChangeListener listener(processor);
+  processor.loadFile(juce::File(pathToJuce(source.path())), true);
+  if (!waitForPublishedReplacement(processor) ||
+      !processWithoutAllocation(processor, 0.75F))
+    return false;
+  const auto delivered = test::waitForMessage([&] {
+    const auto log = processor.runtimeLogSnapshot();
+    return listener.nonParameterChanges > 0 &&
+           std::abs(processor.slotValue(0) - 0.75F) < 1.0e-6F &&
+           log.records.size() == 1U && log.records[0].text == "timer ready";
+  });
+  if (!delivered) {
+    std::cerr << "message-thread timer did not deliver project, parameter, "
+                 "and log updates (changes "
+              << listener.nonParameterChanges << ", slot "
+              << processor.slotValue(0) << ", log records "
+              << processor.runtimeLogSnapshot().records.size() << ")\n";
+    return false;
+  }
+  const auto changes = listener.nonParameterChanges;
+  processor.unload();
+  return listener.waitForChangeSince(changes);
+}
+
 bool exerciseProjectDirtyNotifications() {
   using namespace onda::plugin;
   TemporarySource source;
@@ -3371,9 +3436,10 @@ bool exerciseProjectDirtyNotifications() {
     return false;
   Processor processor(Product::effect);
   StateChangeListener listener(processor);
-  processor.loadFile(juce::File(source.path().string()), true);
+  processor.loadFile(juce::File(onda::plugin::pathToJuce(source.path())), true);
   processor.prepareToPlay(48'000.0, 64);
-  if (!listener.waitForChangeSince(0)) {
+  test::service(processor);
+  if (listener.nonParameterChanges == 0) {
     std::cerr
         << "loading a parameterless project did not mark host state dirty\n";
     return false;
@@ -3385,12 +3451,13 @@ bool exerciseProjectDirtyNotifications() {
       !waitForActiveRevision(processor, previous) ||
       !waitForOutput(processor, 0.75F))
     return false;
-  if (!listener.waitForChangeSince(changes))
+  test::service(processor);
+  if (listener.nonParameterChanges <= changes)
     return false;
   changes = listener.nonParameterChanges;
   processor.requestReload();
   processor.prepareToPlay(48'000.0, 64);
-  juce::MessageManager::getInstance()->runDispatchLoopUntil(100);
+  test::service(processor);
   if (listener.nonParameterChanges != changes) {
     std::cerr << "identical recompilation dirtied host state\n";
     return false;
@@ -3402,13 +3469,14 @@ bool exerciseProjectDirtyNotifications() {
   restored.setStateInformation(state.getData(),
                                static_cast<int>(state.getSize()));
   restored.prepareToPlay(44'100.0, 128);
-  juce::MessageManager::getInstance()->runDispatchLoopUntil(100);
+  test::service(restored);
   if (restoreListener.nonParameterChanges != 0) {
     std::cerr << "restoring host state marked it dirty\n";
     return false;
   }
   processor.unload();
-  return listener.waitForChangeSince(changes);
+  test::service(processor);
+  return listener.nonParameterChanges > changes;
 }
 
 bool exerciseConcurrentStateRestoreAndLogDrain() {
@@ -3424,10 +3492,12 @@ bool exerciseConcurrentStateRestoreAndLogDrain() {
     }
     done.store(true, std::memory_order_release);
   });
-  while (!done.load(std::memory_order_acquire))
-    juce::MessageManager::getInstance()->runDispatchLoopUntil(10);
+  while (!done.load(std::memory_order_acquire)) {
+    test::service(processor);
+    test::yieldToWorker();
+  }
   host.join();
-  juce::MessageManager::getInstance()->runDispatchLoopUntil(100);
+  test::service(processor);
   const auto log = processor.runtimeLogSnapshot();
   return log.records.empty() && log.counters.printOverflow == 0 &&
          log.counters.printTransportDrops == 0 &&
@@ -3470,8 +3540,10 @@ bool exerciseConcurrentInstances() {
   onda::plugin::Processor instrument(onda::plugin::Product::instrument);
   effect.prepareToPlay(48'000.0, 64);
   instrument.prepareToPlay(48'000.0, 64);
-  effect.loadFile(juce::File(effectSource.path().string()), false);
-  instrument.loadFile(juce::File(instrumentSource.path().string()), false);
+  effect.loadFile(juce::File(onda::plugin::pathToJuce(effectSource.path())),
+                  false);
+  instrument.loadFile(
+      juce::File(onda::plugin::pathToJuce(instrumentSource.path())), false);
   if (!waitForOutput(effect, 0.25F) || !waitForOutput(instrument, 0.25F)) {
     std::cerr << "independent plugin instances did not become active\n";
     return false;
@@ -3489,7 +3561,8 @@ bool exerciseConcurrentInstances() {
       processor.processBlock(audio, midi);
       for (int channel = 0; channel < audio.getNumChannels(); ++channel) {
         for (int frame = 0; frame < audio.getNumSamples(); ++frame) {
-          if (std::abs(audio.getSample(channel, frame) - 0.25F) >= 1.0e-5F)
+          if (!test::withinTolerance(audio.getSample(channel, frame) - 0.25F,
+                                     1.0e-5F))
             succeeded.store(false, std::memory_order_relaxed);
         }
       }
@@ -3511,38 +3584,85 @@ bool exerciseConcurrentInstances() {
 
 } // namespace
 
-int main() {
+int main(const int argc, const char *const *argv) {
 #if defined(__linux__)
   std::signal(SIGPIPE, SIG_IGN);
 #endif
   juce::ScopedJuceInitialiser_GUI juceInitialiser;
-  if (!exerciseAlignedAllocation() || !exerciseHostPreparation() ||
-      !exercisePreparedParameterInitialization() ||
-      !exerciseStateSaveDuringNotification() ||
-      !exerciseFailedSelectionReconfiguration() ||
-      !exercisePendingSeedStateSave() ||
-      !exercisePendingBufferBindings() ||
-      !exerciseConcurrentStateRestoreAndLogDrain() ||
-      !exerciseAutomaticEventReplacement() ||
-      !exerciseProjectDirtyNotifications() || !exerciseRunViewAdapter() ||
-      !exerciseScopeCapture() || !exerciseUserEvents() ||
-      !exerciseRuntimeLogging() || !exercise(onda::plugin::Product::effect) ||
-      !exercise(onda::plugin::Product::instrument) || !exerciseStateRestore() ||
-      !exerciseEditorLifecycle() || !exerciseAudioFileBuffers() ||
-      !exerciseProjectBufferOverrideRestore() ||
-      !exerciseIncompleteBufferStateRestore() ||
-      !exerciseSourceGraphFallbackAndDiskAuthority() ||
-      !exerciseProjectExportRelinksAuthority() || !exerciseExtendedMidi() ||
-      !exerciseMidiKeyboardMonitor() || !exerciseEventMetadataGating() ||
-      !exerciseHostContext() || !exerciseTimelineProjection() ||
-      !exerciseExplicitReset() || !exerciseResetParameterInitialization() ||
-      !exerciseResetFailureWithoutAllocation() ||
-      !exerciseReplacementDuringRuntimeFailure() ||
-      !exerciseSupersededHandoff() || !exerciseSeededHandoff() ||
-      !exerciseReplacementDuringSeeding() ||
-      !exerciseConcurrentInstances()) {
-    return 1;
+  struct Case {
+    std::string_view name;
+    bool (*run)();
+  };
+  const Case cases[]{
+      {"AlignedAllocation", exerciseAlignedAllocation},
+      {"HostPreparation", exerciseHostPreparation},
+      {"PreparedParameterInitialization",
+       exercisePreparedParameterInitialization},
+      {"StateSaveDuringNotification", exerciseStateSaveDuringNotification},
+      {"FailedSelectionReconfiguration",
+       exerciseFailedSelectionReconfiguration},
+      {"PendingSeedStateSave", exercisePendingSeedStateSave},
+      {"PendingBufferBindings", exercisePendingBufferBindings},
+      {"ConcurrentStateRestoreAndLogDrain",
+       exerciseConcurrentStateRestoreAndLogDrain},
+      {"AutomaticEventReplacement", exerciseAutomaticEventReplacement},
+      {"MessageThreadDelivery", exerciseMessageThreadDelivery},
+      {"ProjectDirtyNotifications", exerciseProjectDirtyNotifications},
+      {"RunViewAdapter", exerciseRunViewAdapter},
+      {"ScopeCapture", exerciseScopeCapture},
+      {"UserEvents", exerciseUserEvents},
+      {"RuntimeLogging", exerciseRuntimeLogging},
+      {"effect", +[] { return exercise(onda::plugin::Product::effect); }},
+      {"instrument",
+       +[] { return exercise(onda::plugin::Product::instrument); }},
+      {"StateRestore", exerciseStateRestore},
+      {"EditorLifecycle", exerciseEditorLifecycle},
+      {"AudioFileBuffers", exerciseAudioFileBuffers},
+      {"ProjectBufferOverrideRestore", exerciseProjectBufferOverrideRestore},
+      {"IncompleteBufferStateRestore", exerciseIncompleteBufferStateRestore},
+      {"SourceGraphFallbackAndDiskAuthority",
+       exerciseSourceGraphFallbackAndDiskAuthority},
+      {"ProjectExportRelinksAuthority", exerciseProjectExportRelinksAuthority},
+      {"ExtendedMidi", exerciseExtendedMidi},
+      {"MidiKeyboardMonitor", exerciseMidiKeyboardMonitor},
+      {"EventMetadataGating", exerciseEventMetadataGating},
+      {"HostContext", exerciseHostContext},
+      {"TimelineProjection", exerciseTimelineProjection},
+      {"ExplicitReset", exerciseExplicitReset},
+      {"ResetParameterInitialization", exerciseResetParameterInitialization},
+      {"ResetFailureWithoutAllocation", exerciseResetFailureWithoutAllocation},
+      {"ReplacementDuringRuntimeFailure",
+       exerciseReplacementDuringRuntimeFailure},
+      {"SupersededHandoff", exerciseSupersededHandoff},
+      {"SeededHandoff", exerciseSeededHandoff},
+      {"ReplacementDuringSeeding", exerciseReplacementDuringSeeding},
+      {"ConcurrentInstances", exerciseConcurrentInstances},
+  };
+  if (argc > 2) {
+    std::cerr << "usage: onda_processor_tests [case-name]\n";
+    return 2;
   }
-  std::cout << "onda_processor_tests: passed\n";
+  bool selected{};
+  for (const auto &testCase : cases) {
+    if (argc == 2 && testCase.name != argv[1])
+      continue;
+    selected = true;
+    std::cout << "[ RUN      ] " << testCase.name << std::endl;
+    bool passed{};
+    try {
+      passed = testCase.run();
+    } catch (const std::exception &error) {
+      std::cerr << error.what() << '\n';
+    }
+    if (!passed) {
+      std::cerr << "[  FAILED  ] " << testCase.name << std::endl;
+      return 1;
+    }
+    std::cout << "[       OK ] " << testCase.name << std::endl;
+  }
+  if (!selected) {
+    std::cerr << "unknown processor test case\n";
+    return 2;
+  }
   return 0;
 }
