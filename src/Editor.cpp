@@ -73,7 +73,9 @@ constexpr auto juceHostBridgeScript = R"JS(
           }))
         : [],
     }));
-    window._onHostMessage({ type: "state", state: { events } });
+    window._onHostMessage({
+      type: "state", state: { events, resetEventArguments: true },
+    });
   }
 
   window.__hostBridge = { mode: "wry" };
@@ -177,7 +179,7 @@ std::optional<std::size_t> slotIndex(std::string_view name) {
 
 bool hasBuffer(const WorkerStatus &status, const std::string_view name) {
   return std::any_of(
-      status.buffers.begin(), status.buffers.end(),
+      status.bufferChoices().begin(), status.bufferChoices().end(),
       [name](const BufferMapping &buffer) { return buffer.name == name; });
 }
 
@@ -310,6 +312,10 @@ void Editor::publishMidiActivity(const bool force) {
 }
 
 void Editor::publishState(const bool force) {
+  if (!browser_->isVisible()) {
+    hasPublished_ = false;
+    return;
+  }
   const auto revision = processor_.workerStatusRevision();
   const auto logRevision = processor_.runtimeLogRevision();
   std::array<float, slotCount> currentSlots{};
@@ -325,6 +331,8 @@ void Editor::publishState(const bool force) {
   const auto status = processor_.workerStatus();
   const auto resetEventArguments =
       status.engineGeneration != publishedEngineGeneration_;
+  const auto includeRuntimeLog =
+      force || !hasPublished_ || logRevision != publishedLogRevision_;
   publishedEngineGeneration_ = status.engineGeneration;
   publishedRevision_ = status.revision;
   publishedLogRevision_ = logRevision;
@@ -334,7 +342,7 @@ void Editor::publishState(const bool force) {
   browser_->emitEventIfBrowserIsVisible(
       "ondaState",
       makeRunViewState(processor_, status, processor_.canExportProject(),
-                       actionError_, resetEventArguments));
+                       actionError_, resetEventArguments, includeRuntimeLog));
 }
 
 void Editor::publishScope() {

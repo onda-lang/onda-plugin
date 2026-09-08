@@ -403,11 +403,10 @@ bool exerciseExportRelinkConflicts(const onda::plugin::ProjectImage &image,
        {"unload", "load", "restore", "bind", "clear", "reload", "configure"}) {
     SpscSlot<PreparedEngine *> replacements;
     SpscSlot<PreparedEngine *> retirements;
-    std::atomic<bool> deactivate{}, seedPending{};
+    std::atomic<bool> deactivate{};
     bool succeeded = false;
     {
-      Worker worker(Product::effect, replacements, retirements, deactivate,
-                    seedPending);
+      Worker worker(Product::effect, replacements, retirements, deactivate);
       worker.configure(48'000.0, 8);
       worker.restore(source, image, {});
       static_cast<void>(worker.waitForPreparation());
@@ -445,10 +444,90 @@ bool exerciseExportRelinkConflicts(const onda::plugin::ProjectImage &image,
   return true;
 }
 
+bool exerciseDiskRepairDuringFallback() {
+  using namespace onda::plugin;
+  TemporarySource source;
+  source.writeConstantEffect("0.25");
+  const auto initial = PreparedEngine::build(source.path(), Product::effect,
+                                             48'000.0, 8);
+  if (!initial.engine)
+    return false;
+
+  for (const auto fallbackSucceeds : {true, false}) {
+    source.writeInvalid();
+    SpscSlot<PreparedEngine *> replacements;
+    SpscSlot<PreparedEngine *> retirements;
+    std::atomic<bool> deactivate{};
+    std::mutex gateMutex;
+    std::condition_variable gateWake;
+    bool fallbackStarted{};
+    bool releaseFallback{};
+    bool repaired{};
+    {
+      Worker::ProjectBuildFunction gatedFallback =
+          [&](const ProjectImage &image, Product product, double sampleRate,
+              int blockSize, const std::optional<ParameterValues> &parameters) {
+            {
+              std::unique_lock lock(gateMutex);
+              fallbackStarted = true;
+              gateWake.notify_all();
+              if (!gateWake.wait_for(lock, std::chrono::seconds(5),
+                                      [&] { return releaseFallback; })) {
+                return BuildResult{};
+              }
+            }
+            if (fallbackSucceeds)
+              return PreparedEngine::build(image, product, sampleRate,
+                                            blockSize, parameters);
+            BuildResult failure;
+            failure.diagnostic.message = "Injected saved-image build failure";
+            return failure;
+          };
+      Worker worker(Product::effect, replacements, retirements, deactivate,
+                    {}, nullptr, {}, std::move(gatedFallback));
+      worker.configure(48'000.0, 8);
+      worker.restore(source.path(), initial.projectImage, {});
+      bool started;
+      {
+        std::unique_lock lock(gateMutex);
+        started = gateWake.wait_for(lock, std::chrono::seconds(5),
+                                    [&] { return fallbackStarted; });
+      }
+      // The disk post-build check is complete; fallback has not finished.
+      // This repair must remain visible to the next automatic watcher poll.
+      source.writeConstantEffect("0.75");
+      {
+        std::lock_guard lock(gateMutex);
+        releaseFallback = true;
+      }
+      gateWake.notify_all();
+      if (started) {
+        for (int attempt = 0; attempt < 500; ++attempt) {
+          std::unique_ptr<PreparedEngine> replacement{replacements.tryPop()};
+          if (replacement && produces(*replacement, 0.75F)) {
+            repaired = !worker.status().usingProjectImage;
+            break;
+          }
+          std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+      }
+    }
+    delete replacements.tryPop();
+    delete retirements.tryPop();
+    if (!repaired) {
+      std::cerr << "disk repair during "
+                << (fallbackSucceeds ? "successful" : "failed")
+                << " saved-image preparation was not reloaded\n";
+      return false;
+    }
+  }
+  return true;
+}
+
 } // namespace
 
 int main() {
-  if (!exerciseDiagnosticOwnership())
+  if (!exerciseDiagnosticOwnership() || !exerciseDiskRepairDuringFallback())
     return 1;
   auto invalidBytes =
       std::make_shared<const std::vector<std::uint8_t>>(3U, 0xffU);
@@ -600,7 +679,7 @@ int main() {
     return 1;
   }
 
-  if (!runtimeOutput.engine->reset()) {
+  if (!runtimeOutput.engine->reset(slots)) {
     std::cerr << "preserve-pinned reset failed\n";
     return 1;
   }
@@ -759,7 +838,7 @@ int main() {
     }
   }
 
-  if (!instrument.engine->reset()) {
+  if (!instrument.engine->reset(slots)) {
     std::cerr << "instrument reset failed\n";
     return 1;
   }
@@ -818,7 +897,7 @@ int main() {
     }
   }
 
-  if (!instrument.engine->reset()) {
+  if (!instrument.engine->reset(slots)) {
     std::cerr << "instrument reset failed\n";
     return 1;
   }
@@ -1135,7 +1214,6 @@ sample { out1 = in1; out2 = in2 }
   onda::plugin::SpscSlot<onda::plugin::PreparedEngine *> replacements;
   onda::plugin::SpscSlot<onda::plugin::PreparedEngine *> retirements;
   std::atomic<bool> deactivate{};
-  std::atomic<bool> replacementSeedPending{};
   onda::plugin::PreparedEngine *workerEngine{};
   auto handoffBlocker = onda::plugin::PreparedEngine::build(
       source.path(), onda::plugin::Product::effect, 48'000.0, 8);
@@ -1147,8 +1225,7 @@ sample { out1 = in1; out2 = in2 }
   }
   {
     onda::plugin::Worker worker(onda::plugin::Product::effect, replacements,
-                                retirements, deactivate,
-                                replacementSeedPending);
+                                retirements, deactivate);
     worker.configure(48'000.0, 8);
     worker.load(source.path(), true);
 
@@ -1162,18 +1239,20 @@ sample { out1 = in1; out2 = in2 }
     }
 
     workerEngine = waitForReplacement(replacements);
+    if (workerEngine == nullptr || worker.takeSeedValues()) {
+      std::cerr << "unadopted engine exposed host defaults\n";
+      return 1;
+    }
+    worker.setActiveGeneration(workerEngine->buildGeneration());
     const auto seed = worker.takeSeedValues();
-    if (workerEngine == nullptr || !deactivate.load() ||
-        !replacementSeedPending.load() || !seed || seed->count != 1U ||
+    if (deactivate.load() || !seed || seed->count != 1U ||
         seed->revision != worker.requestGeneration() ||
         workerEngine->buildGeneration() != worker.requestGeneration() ||
         !close(seed->values[0], 0.5F)) {
       std::cerr << "worker did not publish the initial engine\n";
       return 1;
     }
-    deactivate.store(false);
-    replacementSeedPending.store(false);
-    worker.setActiveGeneration(workerEngine->buildGeneration());
+    worker.finishSeeding(seed);
 
     source.writeImportedEffect("0.75");
     auto *dependencyReload = waitForReplacement(replacements);
@@ -1253,10 +1332,8 @@ sample { out1 = in1; out2 = in2 }
   onda::plugin::PreparedEngine *unresolvedRecovery{};
   {
     onda::plugin::Worker worker(onda::plugin::Product::effect, replacements,
-                                retirements, deactivate,
-                                replacementSeedPending);
+                                retirements, deactivate);
     deactivate.store(false);
-    replacementSeedPending.store(false);
     worker.configure(48'000.0, 8);
     worker.load(source.path(), false);
     bool observedMissingDependency = false;
@@ -1287,14 +1364,14 @@ sample { out1 = in1; out2 = in2 }
     onda::plugin::SpscSlot<onda::plugin::PreparedEngine *> failureReplacements;
     onda::plugin::SpscSlot<onda::plugin::PreparedEngine *> failureRetirements;
     std::atomic<bool> failureDeactivate{};
-    std::atomic<bool> failureSeedPending{};
     onda::plugin::Worker::BuildFunction failOutsideBuildBoundary =
         [](const std::filesystem::path &, const onda::plugin::Product, double,
-           int, std::span<const onda::plugin::BufferFileBinding>)
+           int, std::span<const onda::plugin::BufferFileBinding>,
+           const std::optional<onda::plugin::ParameterValues> &)
         -> onda::plugin::BuildResult { throw 7; };
     onda::plugin::Worker worker(onda::plugin::Product::effect,
                                 failureReplacements, failureRetirements,
-                                failureDeactivate, failureSeedPending,
+                                failureDeactivate,
                                 std::move(failOutsideBuildBoundary));
     worker.configure(48'000.0, 8);
     worker.load(source.path(), false);
@@ -1320,7 +1397,6 @@ sample { out1 = in1; out2 = in2 }
     onda::plugin::SpscSlot<onda::plugin::PreparedEngine *> raceReplacements;
     onda::plugin::SpscSlot<onda::plugin::PreparedEngine *> raceRetirements;
     std::atomic<bool> raceDeactivate{};
-    std::atomic<bool> raceSeedPending{};
     std::mutex gateMutex;
     std::condition_variable gateWake;
     int buildCalls{};
@@ -1333,7 +1409,8 @@ sample { out1 = in1; out2 = in2 }
         [&](const std::filesystem::path &path,
             const onda::plugin::Product product, const double sampleRate,
             const int blockSize,
-            const std::span<const onda::plugin::BufferFileBinding> bindings) {
+            const std::span<const onda::plugin::BufferFileBinding> bindings,
+            const std::optional<onda::plugin::ParameterValues> &parameters) {
           int call{};
           {
             std::lock_guard lock(gateMutex);
@@ -1341,7 +1418,7 @@ sample { out1 = in1; out2 = in2 }
           }
           if (call == 1) {
             auto result = onda::plugin::PreparedEngine::build(
-                path, product, sampleRate, blockSize, bindings);
+                path, product, sampleRate, blockSize, bindings, parameters);
             std::unique_lock lock(gateMutex);
             firstResultReady = true;
             gateWake.notify_all();
@@ -1354,13 +1431,13 @@ sample { out1 = in1; out2 = in2 }
             gateWake.notify_all();
             gateWake.wait(lock, [&] { return releaseSecond; });
           }
-          return onda::plugin::PreparedEngine::build(path, product, sampleRate,
-                                                     blockSize, bindings);
+          return onda::plugin::PreparedEngine::build(
+              path, product, sampleRate, blockSize, bindings, parameters);
         };
 
     onda::plugin::Worker worker(onda::plugin::Product::effect, raceReplacements,
                                 raceRetirements, raceDeactivate,
-                                raceSeedPending, std::move(gatedBuild));
+                                std::move(gatedBuild));
     worker.configure(48'000.0, 8);
     worker.load(source.path(), false);
     {
@@ -1406,10 +1483,9 @@ sample { out1 = in1; out2 = in2 }
     onda::plugin::SpscSlot<onda::plugin::PreparedEngine *>
         checkpointRetirements;
     std::atomic<bool> checkpointDeactivate{};
-    std::atomic<bool> checkpointSeedPending{};
     onda::plugin::Worker worker(onda::plugin::Product::effect,
                                 checkpointReplacements, checkpointRetirements,
-                                checkpointDeactivate, checkpointSeedPending);
+                                checkpointDeactivate);
     worker.configure(48'000.0, 8);
     worker.load(source.path(), false);
     std::unique_ptr<onda::plugin::PreparedEngine> engine{
@@ -1466,24 +1542,25 @@ sample { out1 = in1; out2 = in2 }
     using namespace onda::plugin;
     SpscSlot<PreparedEngine *> publications;
     SpscSlot<PreparedEngine *> retired;
-    std::atomic<bool> deactivate{}, seedPending{};
+    std::atomic<bool> deactivate{};
     std::mutex gateMutex;
     std::condition_variable gateWake;
     bool blockBuild{}, entered{}, release{};
-    Worker worker(
-        Product::effect, publications, retired, deactivate, seedPending,
-        [&](const auto &path, const auto product, const auto rate,
-            const auto blockSize, const auto bindings) {
-          {
-            std::unique_lock lock(gateMutex);
-            if (blockBuild) {
-              entered = true;
-              gateWake.notify_one();
-              gateWake.wait(lock, [&] { return release; });
-            }
-          }
-          return PreparedEngine::build(path, product, rate, blockSize, bindings);
-        });
+    Worker worker(Product::effect, publications, retired, deactivate,
+                  [&](const auto &path, const auto product, const auto rate,
+                      const auto blockSize, const auto bindings,
+                      const auto &parameters) {
+                    {
+                      std::unique_lock lock(gateMutex);
+                      if (blockBuild) {
+                        entered = true;
+                        gateWake.notify_one();
+                        gateWake.wait(lock, [&] { return release; });
+                      }
+                    }
+                    return PreparedEngine::build(path, product, rate, blockSize,
+                                                 bindings, parameters);
+                  });
     worker.configure(48'000.0, 8);
     worker.load(source.path(), false);
     static_cast<void>(worker.waitForPreparation());
@@ -1533,21 +1610,21 @@ sample { out1 = in1; out2 = in2 }
     onda::plugin::SpscSlot<onda::plugin::PreparedEngine *> watchReplacements;
     onda::plugin::SpscSlot<onda::plugin::PreparedEngine *> watchRetirements;
     std::atomic<bool> watchDeactivate{};
-    std::atomic<bool> watchSeedPending{};
     std::atomic<int> buildCalls{};
     onda::plugin::Worker::BuildFunction countedBuild =
         [&buildCalls](
             const std::filesystem::path &path,
             const onda::plugin::Product product, const double sampleRate,
             const int blockSize,
-            const std::span<const onda::plugin::BufferFileBinding> bindings) {
+            const std::span<const onda::plugin::BufferFileBinding> bindings,
+            const std::optional<onda::plugin::ParameterValues> &parameters) {
           buildCalls.fetch_add(1, std::memory_order_relaxed);
-          return onda::plugin::PreparedEngine::build(path, product, sampleRate,
-                                                     blockSize, bindings);
+          return onda::plugin::PreparedEngine::build(
+              path, product, sampleRate, blockSize, bindings, parameters);
         };
     onda::plugin::Worker worker(
         onda::plugin::Product::effect, watchReplacements, watchRetirements,
-        watchDeactivate, watchSeedPending, std::move(countedBuild));
+        watchDeactivate, std::move(countedBuild));
     worker.configure(48'000.0, 8);
     worker.load(source.path(), false);
     std::unique_ptr<onda::plugin::PreparedEngine> initial{
@@ -1595,9 +1672,7 @@ sample { out1 = in1; out2 = in2 }
     onda::plugin::SpscSlot<onda::plugin::PreparedEngine *> secondReplacements;
     onda::plugin::SpscSlot<onda::plugin::PreparedEngine *> secondRetirements;
     std::atomic<bool> firstDeactivate{};
-    std::atomic<bool> firstSeedPending{};
     std::atomic<bool> secondDeactivate{};
-    std::atomic<bool> secondSeedPending{};
     std::mutex compileGateMutex;
     std::condition_variable compileGateWake;
     int entered{};
@@ -1609,7 +1684,8 @@ sample { out1 = in1; out2 = in2 }
         [&](const std::filesystem::path &path,
             const onda::plugin::Product product, const double sampleRate,
             const int blockSize,
-            const std::span<const onda::plugin::BufferFileBinding> bindings) {
+            const std::span<const onda::plugin::BufferFileBinding> bindings,
+            const std::optional<onda::plugin::ParameterValues> &parameters) {
           {
             std::unique_lock lock(compileGateMutex);
             ++entered;
@@ -1619,7 +1695,7 @@ sample { out1 = in1; out2 = in2 }
             compileGateWake.wait(lock, [&] { return releaseCompiles; });
           }
           auto result = onda::plugin::PreparedEngine::build(
-              path, product, sampleRate, blockSize, bindings);
+              path, product, sampleRate, blockSize, bindings, parameters);
           {
             std::lock_guard lock(compileGateMutex);
             --concurrent;
@@ -1629,11 +1705,10 @@ sample { out1 = in1; out2 = in2 }
         };
 
     onda::plugin::Worker first(onda::plugin::Product::effect, firstReplacements,
-                               firstRetirements, firstDeactivate,
-                               firstSeedPending, countedBuild);
+                               firstRetirements, firstDeactivate, countedBuild);
     onda::plugin::Worker second(
         onda::plugin::Product::effect, secondReplacements, secondRetirements,
-        secondDeactivate, secondSeedPending, countedBuild);
+        secondDeactivate, countedBuild);
     first.configure(48'000.0, 8);
     second.configure(48'000.0, 8);
     first.load(source.path(), false);
@@ -1671,7 +1746,6 @@ sample { out1 = in1; out2 = in2 }
         retirementReplacements;
     onda::plugin::SpscSlot<onda::plugin::PreparedEngine *> retirementQueue;
     std::atomic<bool> retirementDeactivate{};
-    std::atomic<bool> retirementSeedPending{};
     {
       std::lock_guard lock(retirementAuditMutex);
       retirementCount = 0;
@@ -1679,7 +1753,7 @@ sample { out1 = in1; out2 = in2 }
     }
     onda::plugin::Worker worker(
         onda::plugin::Product::effect, retirementReplacements, retirementQueue,
-        retirementDeactivate, retirementSeedPending, {}, observeRetirement);
+        retirementDeactivate, {}, observeRetirement);
     worker.configure(48'000.0, 8);
     worker.load(source.path(), false);
     auto *engine = waitForReplacement(retirementReplacements);

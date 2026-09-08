@@ -371,6 +371,7 @@ add_library(onda_plugin_engine STATIC
     src/Engine.h
     src/OndaSdk.cpp
     src/OndaSdk.h
+    src/Primitive.h
     src/ProjectExport.cpp
     src/ProjectExport.h
     src/Product.h
@@ -390,8 +391,11 @@ target_compile_definitions(onda_plugin_engine PUBLIC
     ONDA_PLUGIN_INPUT_CHANNELS=${ONDA_PLUGIN_INPUT_CHANNELS}
     ONDA_PLUGIN_OUTPUT_CHANNELS=${ONDA_PLUGIN_OUTPUT_CHANNELS}
 )
-set_target_properties(onda_plugin_engine PROPERTIES
+# Keep engine, codec, and embedded-resource symbols private to each module.
+set_target_properties(onda_plugin_engine onda_run_resources PROPERTIES
     CXX_EXTENSIONS OFF
+    CXX_VISIBILITY_PRESET hidden
+    VISIBILITY_INLINES_HIDDEN YES
     POSITION_INDEPENDENT_CODE ON
 )
 

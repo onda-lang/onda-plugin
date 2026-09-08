@@ -2,6 +2,7 @@
 
 #include "JucePath.h"
 #include "Processor.h"
+#include "Primitive.h"
 
 #include <OndaRunResources.h>
 
@@ -70,42 +71,10 @@ juce::var scalarEventValue(const int type, const std::byte *bytes) {
   }
 }
 
-std::size_t eventScalarBytes(const int type) noexcept {
-  switch (type) {
-  case ONDA_PRIMITIVE_BOOL:
-    return 1U;
-  case ONDA_PRIMITIVE_F32:
-  case ONDA_PRIMITIVE_I32:
-    return 4U;
-  case ONDA_PRIMITIVE_F64:
-  case ONDA_PRIMITIVE_I64:
-    return 8U;
-  default:
-    return 0U;
-  }
-}
-
-std::string_view eventScalarName(const int type) noexcept {
-  switch (type) {
-  case ONDA_PRIMITIVE_BOOL:
-    return "bool";
-  case ONDA_PRIMITIVE_F32:
-    return "f32";
-  case ONDA_PRIMITIVE_F64:
-    return "f64";
-  case ONDA_PRIMITIVE_I32:
-    return "i32";
-  case ONDA_PRIMITIVE_I64:
-    return "i64";
-  default:
-    return {};
-  }
-}
-
 juce::var defaultEventValue(const EventParameterMapping &parameter) {
   if (parameter.slice)
     return juce::Array<juce::var>{};
-  const auto scalarBytes = eventScalarBytes(parameter.elementType);
+  const auto scalarBytes = primitiveBytes(parameter.elementType);
   const auto zero =
       parameter.elementType == ONDA_PRIMITIVE_BOOL
           ? juce::var{false}
@@ -130,6 +99,46 @@ juce::var defaultEventValue(const EventParameterMapping &parameter) {
   return values;
 }
 
+void appendRuntimeLog(juce::var &state, const RuntimeLogSnapshot &runtimeLog) {
+  juce::String logText;
+  juce::Array<juce::var> logEntries;
+  logEntries.ensureStorageAllocated(
+      static_cast<int>(runtimeLog.records.size()));
+  for (const auto &record : runtimeLog.records) {
+    logText += juce::String::fromUTF8(record.text.data(),
+                                      static_cast<int>(record.text.size()));
+    logText += "\n";
+    auto entry = object();
+    set(entry, "kind",
+        record.kind == RuntimeLogKind::print ? juce::String{"print"}
+                                             : juce::String{"delegate"});
+    if (!record.sourceFile.empty()) {
+      auto source = object();
+      set(source, "file",
+          juce::String::fromUTF8(record.sourceFile.data(),
+                                 static_cast<int>(record.sourceFile.size())));
+      set(source, "line", static_cast<juce::int64>(record.line));
+      set(entry, "source", std::move(source));
+    }
+    if (!record.lexicalOwner.empty()) {
+      set(entry, "lexicalOwner",
+          juce::String::fromUTF8(record.lexicalOwner.data(),
+                                 static_cast<int>(record.lexicalOwner.size())));
+    }
+    logEntries.add(std::move(entry));
+  }
+  const auto &logCounters = runtimeLog.counters;
+  set(state, "logText", std::move(logText));
+  set(state, "logEntries", std::move(logEntries));
+  set(state, "logRevealed", runtimeLog.revealed);
+  set(state, "printOverflowCount", logCounter(logCounters.printOverflow));
+  set(state, "printTransportDropCount",
+      logCounter(logCounters.printTransportDrops));
+  set(state, "delegateOverflowCount", logCounter(logCounters.delegateOverflow));
+  set(state, "delegateTransportDropCount",
+      logCounter(logCounters.delegateTransportDrops));
+}
+
 } // namespace
 
 std::optional<Resource> runViewResource(const juce::String &request) {
@@ -150,7 +159,8 @@ std::optional<Resource> runViewResource(const juce::String &request) {
 juce::var makeRunViewState(Processor &processor, const WorkerStatus &status,
                            const bool canExportProject,
                            const std::string &actionError,
-                           const bool resetEventArguments) {
+                           const bool resetEventArguments,
+                           const bool includeRuntimeLog) {
   auto state = object();
   set(state, "running", status.active);
   set(state, "connected", status.active);
@@ -194,48 +204,12 @@ juce::var makeRunViewState(Processor &processor, const WorkerStatus &status,
   set(state, "sampleRateHz", processor.hostSampleRate());
   set(state, "blockFrames", processor.hostBlockSize());
 
-  const auto runtimeLog = processor.runtimeLogSnapshot();
-  juce::String logText;
-  juce::Array<juce::var> logEntries;
-  logEntries.ensureStorageAllocated(
-      static_cast<int>(runtimeLog.records.size()));
-  for (const auto &record : runtimeLog.records) {
-    logText += juce::String::fromUTF8(record.text.data(),
-                                      static_cast<int>(record.text.size()));
-    logText += "\n";
-    auto entry = object();
-    set(entry, "kind",
-        record.kind == RuntimeLogKind::print ? juce::String{"print"}
-                                             : juce::String{"delegate"});
-    if (!record.sourceFile.empty()) {
-      auto source = object();
-      set(source, "file",
-          juce::String::fromUTF8(record.sourceFile.data(),
-                                 static_cast<int>(record.sourceFile.size())));
-      set(source, "line", static_cast<juce::int64>(record.line));
-      set(entry, "source", std::move(source));
-    }
-    if (!record.lexicalOwner.empty()) {
-      set(entry, "lexicalOwner",
-          juce::String::fromUTF8(record.lexicalOwner.data(),
-                                 static_cast<int>(record.lexicalOwner.size())));
-    }
-    logEntries.add(std::move(entry));
-  }
-  const auto &logCounters = runtimeLog.counters;
-  set(state, "logText", std::move(logText));
-  set(state, "logEntries", std::move(logEntries));
-  set(state, "logRevealed", runtimeLog.revealed);
-  set(state, "printOverflowCount", logCounter(logCounters.printOverflow));
-  set(state, "printTransportDropCount",
-      logCounter(logCounters.printTransportDrops));
-  set(state, "delegateOverflowCount", logCounter(logCounters.delegateOverflow));
-  set(state, "delegateTransportDropCount",
-      logCounter(logCounters.delegateTransportDrops));
+  if (includeRuntimeLog)
+    appendRuntimeLog(state, processor.runtimeLogSnapshot());
 
   juce::Array<juce::var> buffers;
-  buffers.ensureStorageAllocated(static_cast<int>(status.buffers.size()));
-  for (const auto &mapping : status.buffers) {
+  buffers.ensureStorageAllocated(static_cast<int>(status.bufferChoices().size()));
+  for (const auto &mapping : status.bufferChoices()) {
     auto buffer = object();
     set(buffer, "index", mapping.index);
     set(buffer, "name", juce::String(mapping.name));
@@ -281,7 +255,7 @@ juce::var makeRunViewState(Processor &processor, const WorkerStatus &status,
       set(argument, "name", juce::String(mappingParameter.name));
       set(argument, "type", juce::String(mappingParameter.type));
       set(argument, "scalar",
-          juce::String(eventScalarName(mappingParameter.elementType).data()));
+          juce::String(primitiveName(mappingParameter.elementType).data()));
       set(argument, "arrayLength", mappingParameter.arrayLength);
       set(argument, "isSlice", mappingParameter.slice);
       auto defaultValue = defaultEventValue(mappingParameter);
@@ -294,6 +268,7 @@ juce::var makeRunViewState(Processor &processor, const WorkerStatus &status,
     events.add(std::move(event));
   }
   set(state, "events", std::move(events));
+  set(state, "resetEventArguments", resetEventArguments);
 
   juce::Array<juce::var> parameters;
   parameters.ensureStorageAllocated(static_cast<int>(status.mappings.size()));

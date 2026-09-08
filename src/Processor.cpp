@@ -309,9 +309,14 @@ Processor::Processor(const Product product)
     jassert(slotAtomics_[index] != nullptr &&
             slotParameters_[index] != nullptr);
   }
-  worker_ =
-      std::make_unique<Worker>(product_, replacements_, retirements_,
-                               deactivateRequested_, replacementSeedPending_);
+  worker_ = std::make_unique<Worker>(
+      product_, replacements_, retirements_, deactivateRequested_,
+      Worker::BuildFunction{}, nullptr, [this] {
+        ParameterValues values;
+        for (std::size_t index = 0; index < slotCount; ++index)
+          values[index] = slotValue(index);
+        return values;
+      });
   startTimerHz(20);
 }
 
@@ -349,7 +354,7 @@ juce::AudioProcessorValueTreeState::ParameterLayout Processor::parameters() {
 
 void Processor::prepareToPlay(const double sampleRate,
                               const int maximumBlockSize) {
-  std::lock_guard preparationLock(preparationMutex_);
+  std::unique_lock preparationLock(preparationMutex_);
   const auto safeBlockSize = std::max(maximumBlockSize, 1);
   const auto changed =
       !sameSampleRate(sampleRate,
@@ -361,21 +366,22 @@ void Processor::prepareToPlay(const double sampleRate,
     channel.resize(static_cast<std::size_t>(safeBlockSize));
   if (changed) {
     deactivateRequested_.store(true, std::memory_order_release);
-    replacementSeedPending_.store(false, std::memory_order_release);
   }
   clearMidiActivity();
   worker_->configure(sampleRate, safeBlockSize);
   configuredBlockSize_.store(safeBlockSize, std::memory_order_release);
-  synchronizeEngine();
+  const auto seeded = synchronizeEngine();
+  preparationLock.unlock();
+  notifySlotValues(seeded);
 }
 
-void Processor::synchronizeEngine() {
+std::size_t Processor::synchronizeEngine() {
   // Called with audio suspended during host preparation, or from an offline
   // callback. Neither path needs a message-loop tick to finish preparation.
   offlinePreparedGeneration_ = worker_->waitForPreparation();
-  applySeedValues();
   delete retirements_.tryPop();
   acquireEngine();
+  return applySeedValues();
 }
 
 double Processor::getTailLengthSeconds() const {
@@ -417,10 +423,12 @@ void Processor::retireActive() noexcept {
 }
 
 void Processor::acquireEngine() noexcept {
+  if (activeFaulted_)
+    retireActive();
   if (deactivateRequested_.load(std::memory_order_acquire)) {
     retireActive();
     // The worker owns superseded queued engines. Do not consume a replacement
-    // here: publication can race deactivation while its defaults are seeded.
+    // here: publication can race a host lifecycle change.
     return;
   }
 
@@ -444,10 +452,19 @@ void Processor::acquireEngine() noexcept {
                              std::memory_order_release);
   replacement->attachLogSink(runtimeLogSink_);
   active_ = replacement;
+  activeFaulted_ = false;
   worker_->setActiveGeneration(replacement->buildGeneration());
   clearMidiActivity();
   scopeCapture_.requestReset();
   runtimeFaulted_.store(false, std::memory_order_release);
+}
+
+void Processor::faultActive() noexcept {
+  // A late failure belongs to this engine, not a concurrently published one.
+  activeFaulted_ = true;
+  worker_->setActiveGeneration(0);
+  clearMidiActivity();
+  runtimeFaulted_.store(true, std::memory_order_release);
 }
 
 std::optional<MidiEvent>
@@ -576,8 +593,10 @@ void Processor::processBlock(juce::AudioBuffer<float> &audio,
       prepareToPlay(expectedSampleRate_.load(std::memory_order_acquire),
                     required);
     else if (offlinePreparedGeneration_ != worker_->requestGeneration()) {
-      std::lock_guard preparationLock(preparationMutex_);
-      synchronizeEngine();
+      std::unique_lock preparationLock(preparationMutex_);
+      const auto seeded = synchronizeEngine();
+      preparationLock.unlock();
+      notifySlotValues(seeded);
     }
   }
   const auto maximum = expectedBlockSize_.load(std::memory_order_acquire);
@@ -592,7 +611,7 @@ void Processor::processBlock(juce::AudioBuffer<float> &audio,
 
   acquireEngine();
   if (deactivateRequested_.load(std::memory_order_acquire) ||
-      active_ == nullptr ||
+      active_ == nullptr || activeFaulted_ ||
       !sameSampleRate(active_->sampleRate(),
                       expectedSampleRate_.load(std::memory_order_acquire)) ||
       active_->blockSize() != maximum) {
@@ -612,9 +631,8 @@ void Processor::processBlock(juce::AudioBuffer<float> &audio,
   }
 
   if (resetRequested_.exchange(false, std::memory_order_acq_rel) &&
-      !active_->reset()) {
-    deactivateRequested_.store(true, std::memory_order_release);
-    runtimeFaulted_.store(true, std::memory_order_release);
+      !active_->reset(slotAtomics_)) {
+    faultActive();
     fallback(audio);
     return;
   }
@@ -628,8 +646,7 @@ void Processor::processBlock(juce::AudioBuffer<float> &audio,
             {userEventScratch_.payload.data(),
              static_cast<std::size_t>(userEventScratch_.payloadBytes)},
             slotAtomics_, hostContext)) {
-      deactivateRequested_.store(true, std::memory_order_release);
-      runtimeFaulted_.store(true, std::memory_order_release);
+      faultActive();
       fallback(audio);
       return;
     }
@@ -709,8 +726,7 @@ void Processor::processBlock(juce::AudioBuffer<float> &audio,
   if (succeeded && position < frames)
     succeeded = processRange(position, frames - position, {});
   if (!succeeded) {
-    deactivateRequested_.store(true, std::memory_order_release);
-    runtimeFaulted_.store(true, std::memory_order_release);
+    faultActive();
     fallback(audio);
     if (product_ == Product::effect) {
       for (int channel = 0; channel < static_cast<int>(dryScratch_.size());
@@ -1028,11 +1044,12 @@ void Processor::drainRuntimeLogs() {
   };
 
   std::vector<StagedRecord> records;
-  records.reserve(runtimeLogQueueCapacity - 1U);
   RuntimeLogEntry entry;
   for (std::size_t count = 0U;
        count + 1U < runtimeLogQueueCapacity && runtimeLogSink_.tryPop(entry);
        ++count) {
+    if (records.empty())
+      records.reserve(runtimeLogQueueCapacity - 1U);
     const auto textBytes =
         std::min<std::size_t>(entry.textBytes, entry.text.size());
     const auto sourceFileBytes =
@@ -1129,15 +1146,31 @@ void Processor::drainRuntimeLogs() {
   runtimeLogRevision_.fetch_add(1U, std::memory_order_release);
 }
 
-void Processor::applySeedValues() {
+void Processor::commitSlotValue(const std::size_t index, const float value) {
+  const auto committed = normalized(value);
+  slotParameters_[index]->setValue(committed);
+  // DSP and worker snapshots read the APVTS atomics, whose listener update
+  // otherwise waits until notification. Keep these private mirrors in sync.
+  slotAtomics_[index]->store(committed, std::memory_order_relaxed);
+}
+
+void Processor::notifySlotValues(const std::size_t count) {
+  // Host callbacks may synchronously save/restore state or prepare the engine.
+  // Read the current value so reentry cannot replay stale committed values.
+  for (std::size_t index = 0; index < count; ++index)
+    slotParameters_[index]->sendValueChangedMessageToListeners(
+        slotParameters_[index]->getValue());
+}
+
+std::size_t Processor::applySeedValues() {
   if (auto seed = worker_->takeSeedValues()) {
-    if (seed->revision == worker_->requestGeneration()) {
-      for (std::size_t index = 0; index < seed->count; ++index)
-        setSlotValue(index, seed->values[index]);
-      deactivateRequested_.store(false, std::memory_order_release);
-    }
-    replacementSeedPending_.store(false, std::memory_order_release);
+    // Commit every slot before exposing the completed seed to host callbacks.
+    for (std::size_t index = 0; index < seed->count; ++index)
+      commitSlotValue(index, seed->values[index]);
+    worker_->finishSeeding(seed);
+    return seed->count;
   }
+  return 0;
 }
 
 void Processor::timerCallback() {
@@ -1145,7 +1178,7 @@ void Processor::timerCallback() {
   std::unique_lock preparationLock(preparationMutex_, std::try_to_lock);
   if (!preparationLock.owns_lock())
     return;
-  applySeedValues();
+  const auto seeded = applySeedValues();
   const auto notifyProjectChange = worker_->takeProjectStateChange();
   const auto expected = expectedBlockSize_.load(std::memory_order_acquire);
   if (expected > 0 &&
@@ -1159,6 +1192,7 @@ void Processor::timerCallback() {
   if (runtimeRecoveryRequested_.exchange(false, std::memory_order_acq_rel))
     worker_->requestRebuild();
   preparationLock.unlock();
+  notifySlotValues(seeded);
   if (notifyProjectChange) {
     updateHostDisplay(juce::AudioProcessorListener::ChangeDetails{}
                           .withNonParameterStateChanged(true));
@@ -1169,7 +1203,11 @@ void Processor::getStateInformation(juce::MemoryBlock &destination) {
   juce::MemoryOutputStream stream(destination, false);
   stream.writeInt(static_cast<int>(stateMagic));
   stream.writeInt(stateVersion);
-  const auto project = worker_->persistedProjectState();
+  const auto snapshot = [this] {
+    std::lock_guard preparationLock(preparationMutex_);
+    return worker_->persistedStateSnapshot();
+  }();
+  const auto &project = snapshot.project;
   stream.writeString(pathToJuce(project.path));
   {
     std::lock_guard lock(stateMutex_);
@@ -1182,7 +1220,7 @@ void Processor::getStateInformation(juce::MemoryBlock &destination) {
   }
   writeProjectImage(stream, project.projectImage);
   for (std::size_t index = 0; index < slotCount; ++index)
-    stream.writeFloat(normalized(slotValue(index)));
+    stream.writeFloat(normalized(snapshot.parameters[index]));
   stream.writeInt(editorWidth_.load(std::memory_order_relaxed));
   stream.writeInt(editorHeight_.load(std::memory_order_relaxed));
   stream.writeBool(paramControlLayout() == ParamControlLayout::knobs);
@@ -1239,11 +1277,10 @@ void Processor::setStateInformation(const void *data, const int byteCount) {
     const auto layout = stream.readBool() ? ParamControlLayout::knobs
                                           : ParamControlLayout::sliders;
 
-    std::lock_guard preparationLock(preparationMutex_);
+    std::unique_lock preparationLock(preparationMutex_);
     deactivateRequested_.store(true, std::memory_order_release);
-    replacementSeedPending_.store(false, std::memory_order_release);
     for (std::size_t index = 0; index < slotCount; ++index)
-      setSlotValue(index, restored[index]);
+      commitSlotValue(index, restored[index]);
     if (path->isEmpty() && !projectImage.valid()) {
       unload(false);
     } else {
@@ -1258,6 +1295,8 @@ void Processor::setStateInformation(const void *data, const int byteCount) {
       std::lock_guard lock(stateMutex_);
       lastBrowseDirectory_ = pathFromJuce(*browseDirectory);
     }
+    preparationLock.unlock();
+    notifySlotValues(slotCount);
   } catch (...) {
     // Host-provided state is untrusted and must never escape the VST callback.
   }

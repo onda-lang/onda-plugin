@@ -83,6 +83,8 @@ project. Event argument edits survive parameter automation and log updates;
 loading a new program or explicitly resetting the arguments restores defaults.
 
 Host preparation finishes the requested specialization before playback begins.
+Restores and rebuilds initialize ordinary and pinned state from a snapshot of
+the current host parameters. Selecting a new patch uses its declared defaults.
 Offline rendering also waits for state restored after preparation, without
 requiring the editor or its message loop. Loaded programs report an infinite
 tail to the host because arbitrary Onda DSP can sustain indefinitely; configure
@@ -114,6 +116,12 @@ falls back to the saved project image. Clearing a binding restores an available
 `.ondaproject` default; otherwise the current engine remains inactive until
 every declared buffer is bound.
 The source link and remaining bindings are saved even in this incomplete state.
+An initial source selection and partially bound buffers are saved immediately,
+including before the host prepares playback. Failed replacements retain the
+last complete project checkpoint.
+If a replacement requires new buffer bindings, the view exposes those choices
+while the previous engine keeps playing. Binding or clearing these pending
+buffers preserves the last complete checkpoint until preparation succeeds.
 
 Runtime output retained for the editor is bounded to 1,024 records and 256 KiB
 of text and source metadata. Older records are discarded first and included in
@@ -164,6 +172,11 @@ overrides that pin; otherwise the `ONDA_VERSION` environment variable takes
 precedence over the file. This separation allows plug-in-only fixes to ship
 without changing the Onda SDK dependency.
 
+The current pin uses the official
+[Onda 0.8.3 release](https://github.com/onda-lang/onda/releases/tag/0.8.3).
+The default build downloads its SDK, verifies it against the release's
+`SHA256SUMS.txt`, and embeds run-view resources from the same release tag.
+
 For a private Onda release, download the archive and its checksums using
 authenticated GitHub CLI and pass them explicitly:
 
@@ -199,8 +212,9 @@ The same checks can be run directly with
 ## Releases
 
 Pull requests and pushes to `main` run clean Release builds and tests for Linux
-x64, Windows x64, and macOS arm64. Pushing a semantic version tag matching
-`plugin-version`, with or without a leading `v`, runs the same matrix and
+x64, Windows x64, and macOS arm64, including Steinberg's VST3 validator for both
+bundles. Linux also validates a zero-input build. Pushing a semantic version tag
+matching `plugin-version`, with or without a leading `v`, runs the same matrix and
 publishes the platform archives:
 
 ```sh

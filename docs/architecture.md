@@ -13,8 +13,10 @@ and CC through JUCE's MIDI buffer.
 loaded plugin module, which owns one statically linked Onda/LLVM image. Both
 source and `.ondaproject` inputs go through `onda_compile_file()`. The worker
 hashes Onda's canonical manifest watch projection before and after compilation,
-rejects stale generations, retains successful watch coverage across failed
-loads, and publishes only fully prepared engines. A successful disk preparation
+retains the validated disk snapshot through saved-image preparation so edits
+during fallback remain visible to polling, rejects stale generations, retains
+successful watch coverage across failed loads, and publishes only fully prepared
+engines. A successful disk preparation
 atomically replaces both the engine and serialized Onda `ProjectImage`. When an
 initial disk preparation fails, the worker compiles the complete image in
 memory and continues watching the broken disk graph; it never mixes disk and
@@ -50,6 +52,13 @@ prepares every source and buffer or compiles the complete image.
 Clearing a required binding invalidates the complete image but retains the
 source link and remaining binding paths in saved state, even while preparation
 is incomplete.
+When a replacement is missing buffers, its binding choices are published
+separately from the retained engine's audio, parameters, events, and checkpoint.
+The editor can bind or clear those pending choices while the previous engine
+continues playing. Successful preparation replaces both interfaces together.
+Before the first complete checkpoint, source selections and buffer bindings
+are published immediately for saving and host dirty notifications. An existing
+complete checkpoint takes precedence until its replacement succeeds.
 
 Project export is derived only from that coherent image. Onda owns portable
 path mapping, syntax-aware directive rewriting, manifest construction, and
@@ -87,7 +96,14 @@ another build. Snapshot copying and destruction stay off the audio thread.
 
 Ordinary view updates send event defaults as metadata without overwriting the
 arguments edited in the browser. A new engine generation initializes the
-arguments; the explicit argument-reset command restores their defaults.
+arguments; the explicit argument-reset command restores their defaults. Both
+send the shared view's `resetEventArguments` state flag, so even an incomplete
+draft is discarded when the canonical value has not changed. Unchanged event
+controls retain their DOM nodes, focus, and caret across ordinary updates.
+Focused numeric parameter fields retain their drafts until commit or blur;
+leaving a field without committing reconciles the latest host value.
+Log history is included only when its revision changes or a full view refresh
+is requested, so parameter automation does not repeatedly serialize old logs.
 
 Editor dimensions and the parameter-control layout are processor-owned UI
 state. Changes notify the host that non-parameter state is dirty, are serialized
@@ -123,6 +139,25 @@ Position projection also captures whether the timeline is playing, independently
 of whether a transport event is declared. Stopped sample, time, and musical
 positions remain unchanged at interior logical-block boundaries.
 
+Each worker build attempt snapshots the host slots once and applies the mapped
+values before full initialization, including pinned initializers. Disk builds
+and saved-image fallback use the same snapshot. New patch selections instead
+use declared defaults. A seed belongs to its engine and checkpoint; publishing
+it does not deactivate the playing engine or change host slots. Adoption commits
+the seed. Until the processor finishes writing every host slot and acknowledges
+it with an atomic release, the adopted engine reads its prepared defaults at
+logical block boundaries. The message-thread timer seeds only an adopted engine,
+even if a newer request is compiling. Superseding an unadopted replacement leaves
+the playing engine and its parameters intact. A replacement preserving host
+values inherits an unfinished seed, so initialization and processing cannot
+observe partially written defaults.
+Saved state snapshots capture the checkpoint and current host slots together,
+substituting defaults still pending for that checkpoint. These defaults survive
+request supersession and stop overriding saved values once seeding is
+acknowledged. Snapshot capture is serialized with seeding and host state
+restoration. Initializers remain on the worker, while subsequent parameter
+automation continues to apply at logical block boundaries.
+
 Host preparation waits on the worker's completion condition before returning
 and adopts the specialization without needing a GUI timer tick. An unchanged
 configuration retains its eligible engine. Offline callbacks also synchronize
@@ -147,8 +182,16 @@ plugin reports no tail. MIDI filtering rejects unsupported system/SysEx and
 malformed channel packets before constructing an owning JUCE message.
 
 Generated runtime safety checks return a positive status through the Onda C
-API. On failure the callback restores fallback audio, requests deactivation,
-and publishes only an atomic fault flag. UI status snapshots overlay the
+API. Prepared-instance resets use `onda_init_unchecked` so initializer failures
+also return a status without allocating diagnostics. On failure the callback
+restores fallback audio, quarantines the active instance, clears its published
+active generation, and publishes an atomic fault flag. Quarantine belongs to
+the audio-owned engine and does not change the worker's lifecycle deactivation
+flag: a late failure cannot strand an already prepared replacement. The next
+callback retires the faulted engine through the ordinary off-thread handoff.
+UI status snapshots overlay the
 generic failure while that flag is set; no diagnostic formatting or rebuild is
 attempted from the audio thread. The faulted engine remains quarantined until a
 source change or explicit Reset prepares a replacement.
+Reset applies current host parameter values before rerunning initializers,
+including the defaults written by the editor's Reset command.

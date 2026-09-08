@@ -34,14 +34,15 @@ struct WorkerStatus {
   std::uint64_t engineGeneration{};
   std::vector<ParameterMapping> mappings;
   std::vector<BufferMapping> buffers;
+  // Binding choices for a failed replacement; active metadata stays intact.
+  std::optional<std::vector<BufferMapping>> pendingBuffers;
   std::vector<EventMapping> events;
   MidiCapabilities midi;
-};
 
-struct SeedValues {
-  std::uint64_t revision{};
-  std::array<float, slotCount> values{};
-  std::size_t count{};
+  [[nodiscard]] std::span<const BufferMapping> bufferChoices() const noexcept {
+    return pendingBuffers ? std::span<const BufferMapping>{*pendingBuffers}
+                          : std::span<const BufferMapping>{buffers};
+  }
 };
 
 struct PersistedProjectState {
@@ -50,9 +51,15 @@ struct PersistedProjectState {
   ProjectImage projectImage;
 };
 
+struct PersistedStateSnapshot {
+  PersistedProjectState project;
+  ParameterValues parameters;
+};
+
 struct EnginePublication {
   WorkerStatus status;
   PersistedProjectState project;
+  std::shared_ptr<SeedValues> seed;
 };
 
 struct ProjectExportSnapshot {
@@ -69,15 +76,21 @@ public:
 
   using BuildFunction =
       std::function<BuildResult(const std::filesystem::path &, Product, double,
-                                int, std::span<const BufferFileBinding>)>;
+                                int, std::span<const BufferFileBinding>,
+                                const std::optional<ParameterValues> &)>;
+  using ProjectBuildFunction =
+      std::function<BuildResult(const ProjectImage &, Product, double, int,
+                                const std::optional<ParameterValues> &)>;
+  using ParameterSource = std::function<ParameterValues()>;
   using RetirementObserver = void (*)(PreparedEngine *) noexcept;
 
   Worker(Product product, SpscSlot<PreparedEngine *> &replacements,
          SpscSlot<PreparedEngine *> &retirements,
          std::atomic<bool> &deactivateRequested,
-         std::atomic<bool> &replacementSeedPending,
          BuildFunction buildFunction = {},
-         RetirementObserver retirementObserver = nullptr);
+         RetirementObserver retirementObserver = nullptr,
+         ParameterSource parameterSource = {},
+         ProjectBuildFunction projectBuildFunction = {});
   ~Worker();
 
   Worker(const Worker &) = delete;
@@ -111,8 +124,11 @@ public:
 
   [[nodiscard]] WorkerStatus status() const;
   [[nodiscard]] std::uint64_t statusRevision() const;
-  [[nodiscard]] std::optional<SeedValues> takeSeedValues();
+  [[nodiscard]] std::shared_ptr<SeedValues> takeSeedValues();
+  void finishSeeding(const std::shared_ptr<SeedValues> &seed);
   [[nodiscard]] PersistedProjectState persistedProjectState() const;
+  // Caller serializes this with parameter seeding and host state restoration.
+  [[nodiscard]] PersistedStateSnapshot persistedStateSnapshot() const;
   [[nodiscard]] std::optional<ProjectExportSnapshot>
   projectExportSnapshot() const;
   [[nodiscard]] bool relinkExport(const ProjectExportSnapshot &snapshot,
@@ -132,6 +148,7 @@ private:
     int blockSize{};
     std::uint64_t generation{};
     bool seedDefaults{};
+    bool recoverCheckpoint{};
     bool notifyProjectChange{true};
     std::vector<BufferFileBinding> bufferBindings;
     ProjectImage fallbackProjectImage;
@@ -154,7 +171,12 @@ private:
   void loadLocked(std::filesystem::path path, bool seedDefaults,
                   ExistingEnginePolicy policy);
   void finishRequest(std::uint64_t generation);
-  void publishProjectState(PersistedProjectState state, bool notifyHost);
+  void publishProjectState(PersistedProjectState state, bool notifyHost,
+                           std::shared_ptr<SeedValues> pendingDefaults = {});
+  // Caller holds mutex_; a complete checkpoint takes precedence over requests.
+  void publishIncompleteProjectState();
+  // Caller holds mutex_; pending committed defaults override raw host slots.
+  [[nodiscard]] ParameterValues parameterValuesLocked() const;
   void deactivateStatus() noexcept;
   void clearPublishedInterface() noexcept;
   void reportFailure(const char *message) noexcept;
@@ -187,8 +209,10 @@ private:
   SpscSlot<PreparedEngine *> &replacements_;
   SpscSlot<PreparedEngine *> &retirements_;
   std::atomic<bool> &deactivateRequested_;
-  std::atomic<bool> &replacementSeedPending_;
   BuildFunction buildFunction_;
+  ProjectBuildFunction projectBuildFunction_;
+  // Must support concurrent non-realtime reads and outlive the worker.
+  ParameterSource parameterSource_;
   RetirementObserver retirementObserver_{};
 
   mutable std::mutex mutex_;
@@ -197,8 +221,9 @@ private:
   Request desired_;
   WorkerStatus status_;
   std::vector<std::weak_ptr<const EnginePublication>> publications_;
-  std::optional<SeedValues> seedValues_;
   PersistedProjectState publishedProjectState_;
+  // Belongs to the checkpoint, so survives superseding a pending request.
+  std::shared_ptr<SeedValues> publishedSeedValues_;
   bool stopping_{};
   bool forceRebuild_{};
   bool workerStopped_{};

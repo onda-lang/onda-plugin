@@ -65,13 +65,15 @@ void normalizeBindings(std::vector<BufferFileBinding> &bindings) {
 Worker::Worker(Product product, SpscSlot<PreparedEngine *> &replacements,
                SpscSlot<PreparedEngine *> &retirements,
                std::atomic<bool> &deactivateRequested,
-               std::atomic<bool> &replacementSeedPending,
                BuildFunction buildFunction,
-               const RetirementObserver retirementObserver)
+               const RetirementObserver retirementObserver,
+               ParameterSource parameterSource,
+               ProjectBuildFunction projectBuildFunction)
     : product_(product), replacements_(replacements), retirements_(retirements),
       deactivateRequested_(deactivateRequested),
-      replacementSeedPending_(replacementSeedPending),
       buildFunction_(std::move(buildFunction)),
+      projectBuildFunction_(std::move(projectBuildFunction)),
+      parameterSource_(std::move(parameterSource)),
       retirementObserver_(retirementObserver), thread_([this] { run(); }) {}
 
 Worker::~Worker() {
@@ -94,6 +96,7 @@ void Worker::configure(const double sampleRate, const int blockSize) {
       return;
     desired_.sampleRate = sampleRate;
     desired_.blockSize = blockSize;
+    desired_.recoverCheckpoint = true;
     advanceGeneration();
     forceRebuild_ = true;
     if (!desired_.path.empty() || desired_.fallbackProjectImage.valid()) {
@@ -129,7 +132,8 @@ void Worker::finishRequest(const std::uint64_t generation) {
 // mutex_ is held by every publisher; comparing bytes avoids dirtying the host
 // when recompilation produces an identical checkpoint.
 void Worker::publishProjectState(PersistedProjectState state,
-                                 const bool notifyHost) {
+                                 const bool notifyHost,
+                                 std::shared_ptr<SeedValues> pendingDefaults) {
   const auto sameImage =
       publishedProjectState_.projectImage == state.projectImage ||
       (publishedProjectState_.projectImage.valid() &&
@@ -139,6 +143,7 @@ void Worker::publishProjectState(PersistedProjectState state,
       !sameImage || publishedProjectState_.path != state.path ||
       publishedProjectState_.bufferBindings != state.bufferBindings;
   publishedProjectState_ = std::move(state);
+  publishedSeedValues_ = std::move(pendingDefaults);
   projectStateChanged_ = projectStateChanged_ || (notifyHost && changed);
 }
 
@@ -151,20 +156,25 @@ void Worker::loadLocked(std::filesystem::path path, const bool seedDefaults,
                         const ExistingEnginePolicy policy) {
   desired_.path = std::move(path);
   desired_.fallbackProjectImage = {};
+  desired_.recoverCheckpoint = false;
   desired_.seedDefaults = seedDefaults;
   desired_.notifyProjectChange = true;
   advanceGeneration();
   forceRebuild_ = true;
   status_.path = desired_.path;
+  status_.pendingBuffers.reset();
   status_.message = "Waiting to compile";
   status_.compiling = false;
   status_.usingProjectImage = false;
   if (policy == ExistingEnginePolicy::deactivateImmediately) {
-    publishProjectState({}, true);
+    publishProjectState({.path = desired_.path,
+                         .bufferBindings = desired_.bufferBindings,
+                         .projectImage = {}},
+                        true);
     clearPublishedInterface();
     deactivateRequested_.store(true, std::memory_order_release);
-    replacementSeedPending_.store(false, std::memory_order_release);
   }
+  publishIncompleteProjectState();
   ++status_.revision;
 }
 
@@ -229,6 +239,7 @@ void Worker::restore(std::filesystem::path path, ProjectImage projectImage,
     desired_.path = std::move(path);
     desired_.bufferBindings = std::move(bufferBindings);
     desired_.fallbackProjectImage = std::move(projectImage);
+    desired_.recoverCheckpoint = false;
     desired_.seedDefaults = false;
     desired_.notifyProjectChange = false;
     projectStateChanged_ = false;
@@ -242,14 +253,13 @@ void Worker::restore(std::filesystem::path path, ProjectImage projectImage,
     advanceGeneration();
     forceRebuild_ = true;
     status_.path = desired_.path;
+    status_.pendingBuffers.reset();
     status_.message = "Waiting to restore";
     status_.compiling = false;
     status_.usingProjectImage = false;
     if (policy == ExistingEnginePolicy::deactivateImmediately) {
-      seedValues_.reset();
       clearPublishedInterface();
       deactivateRequested_.store(true, std::memory_order_release);
-      replacementSeedPending_.store(false, std::memory_order_release);
     }
     ++status_.revision;
   }
@@ -265,7 +275,6 @@ void Worker::unload(const bool notifyHost) {
     desired_.fallbackProjectImage = {};
     advanceGeneration();
     forceRebuild_ = false;
-    seedValues_.reset();
     publishProjectState({}, notifyHost);
     if (!notifyHost)
       projectStateChanged_ = false;
@@ -275,7 +284,6 @@ void Worker::unload(const bool notifyHost) {
     clearPublishedInterface();
     status_.usingProjectImage = false;
     deactivateRequested_.store(true, std::memory_order_release);
-    replacementSeedPending_.store(false, std::memory_order_release);
     ++status_.revision;
   }
   wake_.notify_one();
@@ -312,6 +320,7 @@ void Worker::bindBufferFile(std::string name, std::filesystem::path path) {
     forceRebuild_ = true;
     status_.message = "Waiting to bind audio file";
     status_.compiling = false;
+    publishIncompleteProjectState();
     ++status_.revision;
   }
   wake_.notify_one();
@@ -326,18 +335,24 @@ void Worker::clearBuffer(const std::string_view name) {
                   [name](const BufferFileBinding &binding) {
                     return binding.name == name;
                   });
-    desired_.fallbackProjectImage = {};
     desired_.notifyProjectChange = true;
     advanceGeneration();
     forceRebuild_ = true;
     status_.message = "Waiting for buffer binding";
     status_.compiling = false;
-    deactivateStatus();
-    publishProjectState({.path = desired_.path,
-                         .bufferBindings = desired_.bufferBindings,
-                         .projectImage = {}},
-                        true);
-    for (auto &buffer : status_.buffers) {
+    // Editing an incomplete replacement must not discard the running project.
+    if (!status_.pendingBuffers) {
+      desired_.fallbackProjectImage = {};
+      deactivateStatus();
+      publishProjectState({.path = desired_.path,
+                           .bufferBindings = desired_.bufferBindings,
+                           .projectImage = {}},
+                          true);
+      deactivateRequested_.store(true, std::memory_order_release);
+    }
+    auto &buffers = status_.pendingBuffers ? *status_.pendingBuffers
+                                          : status_.buffers;
+    for (auto &buffer : buffers) {
       if (buffer.name == name) {
         buffer.loadedPath.clear();
         buffer.loadedFrames = 0;
@@ -345,8 +360,6 @@ void Worker::clearBuffer(const std::string_view name) {
         buffer.loadedSampleRate = 0.0F;
       }
     }
-    deactivateRequested_.store(true, std::memory_order_release);
-    replacementSeedPending_.store(false, std::memory_order_release);
     ++status_.revision;
   }
   wake_.notify_one();
@@ -361,6 +374,7 @@ void Worker::setBufferBindings(std::vector<BufferFileBinding> bindings) {
     desired_.notifyProjectChange = true;
     advanceGeneration();
     forceRebuild_ = true;
+    publishIncompleteProjectState();
   }
   wake_.notify_one();
 }
@@ -375,9 +389,20 @@ std::uint64_t Worker::statusRevision() const {
   return status_.revision;
 }
 
-std::optional<SeedValues> Worker::takeSeedValues() {
+std::shared_ptr<SeedValues> Worker::takeSeedValues() {
   std::lock_guard lock(mutex_);
-  return std::exchange(seedValues_, std::nullopt);
+  const auto active = activePublication();
+  if (!active || !active->seed || active->seed->claimed)
+    return {};
+  active->seed->claimed = true;
+  return active->seed;
+}
+
+void Worker::finishSeeding(const std::shared_ptr<SeedValues> &seed) {
+  std::lock_guard lock(mutex_);
+  seed->applied.store(true, std::memory_order_release);
+  if (seed->revision == desired_.generation)
+    desired_.seedDefaults = false;
 }
 
 PersistedProjectState Worker::persistedProjectState() const {
@@ -385,11 +410,38 @@ PersistedProjectState Worker::persistedProjectState() const {
   return publishedProjectState_;
 }
 
+PersistedStateSnapshot Worker::persistedStateSnapshot() const {
+  std::lock_guard lock(mutex_);
+  return {publishedProjectState_, parameterValuesLocked()};
+}
+
+ParameterValues Worker::parameterValuesLocked() const {
+  ParameterValues values;
+  values.fill(0.5F);
+  if (parameterSource_)
+    values = parameterSource_();
+  if (publishedSeedValues_ &&
+      !publishedSeedValues_->applied.load(std::memory_order_acquire)) {
+    std::copy_n(publishedSeedValues_->values.begin(),
+                publishedSeedValues_->count, values.begin());
+  }
+  return values;
+}
+
 void Worker::advanceGeneration() noexcept {
   ++desired_.generation;
   requestGeneration_.store(desired_.generation, std::memory_order_release);
-  seedValues_.reset();
-  replacementSeedPending_.store(false, std::memory_order_release);
+}
+
+void Worker::publishIncompleteProjectState() {
+  // Until a complete checkpoint exists, save the user's source and bindings
+  // immediately, even before host preparation or while a buffer is missing.
+  if (!publishedProjectState_.projectImage.valid()) {
+    publishProjectState({.path = desired_.path,
+                         .bufferBindings = desired_.bufferBindings,
+                         .projectImage = desired_.fallbackProjectImage},
+                        desired_.notifyProjectChange);
+  }
 }
 
 void Worker::deactivateStatus() noexcept {
@@ -402,6 +454,7 @@ void Worker::clearPublishedInterface() noexcept {
   deactivateStatus();
   status_.mappings.clear();
   status_.buffers.clear();
+  status_.pendingBuffers.reset();
   status_.events.clear();
   status_.midi = {};
 }
@@ -453,10 +506,13 @@ bool Worker::updateStatus(const Request &request, std::string message,
     status_.engineGeneration = retained->status.engineGeneration;
     status_.mappings = retained->status.mappings;
     status_.buffers = retained->status.buffers;
+    if (!buffers.empty())
+      status_.pendingBuffers = std::move(buffers);
     status_.events = retained->status.events;
     status_.midi = retained->status.midi;
     status_.usingProjectImage = retained->status.usingProjectImage;
-    publishProjectState(retained->project, desired_.notifyProjectChange);
+    publishProjectState(retained->project, desired_.notifyProjectChange,
+                        retained->seed);
     status_.active = true;
     hasPreparedEngine_.store(true, std::memory_order_release);
   } else {
@@ -550,11 +606,17 @@ Worker::mergedPaths(std::vector<std::filesystem::path> first,
 
 void Worker::build(const Request &request) {
   bool hadActiveEngine;
+  PersistedStateSnapshot fallback;
+  std::shared_ptr<SeedValues> fallbackSeed;
   {
     std::lock_guard lock(mutex_);
     if (!matchesDesiredLocked(request))
       return;
     hadActiveEngine = activePublication() != nullptr;
+    // A failed selection can have no requested image while the last complete
+    // checkpoint still owns everything needed for host re-specialization.
+    fallback = {publishedProjectState_, parameterValuesLocked()};
+    fallbackSeed = publishedSeedValues_;
   }
   if (!updateStatus(request, "Compiling", true))
     return;
@@ -567,6 +629,19 @@ void Worker::build(const Request &request) {
   prePaths = mergedPaths(std::move(prePaths), {});
   const auto before = capture(prePaths);
 
+  // Use the same host values for disk preparation and image fallback. New
+  // patch selections deliberately initialize with their declared defaults.
+  std::shared_ptr<SeedValues> inheritedSeed;
+  std::optional<ParameterValues> initialParameters;
+  if (!request.seedDefaults) {
+    std::lock_guard lock(mutex_);
+    if (publishedSeedValues_ &&
+        !publishedSeedValues_->applied.load(std::memory_order_acquire)) {
+      inheritedSeed = publishedSeedValues_;
+    }
+    if (parameterSource_ || inheritedSeed)
+      initialParameters = parameterValuesLocked();
+  }
   BuildResult diskResult;
   try {
     std::lock_guard compileLock(compileMutex);
@@ -576,10 +651,12 @@ void Worker::build(const Request &request) {
       diskResult =
           buildFunction_
               ? buildFunction_(request.path, product_, request.sampleRate,
-                               request.blockSize, request.bufferBindings)
+                               request.blockSize, request.bufferBindings,
+                               initialParameters)
               : PreparedEngine::build(request.path, product_,
                                       request.sampleRate, request.blockSize,
-                                      request.bufferBindings);
+                                      request.bufferBindings,
+                                      initialParameters);
     }
   } catch (const std::bad_alloc &) {
     diskResult.diagnostic.message =
@@ -597,7 +674,8 @@ void Worker::build(const Request &request) {
   const auto discoveredNewPath =
       !std::includes(prePaths.begin(), prePaths.end(), attemptPaths.begin(),
                      attemptPaths.end());
-  const auto knownChanged = before != capture(prePaths);
+  auto after = capture(prePaths);
+  const auto knownChanged = before != after;
 
   if (!stillCurrent(request))
     return;
@@ -616,19 +694,35 @@ void Worker::build(const Request &request) {
     return;
   }
 
+  // Keep the validated disk snapshot even if saved-image preparation takes
+  // time. Recapturing hereafter would swallow edits made during fallback.
+  const auto retainWatchSnapshot = [&after, this] {
+    std::erase_if(after, [this](const FileStamp &stamp) {
+      return !std::binary_search(watchedPaths_.begin(), watchedPaths_.end(),
+                                 stamp.path);
+    });
+    watchedStamp_ = std::move(after);
+  };
+
   const auto diskFailure = diagnosticMessage(diskResult.diagnostic);
   auto usingProjectImage = false;
   auto attemptedProjectImage = false;
   auto result = std::move(diskResult);
   if (!result.engine && !hadActiveEngine &&
-      request.fallbackProjectImage.valid() && !buildFunction_) {
+      (request.recoverCheckpoint || request.fallbackProjectImage.valid()) &&
+      fallback.project.projectImage.valid() && !buildFunction_) {
     attemptedProjectImage = true;
     static_cast<void>(updateStatus(
         request, "Linked project failed; restoring saved project image", true));
     try {
       std::lock_guard compileLock(compileMutex);
-      result = PreparedEngine::build(request.fallbackProjectImage, product_,
-                                     request.sampleRate, request.blockSize);
+      result = projectBuildFunction_
+                   ? projectBuildFunction_(fallback.project.projectImage, product_,
+                                           request.sampleRate, request.blockSize,
+                                           fallback.parameters)
+                   : PreparedEngine::build(fallback.project.projectImage, product_,
+                                           request.sampleRate, request.blockSize,
+                                           fallback.parameters);
       usingProjectImage = result.engine != nullptr;
     } catch (const std::bad_alloc &) {
       result.diagnostic.message =
@@ -645,7 +739,7 @@ void Worker::build(const Request &request) {
 
   if (!result.engine) {
     watchedPaths_ = mergedPaths(successfulPaths_, attemptPaths);
-    watchedStamp_ = capture(watchedPaths_);
+    retainWatchSnapshot();
     auto message = diagnosticMessage(result.diagnostic);
     if (attemptedProjectImage)
       message = diskFailure + "; saved project image also failed: " + message;
@@ -660,7 +754,7 @@ void Worker::build(const Request &request) {
   watchedPaths_ = usingProjectImage
                       ? mergedPaths(successfulPaths_, attemptPaths)
                       : attemptPaths;
-  watchedStamp_ = capture(watchedPaths_);
+  retainWatchSnapshot();
 
   std::vector<ParameterMapping> mappings(
       result.engine->parameterMappings().begin(),
@@ -679,11 +773,9 @@ void Worker::build(const Request &request) {
       return;
     }
 
-    std::optional<SeedValues> seed;
-    if (request.seedDefaults) {
-      deactivateRequested_.store(true, std::memory_order_release);
-      replacementSeedPending_.store(true, std::memory_order_release);
-      seed.emplace();
+    auto seed = usingProjectImage ? fallbackSeed : inheritedSeed;
+    if (request.seedDefaults && !usingProjectImage) {
+      seed = std::make_shared<SeedValues>();
       seed->revision = request.generation;
       seed->count = std::min(mappings.size(), slotCount);
       for (std::size_t index = 0; index < seed->count; ++index)
@@ -692,12 +784,12 @@ void Worker::build(const Request &request) {
     }
 
     publishProjectState(
-        {
-            .path = desired_.path,
-            .bufferBindings = desired_.bufferBindings,
-            .projectImage = result.projectImage,
-        },
-        desired_.notifyProjectChange);
+        usingProjectImage
+            ? fallback.project
+            : PersistedProjectState{.path = desired_.path,
+                                    .bufferBindings = desired_.bufferBindings,
+                                    .projectImage = result.projectImage},
+        desired_.notifyProjectChange, seed);
     desired_.fallbackProjectImage = result.projectImage;
     status_.path = desired_.path;
     status_.message = usingProjectImage
@@ -710,21 +802,18 @@ void Worker::build(const Request &request) {
     status_.engineGeneration = request.generation;
     status_.mappings = std::move(mappings);
     status_.buffers = std::move(buffers);
+    status_.pendingBuffers.reset();
     status_.events = std::move(events);
     status_.midi = midi;
     result.engine->buildGeneration_ = request.generation;
+    result.engine->parameterSeed_ = seed;
     result.engine->publication_ = std::make_shared<const EnginePublication>(
-        EnginePublication{status_, publishedProjectState_});
+        EnginePublication{status_, publishedProjectState_, seed});
     std::erase_if(publications_, [](const auto &entry) { return entry.expired(); });
     publications_.push_back(result.engine->publication_);
     destroy(replacements_.replace(result.engine.release()));
 
-    if (seed) {
-      seedValues_ = std::move(seed);
-      desired_.seedDefaults = false;
-    } else {
-      deactivateRequested_.store(false, std::memory_order_release);
-    }
+    deactivateRequested_.store(false, std::memory_order_release);
     ++status_.revision;
     completedGeneration_ = request.generation;
   }

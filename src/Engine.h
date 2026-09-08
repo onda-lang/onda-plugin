@@ -18,6 +18,17 @@
 namespace onda::plugin {
 
 inline constexpr std::size_t slotCount = 32U;
+using ParameterValues = std::array<float, slotCount>;
+
+// Published with an engine. Audio uses these values until host seeding finishes.
+struct SeedValues {
+  std::uint64_t revision{};
+  ParameterValues values{};
+  std::size_t count{};
+  std::atomic<bool> applied{};
+  // Accessed only under the worker mutex.
+  bool claimed{};
+};
 
 enum class MidiKind : std::uint8_t {
   noteOn,
@@ -155,10 +166,12 @@ public:
 
   [[nodiscard]] static BuildResult
   build(const std::filesystem::path &path, Product product, double sampleRate,
-        int blockSize, std::span<const BufferFileBinding> bufferBindings = {});
-  [[nodiscard]] static BuildResult build(const ProjectImage &projectImage,
-                                         Product product, double sampleRate,
-                                         int blockSize);
+        int blockSize, std::span<const BufferFileBinding> bufferBindings = {},
+        const std::optional<ParameterValues> &initialParameters = std::nullopt);
+  [[nodiscard]] static BuildResult
+  build(const ProjectImage &projectImage, Product product, double sampleRate,
+        int blockSize,
+        const std::optional<ParameterValues> &initialParameters = std::nullopt);
 
   [[nodiscard]] bool
   process(float *const *hostInputs, float *const *hostOutputs, int frames,
@@ -167,7 +180,8 @@ public:
           const HostContext &hostContext = {},
           int hostCallbackOffset = 0) noexcept;
 
-  [[nodiscard]] bool reset() noexcept;
+  [[nodiscard]] bool
+  reset(const std::array<std::atomic<float> *, slotCount> &slots) noexcept;
   void attachLogSink(RuntimeLogSink &sink) noexcept;
 
   [[nodiscard]] double sampleRate() const noexcept { return sampleRate_; }
@@ -221,7 +235,7 @@ private:
     std::uint32_t line{};
   };
 
-  PreparedEngine(Product product, double sampleRate, int blockSize,
+  PreparedEngine(double sampleRate, int blockSize,
                  ProgramHandle program, InstanceHandle instance,
                  int inputChannels, int outputChannels,
                  std::vector<float> inputSlab, std::vector<float> outputSlab,
@@ -230,7 +244,8 @@ private:
   [[nodiscard]] static BuildResult
   build(CompileResult compiled, Product product, double sampleRate,
         int blockSize, std::span<const BufferFileBinding> bufferBindings,
-        const std::filesystem::path &diskEntry);
+        const std::filesystem::path &diskEntry,
+        const std::optional<ParameterValues> &initialParameters);
 
   [[nodiscard]] bool prepareRuntimeOutput(Diagnostic &diagnostic);
   [[nodiscard]] bool initialize() noexcept;
@@ -261,14 +276,15 @@ private:
                      int hostCallbackOffset) noexcept;
   [[nodiscard]] bool dispatchHostContext(const HostContext &hostContext,
                                          int hostCallbackOffset) noexcept;
+  void applyParameter(std::size_t slot, float value) noexcept;
   void applyParameters(
       const std::array<std::atomic<float> *, slotCount> &slots) noexcept;
 
-  Product product_{};
   std::uint64_t buildGeneration_{};
   // Worker metadata lives until this engine is retired. Audio never accesses
   // or copies it; destruction happens on the worker or during host preparation.
   std::shared_ptr<const EnginePublication> publication_;
+  std::shared_ptr<SeedValues> parameterSeed_;
   double sampleRate_{};
   int blockSize_{};
   ProgramHandle program_;

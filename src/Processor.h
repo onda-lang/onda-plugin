@@ -147,12 +147,15 @@ private:
   void timerCallback() override;
   void acquireEngine() noexcept;
   // Caller holds preparationMutex_; host audio is suspended or offline.
-  void synchronizeEngine();
-  void applySeedValues();
+  [[nodiscard]] std::size_t synchronizeEngine();
+  [[nodiscard]] std::size_t applySeedValues();
+  void commitSlotValue(std::size_t index, float value);
+  void notifySlotValues(std::size_t count);
   [[nodiscard]] std::string
   saveProjectSnapshot(const ProjectExportSnapshot &snapshot,
                       const juce::File &directory);
   void retireActive() noexcept;
+  void faultActive() noexcept;
   void drainRuntimeLogs();
   void observeMidiActivity(const juce::MidiMessage &message) noexcept;
   void clearMidiActivity() noexcept;
@@ -170,7 +173,6 @@ private:
   SpscSlot<PreparedEngine *> replacements_;
   SpscSlot<PreparedEngine *> retirements_;
   std::atomic<bool> deactivateRequested_{};
-  std::atomic<bool> replacementSeedPending_{};
   std::atomic<bool> resetRequested_{};
   std::atomic<bool> runtimeFaulted_{};
   std::atomic<bool> runtimeRecoveryRequested_{};
@@ -181,6 +183,8 @@ private:
   juce::ThreadPool exportPool_{1};
   std::atomic<bool> exportPending_{};
   PreparedEngine *active_{};
+  // Audio-owned quarantine; UI fault reporting may be cleared independently.
+  bool activeFaulted_{};
   std::uint64_t offlinePreparedGeneration_{};
   RuntimeLogSink runtimeLogSink_;
   ScopeCapture scopeCapture_;

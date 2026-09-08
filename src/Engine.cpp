@@ -1,6 +1,7 @@
 #include "Engine.h"
 
 #include "AudioFile.h"
+#include "Primitive.h"
 
 #include <algorithm>
 #include <array>
@@ -97,23 +98,6 @@ bool bindAudio(onda_instance_t *instance, const onda_program_t *program,
   return true;
 }
 
-std::optional<std::string> parameterType(const int primitive) {
-  switch (primitive) {
-  case ONDA_PRIMITIVE_F32:
-    return "f32";
-  case ONDA_PRIMITIVE_F64:
-    return "f64";
-  case ONDA_PRIMITIVE_I32:
-    return "i32";
-  case ONDA_PRIMITIVE_I64:
-    return "i64";
-  case ONDA_PRIMITIVE_BOOL:
-    return "bool";
-  default:
-    return std::nullopt;
-  }
-}
-
 std::optional<std::string> parameterUnit(const onda_program_t *program,
                                          const int index) {
   const auto bytes = onda_param_unit_copy(program, index, nullptr, 0);
@@ -135,9 +119,9 @@ std::optional<ParameterMapping> parameterMapping(const onda_program_t *program,
   if (onda_param_array_len(program, index) != 1)
     return std::nullopt;
   const auto primitive = onda_param_elem_type(program, index);
-  const auto type = parameterType(primitive);
+  const auto type = primitiveName(primitive);
   const auto unit = parameterUnit(program, index);
-  if (!type || !unit)
+  if (type.empty() || !unit)
     return std::nullopt;
 
   const auto plain = onda_param_normalized_to_plain(program, index, 0.5);
@@ -148,7 +132,7 @@ std::optional<ParameterMapping> parameterMapping(const onda_program_t *program,
 
   ParameterMapping mapping;
   mapping.parameterIndex = index;
-  mapping.type = *type;
+  mapping.type = type;
   mapping.unit = *unit;
   if (const auto *name = onda_param_name(program, index))
     mapping.name = name;
@@ -334,14 +318,14 @@ bool collectVisibleEvents(const onda_program_t *program,
           onda_event_param_name(program, eventIndex, parameterIndex);
       const auto elementType =
           onda_event_param_elem_type(program, eventIndex, parameterIndex);
-      const auto type = parameterType(elementType);
+      const auto type = primitiveName(elementType);
       const auto arrayLength =
           onda_event_param_array_len(program, eventIndex, parameterIndex);
       const auto isArray =
           onda_event_param_is_array(program, eventIndex, parameterIndex);
       const auto isSlice =
           onda_event_param_is_slice(program, eventIndex, parameterIndex);
-      if (parameterName == nullptr || !type || arrayLength < 0 ||
+      if (parameterName == nullptr || type.empty() || arrayLength < 0 ||
           (isArray != 0 && isArray != 1) || (isSlice != 0 && isSlice != 1) ||
           (isArray == 1 && (isSlice == 1 || arrayLength <= 0)) ||
           (isSlice == 1 && arrayLength != 0) ||
@@ -352,7 +336,7 @@ bool collectVisibleEvents(const onda_program_t *program,
 
       EventParameterMapping parameter{
           .name = parameterName,
-          .type = *type,
+          .type = std::string{type},
           .elementType = elementType,
           .arrayLength = arrayLength,
           .array = isArray == 1,
@@ -383,23 +367,6 @@ bool collectVisibleEvents(const onda_program_t *program,
     events.push_back(std::move(event));
   }
   return true;
-}
-
-std::size_t primitiveBytes(const int primitive) noexcept {
-  switch (primitive) {
-  case ONDA_PRIMITIVE_BOOL:
-    return sizeof(bool);
-  case ONDA_PRIMITIVE_F32:
-    return sizeof(float);
-  case ONDA_PRIMITIVE_F64:
-    return sizeof(double);
-  case ONDA_PRIMITIVE_I32:
-    return sizeof(std::int32_t);
-  case ONDA_PRIMITIVE_I64:
-    return sizeof(std::int64_t);
-  default:
-    return 0U;
-  }
 }
 
 bool appendText(RuntimeLogEntry &entry, const std::string_view text) noexcept {
@@ -562,12 +529,12 @@ bool PreparedEngine::trigger(const EventBinding &binding,
 }
 
 PreparedEngine::PreparedEngine(
-    Product product, const double sampleRate, const int blockSize,
+    const double sampleRate, const int blockSize,
     ProgramHandle program, InstanceHandle instance, const int inputChannels,
     const int outputChannels, std::vector<float> inputSlab,
     std::vector<float> outputSlab, std::vector<BufferStorage> bufferStorage,
     std::vector<BufferMapping> bufferMappings) noexcept
-    : product_(product), sampleRate_(sampleRate), blockSize_(blockSize),
+    : sampleRate_(sampleRate), blockSize_(blockSize),
       program_(std::move(program)), inputChannels_(inputChannels),
       outputChannels_(outputChannels), inputSlab_(std::move(inputSlab)),
       outputSlab_(std::move(outputSlab)),
@@ -882,24 +849,26 @@ void PreparedEngine::collectExecutionOutput() noexcept {
 BuildResult
 PreparedEngine::build(const std::filesystem::path &path, const Product product,
                       const double sampleRate, const int blockSize,
-                      const std::span<const BufferFileBinding> bufferBindings) {
+                      const std::span<const BufferFileBinding> bufferBindings,
+                      const std::optional<ParameterValues> &initialParameters) {
   return build(compileFile(path, sampleRate, blockSize), product, sampleRate,
-               blockSize, bufferBindings, path);
+               blockSize, bufferBindings, path, initialParameters);
 }
 
-BuildResult PreparedEngine::build(const ProjectImage &projectImage,
-                                  const Product product,
-                                  const double sampleRate,
-                                  const int blockSize) {
+BuildResult
+PreparedEngine::build(const ProjectImage &projectImage, const Product product,
+                      const double sampleRate, const int blockSize,
+                      const std::optional<ParameterValues> &initialParameters) {
   return build(compileProjectImage(projectImage, sampleRate, blockSize),
-               product, sampleRate, blockSize, {}, {});
+               product, sampleRate, blockSize, {}, {}, initialParameters);
 }
 
 BuildResult
 PreparedEngine::build(CompileResult compiled, const Product product,
                       const double sampleRate, const int blockSize,
                       const std::span<const BufferFileBinding> bufferBindings,
-                      const std::filesystem::path &diskEntry) {
+                      const std::filesystem::path &diskEntry,
+                      const std::optional<ParameterValues> &initialParameters) {
   BuildResult result;
   result.projectImage = compiled.projectImage;
   result.watchPaths = std::move(compiled.watchPaths);
@@ -1087,10 +1056,9 @@ PreparedEngine::build(CompileResult compiled, const Product product,
   std::vector<float> inputSlab(inputSamples);
   std::vector<float> outputSlab(outputSamples);
   auto engine = std::unique_ptr<PreparedEngine>(new PreparedEngine(
-      product, sampleRate, blockSize, std::move(compiled.program),
-      std::move(instance), inputs, outputs, std::move(inputSlab),
-      std::move(outputSlab), std::move(bufferStorage),
-      std::move(bufferMappings)));
+      sampleRate, blockSize, std::move(compiled.program), std::move(instance),
+      inputs, outputs, std::move(inputSlab), std::move(outputSlab),
+      std::move(bufferStorage), std::move(bufferMappings)));
 
   if (!engine->prepareRuntimeOutput(result.diagnostic))
     return result;
@@ -1115,16 +1083,6 @@ PreparedEngine::build(CompileResult compiled, const Product product,
       }
     }
   }
-  if (!engine->initialize()) {
-    result.diagnostic = error("Failed to initialize the Onda runtime instance");
-    return result;
-  }
-  if (onda_prepare_unchecked_process(engine->instance_.get()) != 0) {
-    if (result.diagnostic.empty())
-      result.diagnostic = error("Failed to prepare unchecked Onda processing");
-    return result;
-  }
-
   const auto parameterCount = onda_param_count(engine->program_.get());
   if (parameterCount < 0) {
     result.diagnostic = error("Onda returned invalid parameter metadata");
@@ -1138,6 +1096,20 @@ PreparedEngine::build(CompileResult compiled, const Product product,
       continue;
     engine->parameterMappings_[engine->parameterMappingCount_++] =
         std::move(*mapping);
+  }
+
+  if (initialParameters) {
+    for (std::size_t index = 0; index < engine->parameterMappingCount_; ++index)
+      engine->applyParameter(index, (*initialParameters)[index]);
+  }
+  if (!engine->initialize()) {
+    result.diagnostic = error("Failed to initialize the Onda runtime instance");
+    return result;
+  }
+  if (onda_prepare_unchecked_process(engine->instance_.get()) != 0) {
+    if (result.diagnostic.empty())
+      result.diagnostic = error("Failed to prepare unchecked Onda processing");
+    return result;
   }
 
   for (std::size_t index = 0; index < expectedMidiEvents.size(); ++index) {
@@ -1182,15 +1154,23 @@ PreparedEngine::build(CompileResult compiled, const Product product,
   return result;
 }
 
+void PreparedEngine::applyParameter(const std::size_t slot,
+                                    const float value) noexcept {
+  const auto normalized =
+      std::isfinite(value) ? std::clamp(value, 0.0F, 1.0F) : 0.5F;
+  static_cast<void>(onda_set_param_normalized(
+      instance_.get(), parameterMappings_[slot].parameterIndex,
+      static_cast<double>(normalized)));
+}
+
 void PreparedEngine::applyParameters(
     const std::array<std::atomic<float> *, slotCount> &slots) noexcept {
+  const auto useDefaults =
+      parameterSeed_ && !parameterSeed_->applied.load(std::memory_order_acquire);
   for (std::size_t index = 0; index < parameterMappingCount_; ++index) {
-    const auto value = slots[index]->load(std::memory_order_relaxed);
-    const auto normalized =
-        std::isfinite(value) ? std::clamp(value, 0.0F, 1.0F) : 0.5F;
-    static_cast<void>(onda_set_param_normalized(
-        instance_.get(), parameterMappings_[index].parameterIndex,
-        static_cast<double>(normalized)));
+    applyParameter(index, useDefaults && index < parameterSeed_->count
+                              ? parameterSeed_->values[index]
+                              : slots[index]->load(std::memory_order_relaxed));
   }
 }
 
@@ -1462,11 +1442,13 @@ bool PreparedEngine::triggerEvent(
   return status == 0;
 }
 
-bool PreparedEngine::reset() noexcept {
+bool PreparedEngine::reset(
+    const std::array<std::atomic<float> *, slotCount> &slots) noexcept {
+  applyParameters(slots);
   logicalFrame_ = 0;
   blockStarted_ = false;
-  const auto status =
-      onda_init(instance_.get(), ONDA_INIT_PRESERVE_PINNED, &executionOutput_);
+  const auto status = onda_init_unchecked(
+      instance_.get(), ONDA_INIT_PRESERVE_PINNED, &executionOutput_);
   collectExecutionOutput();
   return status == 0 && onda_prepare_unchecked_process(instance_.get()) == 0;
 }

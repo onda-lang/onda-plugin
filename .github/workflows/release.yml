@@ -98,6 +98,32 @@ jobs:
             libxrandr-dev \
             libxrender-dev
 
+      - name: Checkout VST3 validator SDK
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          repository: steinbergmedia/vst3sdk
+          ref: 9fad9770f2ae8542ab1a548a68c1ad1ac690abe0 # v3.8.0_build_66
+          path: build-validator-sdk
+          persist-credentials: false
+
+      - name: Build VST3 validator
+        shell: bash
+        run: |
+          git -C build-validator-sdk submodule update --init --depth 1 \
+            base cmake pluginterfaces public.sdk
+          cmake -S build-validator-sdk -B build-validator \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DSMTG_ENABLE_VST3_PLUGIN_EXAMPLES=OFF \
+            -DSMTG_ENABLE_VST3_HOSTING_EXAMPLES=OFF \
+            -DSMTG_ENABLE_VSTGUI_SUPPORT=OFF
+          cmake --build build-validator --config Release --target validator --parallel 2
+          validator="$GITHUB_WORKSPACE/build-validator/bin/Release/validator"
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            validator="$validator.exe"
+          fi
+          test -f "$validator"
+          echo "ONDA_VST3_VALIDATOR=$validator" >> "$GITHUB_ENV"
+
       - name: Configure CMake on Windows
         if: runner.os == 'Windows'
         shell: pwsh
@@ -108,6 +134,7 @@ jobs:
             -OutputDirectory $webView2 `
             -NonInteractive
           cmake -S . -B $env:BUILD_PATH -A x64 `
+            "-DONDA_VST3_VALIDATOR=$env:ONDA_VST3_VALIDATOR" `
             "-DJUCE_WEBVIEW2_PACKAGE_LOCATION=$webView2"
 
       - name: Configure CMake on Unix
@@ -116,6 +143,7 @@ jobs:
         run: >
           cmake -S . -B "$BUILD_PATH"
           -DCMAKE_BUILD_TYPE=Release
+          -DONDA_VST3_VALIDATOR="$ONDA_VST3_VALIDATOR"
 
       - name: Build
         shell: bash
@@ -136,6 +164,7 @@ jobs:
           cmake -S . -B "$zero_input_build" \
             -DCMAKE_BUILD_TYPE=Release \
             -DONDA_PLUGIN_INPUT_CHANNELS=0 \
+            -DONDA_VST3_VALIDATOR="$ONDA_VST3_VALIDATOR" \
             -DONDA_SDK_ARCHIVE="$BUILD_PATH/_deps/onda-$onda_version-linux-x64.tar.xz" \
             -DONDA_SDK_CHECKSUMS="$BUILD_PATH/_deps/$onda_version-SHA256SUMS.txt" \
             -DONDA_RELEASE_SOURCE_DIR="$BUILD_PATH/_deps/ondareleasesource-src" \
@@ -143,7 +172,7 @@ jobs:
           cmake --build "$zero_input_build" --config Release \
             --target onda_vst3_smoke --parallel 2
           ctest --test-dir "$zero_input_build" -C Release \
-            --output-on-failure -R onda_vst3_smoke
+            --output-on-failure -R onda_vst3_
 
       - name: Package Unix bundles
         if: runner.os != 'Windows'
@@ -165,6 +194,9 @@ jobs:
             "$BUILD_PATH/onda_vst3_smoke" \
               "$package_root/OndaSynth.vst3/Contents/x86_64-linux/OndaSynth.so" \
               "$package_root/OndaFX.vst3/Contents/x86_64-linux/OndaFX.so"
+            for bundle in "$package_root"/*.vst3; do
+              "$ONDA_VST3_VALIDATOR" -q "$bundle"
+            done
           fi
           cd "$RUNNER_TEMP"
           cmake -E tar cf "$archive" --format=zip "$PACKAGE_NAME"
