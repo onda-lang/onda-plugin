@@ -25,9 +25,14 @@ struct ProductExpectation {
 
 [[nodiscard]] juce::File bundleForModule(const juce::File &module) {
   auto candidate = module;
-  while (candidate != juce::File{} && !candidate.hasFileExtension("vst3"))
-    candidate = candidate.getParentDirectory();
-  return candidate;
+  for (;;) {
+    if (candidate.isDirectory() && candidate.hasFileExtension("vst3"))
+      return candidate;
+    const auto parent = candidate.getParentDirectory();
+    if (parent == candidate)
+      return {};
+    candidate = parent;
+  }
 }
 
 [[nodiscard]] bool check(const bool condition, const juce::String &message) {
@@ -35,6 +40,21 @@ struct ProductExpectation {
     return true;
   std::cerr << message << '\n';
   return false;
+}
+
+[[nodiscard]] bool checkBundleLookup() {
+  const juce::File root{testTemporaryRoot().string()};
+  const auto bundle = root.getChildFile("Lookup.vst3");
+  const auto module = bundle.getChildFile("Contents/x86_64-win/Lookup.vst3");
+  if (!check(module.getParentDirectory().createDirectory().wasOk() &&
+                 module.replaceWithText("test module"),
+             "Could not create the Windows bundle lookup fixture"))
+    return false;
+  return check(bundleForModule(module) == bundle &&
+                   bundleForModule(bundle) == bundle &&
+                   bundleForModule(root.getChildFile("missing.bin")) ==
+                       juce::File{},
+               "VST3 bundle lookup did not resolve the bundle directory");
 }
 
 [[nodiscard]] bool checkMetadata(const juce::File &bundle,
@@ -285,6 +305,8 @@ int main(const int argc, const char *const *argv) {
   }
 
   juce::ScopedJuceInitialiser_GUI juceInitialiser;
+  if (!checkBundleLookup())
+    return 1;
   juce::VST3PluginFormatHeadless format;
   constexpr std::array expectations{
       ProductExpectation{"OndaSynth", false, "ABCDEF019182FAEB4F6E64614F64796E",

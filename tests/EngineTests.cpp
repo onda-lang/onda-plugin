@@ -1160,7 +1160,9 @@ sample { out1 = in1; out2 = in2 }
                                            slots) ||
       std::abs(bufferLeft[0] - 0.1F) >= 5.0e-4F ||
       std::abs(bufferRight[0] - 0.5F) >= 5.0e-4F) {
-    std::cerr << "exported buffer asset did not reproduce its checkpoint\n";
+    std::cerr << "exported buffer asset did not reproduce its checkpoint: "
+              << exportedBufferBuild.diagnostic.message << " (samples "
+              << bufferLeft[0] << ", " << bufferRight[0] << ")\n";
     std::filesystem::remove_all(assetExportRoot);
     return 1;
   }

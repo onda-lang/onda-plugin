@@ -16,7 +16,8 @@ std::string copyString(const char *text) {
 }
 
 std::string pathString(const std::filesystem::path &path) {
-  const auto bytes = path.u8string();
+  // Project-image file names require portable '/' separators on every OS.
+  const auto bytes = path.generic_u8string();
   return {reinterpret_cast<const char *>(bytes.data()), bytes.size()};
 }
 

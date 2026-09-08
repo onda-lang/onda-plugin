@@ -1,6 +1,7 @@
 #include "TemporaryDirectory.h"
 
 #include "AudioFile.h"
+#include "JucePath.h"
 #include "Processor.h"
 #include "RunViewHost.h"
 #include "TestAudioFile.h"
@@ -1459,8 +1460,11 @@ bool exerciseStateRestore() {
     hostileValues[1] = std::numeric_limits<float>::infinity();
     hostileValues[2] = -1.0F;
     hostileValues[3] = 2.0F;
+    const juce::File unicodeDirectory{onda::plugin::pathToJuce(
+        testTemporaryRoot() /
+        std::filesystem::path{u8"\u00d8nda/\u72b6\u614b"})};
     const auto hostileState =
-        makeState({}, juce::String::fromUTF8("/tmp/Ønda/状態"), hostileValues,
+        makeState({}, unicodeDirectory.getFullPathName(), hostileValues,
                   -100, 100'000);
     onda::plugin::Processor normalized(onda::plugin::Product::effect);
     normalized.setStateInformation(hostileState.getData(),
@@ -1471,8 +1475,7 @@ bool exerciseStateRestore() {
         std::abs(normalized.slotValue(2)) >= 1.0e-6F ||
         std::abs(normalized.slotValue(3) - 1.0F) >= 1.0e-6F || width != 360 ||
         height != 1400 ||
-        normalized.lastBrowseDirectory().getFullPathName() !=
-            juce::String::fromUTF8("/tmp/Ønda/状態")) {
+        normalized.lastBrowseDirectory() != unicodeDirectory) {
       std::cerr << "hostile finite, non-finite, or Unicode state was not "
                    "normalized safely\n";
       return false;
