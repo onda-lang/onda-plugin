@@ -64,7 +64,7 @@ projected at an interior boundary only when the same snapshot also supplies
 tempo. Stopped timeline positions remain unchanged, including when the program
 does not declare a `transport` event. Bar position and loop points use the host-provided values. 
 
-## Audio-file buffers
+## Audio buffers
 
 An `.ondaproject` input uses the immutable buffer defaults retained by Onda's
 compiled program. External buffers can also be bound by name to an audio file
