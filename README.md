@@ -1,15 +1,17 @@
-# Onda VST3 plugin
+<h1>
+  <img src="assets/svg/onda-logo-dark.svg" alt="onda logo" width="40" align="absmiddle" /> Onda VST3 Plugin
+</h1>
 
 `OndaSynth` and `OndaFX` are two VST3 plugins that allow you to run the 
 the [Onda](https://onda-lang.org) audio programming language in your favorite DAW.
 
+[Pre-built binaries](https://github.com/onda-lang/onda-plugin/releases) are available for Windows, macOS and Linux.
+
 ## Examples
 
-The [`examples`](examples) contains tested, plug-in-ready instruments and effects
-that exercise MIDI, host tempo, polyphony, dynamics, nonlinear processing, and
-modulated delay. Load instrument patches in `OndaSynth` and effects in `OndaFX`
-through the embedded run view. The complete collection is included in every
-release archive.
+The [`examples`](examples) contain tested, plug-in-ready instruments and effects
+that show basic Onda programs. Load instrument patches in `OndaSynth` and effects in `OndaFX`
+through the embedded run view. 
 
 ## DSP events
 
@@ -31,8 +33,7 @@ name with a different payload rejects the load. Channels are zero-based,
 ordinary MIDI notes use `id = -1`, and all continuous values except program
 number are normalized to `[0, 1]`. Pitch bend uses `0.5` as its center.
 Incoming messages whose event is not declared are ignored without splitting
-audio processing at their offsets. Unsupported system/SysEx messages are ignored
-without allocating in the audio callback.
+audio processing at their offsets. 
 
 JUCE playhead data is exposed through these optional, read-only host-context
 events:
@@ -57,21 +58,11 @@ supplies its field; there are no separate availability flags. If a host stops
 supplying a field, its handler is not called again, so the Onda program decides
 whether and how long to retain the previous value.
 
-The prepared engine retains an allocation-free presence table built from Onda
-event metadata. Undeclared context fields are not read, projected, packed, or
-dispatched. If the program declares no position-based context event, the audio
-callback does not request JUCE playhead position data at all. A declared
-`musical_position` also reads tempo when available because tempo is required to
-project PPQ to an interior logical-block boundary.
-
 While transport is playing, sample and second positions are projected from the
 host callback start to the logical block boundary. Quarter-note position is
 projected at an interior boundary only when the same snapshot also supplies
 tempo. Stopped timeline positions remain unchanged, including when the program
-does not declare a `transport` event. Bar position and
-loop points use the host-provided values. Host context is not stored in plugin
-state and cannot be used to control the DAW.
-
+does not declare a `transport` event. Bar position and loop points use the host-provided values. 
 
 ## Audio-file buffers
 
@@ -84,9 +75,6 @@ decoded on the background worker into pointer-stable, interleaved `f32` storage
 before the replacement engine is published. In addition to the JUCE formats,
 the loader accepts Onda's canonical `.ondabuffer` container.
 
-The decoded channel count must match a mono or fixed-channel Onda buffer;
-dynamic-channel buffers accept the file's channel count. Samples are not
-resampled: the file's original sample rate is supplied to Onda with the buffer.
 Audio-file bindings must be read-only: programs that may write a bound buffer
 are rejected during preparation because Onda project assets are immutable.
 The worker watches both source and bound audio files, so an edited audio file
@@ -97,18 +85,10 @@ reloading, while the project image always contains the matching canonical
 assets for deterministic DAW restore. Moving a linked audio file therefore
 falls back to the saved project image. Clearing a binding restores an available
 `.ondaproject` default; otherwise the current engine remains inactive until
-every declared buffer is bound.
-The source link and remaining bindings are saved even in this incomplete state.
-An initial source selection and partially bound buffers are saved immediately,
-including before the host prepares playback. Failed replacements retain the
-last complete project checkpoint.
+every declared buffer is bound. Failed replacements retain the last complete project checkpoint.
 If a replacement requires new buffer bindings, the view exposes those choices
 while the previous engine keeps playing. Binding or clearing these pending
 buffers preserves the last complete checkpoint until preparation succeeds.
-
-Runtime output retained for the editor is bounded to 1,024 records and 256 KiB
-of text and source metadata. Older records are discarded first and included in
-the corresponding drop count shown by the logger.
 
 ## Build
 
@@ -117,8 +97,7 @@ Requirements:
 - CMake 3.22+, Ninja, and a C++20 compiler
 - The plug-in version selected by [`plugin-version`](plugin-version)
 - The Onda release SDK selected by [`onda-version`](onda-version)
-- JUCE 8.0.13 at
-  `7c9d3783b127263d72bb65fe0a7e2dc8a02a7ac2`
+- JUCE selected by [`juce-version`](juce-version)
 - Linux editor builds: GTK 3 and WebKitGTK 4.1 development packages
 
 Configure and build the plugins:
@@ -155,11 +134,6 @@ overrides that pin; otherwise the `ONDA_VERSION` environment variable takes
 precedence over the file. This separation allows plug-in-only fixes to ship
 without changing the Onda SDK dependency.
 
-The current pin uses the official
-[Onda 0.8.3 release](https://github.com/onda-lang/onda/releases/tag/0.8.3).
-The default build downloads its SDK, verifies it against the release's
-`SHA256SUMS.txt`, and embeds run-view resources from the same release tag.
-
 For a private Onda release, download the archive and its checksums using
 authenticated GitHub CLI and pass them explicitly:
 
@@ -192,6 +166,3 @@ ctest --test-dir build --output-on-failure
 The same checks can be run directly with
 `scripts/validate-vst3.sh /path/to/validator build`.
 
-## Releases
-
-[Pre-built releases](https://github.com/onda-lang/onda-plugin/releases) are available for Windows, macOS and Linux.

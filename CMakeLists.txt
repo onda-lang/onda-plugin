@@ -37,12 +37,25 @@ if(NOT ONDA_VERSION MATCHES "^[0-9]+\\.[0-9]+\\.[0-9]+$")
     message(FATAL_ERROR "Invalid Onda version '${ONDA_VERSION}'")
 endif()
 
+set(JUCE_VERSION_FILE "${CMAKE_CURRENT_SOURCE_DIR}/juce-version")
+if(NOT EXISTS "${JUCE_VERSION_FILE}")
+    message(FATAL_ERROR "JUCE version file not found: ${JUCE_VERSION_FILE}")
+endif()
+file(STRINGS "${JUCE_VERSION_FILE}" JUCE_REVISION LIMIT_COUNT 1)
+string(STRIP "${JUCE_REVISION}" JUCE_REVISION)
+string(LENGTH "${JUCE_REVISION}" JUCE_REVISION_LENGTH)
+if(NOT JUCE_REVISION MATCHES "^[0-9a-f]+$" OR
+        NOT JUCE_REVISION_LENGTH EQUAL 40)
+    message(FATAL_ERROR "Invalid JUCE revision '${JUCE_REVISION}'")
+endif()
+
 # Match the Onda release SDK's minimum macOS version.
 if(CMAKE_HOST_APPLE AND NOT DEFINED CMAKE_OSX_DEPLOYMENT_TARGET)
     set(CMAKE_OSX_DEPLOYMENT_TARGET "15.0" CACHE STRING "Minimum macOS version")
 endif()
 project(onda-plugin VERSION "${ONDA_PLUGIN_VERSION}" LANGUAGES C CXX)
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+    "${CMAKE_CURRENT_SOURCE_DIR}/juce-version"
     "${CMAKE_CURRENT_SOURCE_DIR}/onda-version"
     "${CMAKE_CURRENT_SOURCE_DIR}/plugin-version")
 
@@ -93,8 +106,6 @@ set(ONDA_VST3_VALIDATOR "" CACHE FILEPATH
 message(STATUS
     "Building Onda VST3 ${PROJECT_VERSION} with Onda SDK ${ONDA_VERSION} "
     "(${ONDA_PLUGIN_INPUT_CHANNELS} inputs, ${ONDA_PLUGIN_OUTPUT_CHANNELS} outputs)")
-
-set(JUCE_REVISION "7c9d3783b127263d72bb65fe0a7e2dc8a02a7ac2")
 
 if(WIN32 AND CMAKE_SIZEOF_VOID_P EQUAL 8)
     set(ONDA_SDK_PLATFORM "windows-x64")

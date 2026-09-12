@@ -7,7 +7,7 @@ the corresponding terms in the `licenses` directory.
 | --- | --- | --- |
 | [Onda](https://github.com/onda-lang/onda) | Same as `onda-version` | `Onda/LICENSE` |
 | Onda native dependencies, including LLVM and statically linked Rust crates | Supplied by the Onda SDK | `Onda/THIRD_PARTY_NOTICES.md` and `Onda/licenses/` |
-| [JUCE](https://github.com/juce-framework/JUCE) | `7c9d3783b127263d72bb65fe0a7e2dc8a02a7ac2` | `JUCE-LICENSE.md` |
+| [JUCE](https://github.com/juce-framework/JUCE) | Same as `juce-version` | `JUCE-LICENSE.md` |
 | Microsoft WebView2 Loader (Windows only) | `1.0.3485.44` | `WebView2-LICENSE.txt` and `WebView2-NOTICE.txt` in Windows archives |
 | Steinberg VST3 SDK | Vendored by JUCE | `VST3-SDK-LICENSE.txt` |
 | FLAC | Vendored by JUCE | `FLAC-LICENSE.txt` |
