@@ -103,8 +103,7 @@ Requirements:
 Configure and build the plugins:
 
 ```sh
-cmake -S . -B build -G Ninja \
-  -DCMAKE_BUILD_TYPE=Release
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 ```
 
@@ -119,8 +118,7 @@ outputs. Custom builds can expose between 0 and 64 inputs and between 1 and 64
 outputs; for example:
 
 ```sh
-cmake -S . -B build -G Ninja \
-  -DCMAKE_BUILD_TYPE=Release \
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
   -DONDA_PLUGIN_INPUT_CHANNELS=4 \
   -DONDA_PLUGIN_OUTPUT_CHANNELS=8
 ```
@@ -162,8 +160,7 @@ For release verification, point CMake at Steinberg's VST3 validator so both
 bundles are included in the normal test suite:
 
 ```sh
-cmake -S . -B build \
-  -DONDA_VST3_VALIDATOR=/path/to/validator
+cmake -S . -B build -DONDA_VST3_VALIDATOR=/path/to/validator
 cmake --build build
 ctest --test-dir build --output-on-failure
 ```
