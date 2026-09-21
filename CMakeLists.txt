@@ -300,13 +300,10 @@ file(GLOB ONDA_JUCE_MODULE_SOURCES
     "${ONDA_JUCE_SOURCE_DIR}/modules/*/*.cpp"
     "${ONDA_JUCE_SOURCE_DIR}/modules/*/*.m"
     "${ONDA_JUCE_SOURCE_DIR}/modules/*/*.mm")
-if(MSVC)
-    set(ONDA_JUCE_WARNING_SUPPRESSION /w /wd9025)
-else()
-    set(ONDA_JUCE_WARNING_SUPPRESSION -w)
+if(NOT MSVC)
+    set_property(SOURCE ${ONDA_JUCE_MODULE_SOURCES} APPEND PROPERTY
+        COMPILE_OPTIONS -w)
 endif()
-set_property(SOURCE ${ONDA_JUCE_MODULE_SOURCES} APPEND PROPERTY
-    COMPILE_OPTIONS ${ONDA_JUCE_WARNING_SUPPRESSION})
 
 function(onda_treat_juce_headers_as_system target)
     target_include_directories(${target} SYSTEM PRIVATE
