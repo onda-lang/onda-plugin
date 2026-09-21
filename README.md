@@ -145,34 +145,3 @@ revision used for embedded run-view resources. `-DONDA_VERSION=x.y.z`
 overrides that pin; otherwise the `ONDA_VERSION` environment variable takes
 precedence over the file. This separation allows plug-in-only fixes to ship
 without changing the Onda SDK dependency.
-
-For a private Onda release, download the archive and its checksums using
-authenticated GitHub CLI and pass them explicitly:
-
-```sh
-onda_version="$(tr -d '\r\n' < onda-version)"
-gh release download "$onda_version" --repo onda-lang/onda \
-  --pattern "onda-$onda_version-linux-x64.tar.xz" \
-  --pattern SHA256SUMS.txt
-cmake -S . -B build -G Ninja \
-  -DCMAKE_BUILD_TYPE=Release \
-  -DONDA_SDK_ARCHIVE="$PWD/onda-$onda_version-linux-x64.tar.xz" \
-  -DONDA_SDK_CHECKSUMS="$PWD/SHA256SUMS.txt"
-```
-
-`ONDA_JUCE_ROOT` remains available as an optional exact-revision JUCE checkout;
-without it, CMake fetches the pinned JUCE revision. The bundles are written to
-`OndaSynth_artefacts/Release/VST3` and `OndaFX_artefacts/Release/VST3`. They are
-never copied into a system or user plugin directory.
-
-For release verification, point CMake at Steinberg's VST3 validator so both
-bundles are included in the normal test suite:
-
-```sh
-cmake -S . -B build -DONDA_VST3_VALIDATOR=/path/to/validator
-cmake --build build
-ctest --test-dir build --output-on-failure
-```
-
-The same checks can be run directly with
-`scripts/validate-vst3.sh /path/to/validator build`.

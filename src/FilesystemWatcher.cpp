@@ -372,20 +372,13 @@ public:
   }
 
   ~NativeWatcher() {
-    stopping_.store(true, std::memory_order_release);
     if (thread_.joinable()) {
-      PostQueuedCompletionStatus(completionPort_, 0, stopKey, nullptr);
+      static_cast<void>(
+          PostQueuedCompletionStatus(completionPort_, 0, stopKey, nullptr));
       thread_.join();
     }
-    for (auto &entry : entries_) {
-      if (entry->pending) {
-        CancelIoEx(entry->directory, &entry->operation);
-        DWORD ignored{};
-        static_cast<void>(GetOverlappedResult(
-            entry->directory, &entry->operation, &ignored, TRUE));
-      }
+    for (auto &entry : entries_)
       CloseHandle(entry->directory);
-    }
     if (completionPort_ != nullptr)
       CloseHandle(completionPort_);
   }
@@ -419,6 +412,31 @@ private:
     return entry.pending;
   }
 
+  void cancelPending() noexcept {
+    // The IOCP thread exclusively owns pending state. Drain every cancelled
+    // completion before the entries and their OVERLAPPED storage are destroyed.
+    auto remaining = std::size_t{};
+    for (auto &entry : entries_) {
+      if (!entry->pending)
+        continue;
+      ++remaining;
+      static_cast<void>(CancelIoEx(entry->directory, &entry->operation));
+    }
+
+    while (remaining != 0U) {
+      DWORD bytes{};
+      ULONG_PTR key{};
+      OVERLAPPED *operation{};
+      static_cast<void>(GetQueuedCompletionStatus(
+          completionPort_, &bytes, &key, &operation, INFINITE));
+      auto *entry = reinterpret_cast<Entry *>(key);
+      if (entry != nullptr && operation == &entry->operation && entry->pending) {
+        entry->pending = false;
+        --remaining;
+      }
+    }
+  }
+
   void run() noexcept {
     for (;;) {
       DWORD bytes{};
@@ -426,8 +444,10 @@ private:
       OVERLAPPED *operation{};
       const auto success = GetQueuedCompletionStatus(
           completionPort_, &bytes, &key, &operation, INFINITE);
-      if (key == stopKey || stopping_.load(std::memory_order_acquire))
+      if (key == stopKey) {
+        cancelPending();
         return;
+      }
       auto *entry = reinterpret_cast<Entry *>(key);
       if (entry == nullptr || operation != &entry->operation) {
         callback_({}, true);
@@ -461,7 +481,6 @@ private:
   HANDLE completionPort_{};
   std::vector<std::unique_ptr<Entry>> entries_;
   Paths registered_;
-  std::atomic<bool> stopping_{};
   std::thread thread_;
 };
 
