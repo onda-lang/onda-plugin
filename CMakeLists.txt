@@ -293,6 +293,37 @@ else()
     set(ONDA_JUCE_SOURCE_DIR "${juce_SOURCE_DIR}")
 endif()
 
+# JUCE modules are compiled as sources of each consumer, so consumer warning
+# flags otherwise diagnose JUCE and its bundled codecs as if they were ours.
+file(GLOB ONDA_JUCE_MODULE_SOURCES
+    "${ONDA_JUCE_SOURCE_DIR}/modules/*/*.c"
+    "${ONDA_JUCE_SOURCE_DIR}/modules/*/*.cpp"
+    "${ONDA_JUCE_SOURCE_DIR}/modules/*/*.m"
+    "${ONDA_JUCE_SOURCE_DIR}/modules/*/*.mm")
+if(MSVC)
+    set(ONDA_JUCE_WARNING_SUPPRESSION /w)
+else()
+    set(ONDA_JUCE_WARNING_SUPPRESSION -w)
+endif()
+set_property(SOURCE ${ONDA_JUCE_MODULE_SOURCES} APPEND PROPERTY
+    COMPILE_OPTIONS "${ONDA_JUCE_WARNING_SUPPRESSION}")
+
+function(onda_treat_juce_headers_as_system target)
+    target_include_directories(${target} SYSTEM PRIVATE
+        "${ONDA_JUCE_SOURCE_DIR}/modules")
+endfunction()
+
+add_library(onda_lto_flags INTERFACE)
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    target_compile_options(onda_lto_flags INTERFACE
+        $<$<CONFIG:Release>:-flto=auto>)
+    target_link_options(onda_lto_flags INTERFACE
+        $<$<CONFIG:Release>:-flto=auto>)
+else()
+    target_link_libraries(onda_lto_flags INTERFACE
+        juce::juce_recommended_lto_flags)
+endif()
+
 set(ONDA_RELEASE_LICENSE_DIR "${CMAKE_BINARY_DIR}/release-licenses")
 file(REMOVE_RECURSE "${ONDA_RELEASE_LICENSE_DIR}")
 file(MAKE_DIRECTORY "${ONDA_RELEASE_LICENSE_DIR}")
@@ -380,6 +411,8 @@ add_library(onda_plugin_engine STATIC
     src/AudioFile.h
     src/Engine.cpp
     src/Engine.h
+    src/EventPayload.cpp
+    src/EventPayload.h
     src/OndaSdk.cpp
     src/OndaSdk.h
     src/Primitive.h
@@ -397,6 +430,7 @@ target_link_libraries(onda_plugin_engine
     PUBLIC Onda::Static
     PRIVATE juce::juce_audio_formats
 )
+onda_treat_juce_headers_as_system(onda_plugin_engine)
 target_compile_definitions(onda_plugin_engine PUBLIC
     JUCE_USE_CURL=0
     ONDA_PLUGIN_INPUT_CHANNELS=${ONDA_PLUGIN_INPUT_CHANNELS}
@@ -456,9 +490,10 @@ function(add_onda_plugin target product_name plugin_code is_synth)
         juce::juce_gui_extra
         juce::juce_audio_plugin_client
         juce::juce_recommended_config_flags
-        juce::juce_recommended_lto_flags
         juce::juce_recommended_warning_flags
+        onda_lto_flags
     )
+    onda_treat_juce_headers_as_system(${target})
     target_compile_definitions(${target} PRIVATE
         JUCE_WEB_BROWSER=1
         JUCE_USE_CURL=0
@@ -508,6 +543,7 @@ if(BUILD_TESTING AND ONDA_PLUGIN_BUILD_TESTS)
         onda_plugin_engine
         juce::juce_audio_formats
     )
+    onda_treat_juce_headers_as_system(onda_plugin_tests)
     if(MSVC)
         target_compile_options(onda_plugin_tests PRIVATE /W4 /permissive-)
     else()
@@ -539,6 +575,7 @@ if(BUILD_TESTING AND ONDA_PLUGIN_BUILD_TESTS)
         juce::juce_recommended_config_flags
         juce::juce_recommended_warning_flags
     )
+    onda_treat_juce_headers_as_system(onda_processor_tests)
     target_compile_definitions(onda_processor_tests PRIVATE
         JUCE_WEB_BROWSER=1
         JUCE_USE_CURL=0
@@ -564,6 +601,12 @@ if(BUILD_TESTING AND ONDA_PLUGIN_BUILD_TESTS)
     else()
         target_compile_options(onda_processor_tests PRIVATE
             -Wall -Wextra -Wpedantic -Wconversion -Wsign-conversion)
+        if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+            # The test intentionally pairs malloc/free in replacement
+            # new/delete operators so it can audit real-time allocations.
+            target_compile_options(onda_processor_tests PRIVATE
+                -Wno-mismatched-new-delete)
+        endif()
     endif()
     if(ONDA_PLUGIN_INPUT_CHANNELS EQUAL 2 AND
             ONDA_PLUGIN_OUTPUT_CHANNELS EQUAL 2)
@@ -579,6 +622,7 @@ if(BUILD_TESTING AND ONDA_PLUGIN_BUILD_TESTS)
         Threads::Threads
         ${CMAKE_DL_LIBS}
     )
+    onda_treat_juce_headers_as_system(onda_vst3_smoke)
     target_compile_definitions(onda_vst3_smoke PRIVATE
         ONDA_PLUGIN_VERSION="${PROJECT_VERSION}"
         ONDA_PLUGIN_INPUT_CHANNELS=${ONDA_PLUGIN_INPUT_CHANNELS}

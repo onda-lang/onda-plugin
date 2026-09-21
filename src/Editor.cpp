@@ -42,6 +42,14 @@ constexpr auto juceHostBridgeScript = R"JS(
   }
 
   function defaultEventArgumentValue(argument) {
+    const structured = typeof argument?.type === "string"
+      && !/^(?:f32|f64|i32|i64|bool)(?:\[[0-9]*\])?$/.test(argument.type);
+    if (structured) {
+      const value = argument.default ?? {};
+      return typeof structuredClone === "function"
+        ? structuredClone(value)
+        : JSON.parse(JSON.stringify(value));
+    }
     const isArray = Boolean(
       argument?.isSlice
       || (typeof argument?.arrayLength === "number" && argument.arrayLength !== 1)
@@ -55,6 +63,10 @@ constexpr auto juceHostBridgeScript = R"JS(
     }
     if (argument?.type === "i64") {
       return typeof argument.default === "string" ? argument.default : "0";
+    }
+    if ((argument?.type === "f32" || argument?.type === "f64")
+        && ["NaN", "Infinity", "-Infinity"].includes(argument.default)) {
+      return argument.default;
     }
     const value = Number(argument?.default);
     return Number.isFinite(value) ? value : 0;
@@ -365,7 +377,8 @@ void Editor::handleCommand(const juce::var &command) {
     const auto key = input->getProperty("key");
     const auto velocity = input->getProperty("velocity");
     const auto pressed = input->getProperty("pressed");
-    if (key.isInt() && (velocity.isDouble() || velocity.isInt()) && pressed.isBool())
+    if (key.isInt() && (velocity.isDouble() || velocity.isInt()) &&
+        pressed.isBool())
       processor_.triggerMidiNote(static_cast<int>(key),
                                  static_cast<float>(velocity),
                                  static_cast<bool>(pressed));

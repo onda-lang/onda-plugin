@@ -7,12 +7,10 @@
 
 #include <algorithm>
 #include <bit>
-#include <charconv>
 #include <cmath>
 #include <cstring>
 #include <limits>
 #include <new>
-#include <system_error>
 #include <unordered_set>
 
 namespace onda::plugin {
@@ -25,102 +23,6 @@ constexpr int maximumBufferNameBytes = 1024;
 constexpr int maximumBufferBindings = 1024;
 constexpr std::size_t maximumRuntimeLogEntries = 1024U;
 constexpr std::size_t maximumRuntimeLogBytes = 256U * 1024U;
-
-template <typename Value>
-bool appendEventValue(UserEventCommand &command, const Value value) noexcept {
-  if (command.payloadBytes > command.payload.size() - sizeof(value))
-    return false;
-  std::memcpy(command.payload.data() + command.payloadBytes, &value,
-              sizeof(value));
-  command.payloadBytes += static_cast<std::uint32_t>(sizeof(value));
-  return true;
-}
-
-std::optional<double> eventNumber(const juce::var &value) {
-  if (!value.isInt() && !value.isInt64() && !value.isDouble())
-    return std::nullopt;
-  const auto number = static_cast<double>(value);
-  return std::isfinite(number) ? std::optional<double>{number} : std::nullopt;
-}
-
-bool isInteger(const double value) noexcept {
-  return std::fpclassify(std::remainder(value, 1.0)) == FP_ZERO;
-}
-
-bool appendEventScalar(UserEventCommand &command, const int type,
-                       const juce::var &value) {
-  if (type == ONDA_PRIMITIVE_BOOL)
-    return value.isBool() &&
-           appendEventValue(
-               command, static_cast<std::uint8_t>(static_cast<bool>(value)));
-
-  if (type == ONDA_PRIMITIVE_I64) {
-    if (value.isString()) {
-      const auto text = value.toString().toStdString();
-      std::int64_t integer{};
-      const auto parsed =
-          std::from_chars(text.data(), text.data() + text.size(), integer);
-      return parsed.ec == std::errc{} &&
-             parsed.ptr == text.data() + text.size() &&
-             appendEventValue(command, integer);
-    }
-    if (value.isInt())
-      return appendEventValue(
-          command, static_cast<std::int64_t>(static_cast<int>(value)));
-    if (value.isInt64())
-      return appendEventValue(
-          command, static_cast<std::int64_t>(static_cast<juce::int64>(value)));
-  }
-
-  const auto number = eventNumber(value);
-  if (!number)
-    return false;
-  switch (type) {
-  case ONDA_PRIMITIVE_F32:
-    return *number >= -static_cast<double>(std::numeric_limits<float>::max()) &&
-           *number <= static_cast<double>(std::numeric_limits<float>::max()) &&
-           appendEventValue(command, static_cast<float>(*number));
-  case ONDA_PRIMITIVE_F64:
-    return appendEventValue(command, *number);
-  case ONDA_PRIMITIVE_I32:
-    return isInteger(*number) &&
-           *number >=
-               static_cast<double>(std::numeric_limits<std::int32_t>::min()) &&
-           *number <=
-               static_cast<double>(std::numeric_limits<std::int32_t>::max()) &&
-           appendEventValue(command, static_cast<std::int32_t>(*number));
-  case ONDA_PRIMITIVE_I64: {
-    // A double cannot identify integers outside JavaScript's exact range.
-    // Full-range i64 values cross the UI boundary as decimal strings.
-    constexpr auto maximumExactDoubleInteger = 9'007'199'254'740'991.0;
-    return isInteger(*number) && *number >= -maximumExactDoubleInteger &&
-           *number <= maximumExactDoubleInteger &&
-           appendEventValue(command, static_cast<std::int64_t>(*number));
-  }
-  default:
-    return false;
-  }
-}
-
-bool appendEventParameter(UserEventCommand &command,
-                          const EventParameterMapping &parameter,
-                          const juce::var &value) {
-  if (!parameter.array && !parameter.slice)
-    return appendEventScalar(command, parameter.elementType, value);
-  const auto *values = value.getArray();
-  if (values == nullptr ||
-      (parameter.array && values->size() != parameter.arrayLength) ||
-      values->size() > std::numeric_limits<std::int32_t>::max()) {
-    return false;
-  }
-  if (parameter.slice &&
-      !appendEventValue(command, static_cast<std::int32_t>(values->size()))) {
-    return false;
-  }
-  return std::ranges::all_of(*values, [&command, &parameter](const auto &item) {
-    return appendEventScalar(command, parameter.elementType, item);
-  });
-}
 
 [[nodiscard]] std::size_t
 runtimeLogPayloadBytes(const RuntimeLogRecord &record) noexcept {
@@ -640,12 +542,19 @@ void Processor::processBlock(juce::AudioBuffer<float> &audio,
   while (userEvents_.tryPop(userEventScratch_)) {
     if (userEventScratch_.generation != active_->buildGeneration())
       continue;
-    if (userEventScratch_.payloadBytes > userEventScratch_.payload.size() ||
-        !active_->triggerEvent(
-            userEventScratch_.eventIndex,
-            {userEventScratch_.payload.data(),
-             static_cast<std::size_t>(userEventScratch_.payloadBytes)},
-            slotAtomics_, hostContext)) {
+    if (userEventScratch_.payloadBytes > userEventScratch_.payload.size()) {
+      faultActive();
+      fallback(audio);
+      return;
+    }
+    const auto result = active_->triggerEvent(
+        userEventScratch_.eventIndex,
+        {userEventScratch_.payload.data(),
+         static_cast<std::size_t>(userEventScratch_.payloadBytes)},
+        slotAtomics_, hostContext);
+    if (result == EventTriggerResult::inputRejected)
+      continue;
+    if (result == EventTriggerResult::runtimeFailure) {
       faultActive();
       fallback(audio);
       return;
@@ -692,7 +601,8 @@ void Processor::processBlock(juce::AudioBuffer<float> &audio,
     keyboardGeneration_ = active_->buildGeneration();
   }
   const auto dispatchKeyboardNote = [&](const int key, const float velocity) {
-    const MidiEvent event{velocity > 0.0F ? MidiKind::noteOn : MidiKind::noteOff,
+    const MidiEvent event{velocity > 0.0F ? MidiKind::noteOn
+                                          : MidiKind::noteOff,
                           0, 0, key, velocity};
     if (!processRange(0, 0, std::span<const MidiEvent>{&event, 1U}))
       return false;
@@ -702,7 +612,8 @@ void Processor::processBlock(juce::AudioBuffer<float> &audio,
   auto succeeded = true;
   const auto epoch = keyboardEpoch_.load(std::memory_order_acquire);
   if (consumedKeyboardEpoch_ != epoch) {
-    for (std::size_t key = 0; key < keyboardHeldNotes_.size() && succeeded; ++key) {
+    for (std::size_t key = 0; key < keyboardHeldNotes_.size() && succeeded;
+         ++key) {
       if (keyboardHeldNotes_[key])
         succeeded = dispatchKeyboardNote(static_cast<int>(key), 0.0F);
     }
@@ -710,8 +621,8 @@ void Processor::processBlock(juce::AudioBuffer<float> &audio,
   }
   KeyboardNoteCommand keyboardNote;
   // Bound callback work even if the producer continues submitting notes.
-  for (std::size_t count = 0; count < 256U && keyboardNotes_.tryPop(keyboardNote);
-       ++count) {
+  for (std::size_t count = 0;
+       count < 256U && keyboardNotes_.tryPop(keyboardNote); ++count) {
     if (keyboardNote.generation == keyboardGeneration_ &&
         keyboardNote.epoch == epoch && succeeded)
       succeeded = dispatchKeyboardNote(keyboardNote.key, keyboardNote.velocity);
@@ -840,17 +751,17 @@ bool Processor::saveProjectAsAsync(
   try {
     const auto snapshot =
         worker_->projectExportSnapshot().value_or(ProjectExportSnapshot{});
-    exportPool_.addJob([this, snapshot, directory,
-                        completion = std::move(completion)] {
-      auto result = saveProjectSnapshot(snapshot, directory);
-      exportPending_.store(false, std::memory_order_release);
-      if (completion) {
-        juce::MessageManager::callAsync(
-            [completion, result = std::move(result)]() mutable {
-              completion(std::move(result));
-            });
-      }
-    });
+    exportPool_.addJob(
+        [this, snapshot, directory, completion = std::move(completion)] {
+          auto result = saveProjectSnapshot(snapshot, directory);
+          exportPending_.store(false, std::memory_order_release);
+          if (completion) {
+            juce::MessageManager::callAsync(
+                [completion, result = std::move(result)]() mutable {
+                  completion(std::move(result));
+                });
+          }
+        });
   } catch (...) {
     exportPending_.store(false, std::memory_order_release);
     return false;
@@ -923,14 +834,13 @@ std::string Processor::triggerEvent(const std::string_view name,
   UserEventCommand command;
   command.generation = status.engineGeneration;
   command.eventIndex = event->index;
-  for (std::size_t index = 0; index < event->parameters.size(); ++index) {
-    if (!appendEventParameter(
-            command, event->parameters[index],
-            arguments->getReference(static_cast<int>(index)))) {
-      return "Event '" + event->name + "' parameter '" +
-             event->parameters[index].name + "' has an invalid value";
-    }
-  }
+  std::size_t payloadBytes{};
+  std::string payloadError;
+  if (!encodePayload(event->schema, values, command.payload, payloadBytes,
+                     payloadError))
+    return "Event '" + event->name +
+           "' has an invalid payload: " + payloadError;
+  command.payloadBytes = static_cast<std::uint32_t>(payloadBytes);
   if (!userEvents_.tryPush(command))
     return "The event queue is full";
   return {};
@@ -976,10 +886,10 @@ void Processor::triggerMidiNote(const int key, const float velocity,
   const auto status = workerStatus();
   if (!status.active || !status.midi.noteOn || !status.midi.noteOff)
     return;
-  if (!keyboardNotes_.tryPush({status.engineGeneration,
-                               keyboardEpoch_.load(std::memory_order_acquire), key,
-                               pressed ? std::clamp(velocity, 0.0F, 1.0F)
-                                       : 0.0F}))
+  if (!keyboardNotes_.tryPush(
+          {status.engineGeneration,
+           keyboardEpoch_.load(std::memory_order_acquire), key,
+           pressed ? std::clamp(velocity, 0.0F, 1.0F) : 0.0F}))
     releaseKeyboardNotes();
 }
 
@@ -1162,10 +1072,9 @@ void Processor::drainRuntimeLogs() {
       runtimeLogRecords_.push_back(std::move(record.record));
     }
     auto discarded = std::size_t{};
-    while (
-        discarded < runtimeLogRecords_.size() &&
-        (runtimeLogRecords_.size() - discarded > maximumRuntimeLogEntries ||
-         runtimeLogBytes_ > maximumRuntimeLogBytes)) {
+    while (discarded < runtimeLogRecords_.size() &&
+           (runtimeLogRecords_.size() - discarded > maximumRuntimeLogEntries ||
+            runtimeLogBytes_ > maximumRuntimeLogBytes)) {
       const auto &record = runtimeLogRecords_[discarded];
       runtimeLogBytes_ -= runtimeLogPayloadBytes(record);
       auto &dropCounter = record.kind == RuntimeLogKind::print

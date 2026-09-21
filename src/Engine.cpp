@@ -5,12 +5,15 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <charconv>
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <numeric>
 #include <span>
 #include <string_view>
+#include <type_traits>
 #include <utility>
 
 namespace onda::plugin {
@@ -185,7 +188,7 @@ std::optional<ParameterMapping> parameterMapping(const onda_program_t *program,
   if (hasStep == 1) {
     const auto step = onda_param_step_f64(program, index);
     const auto stepCount = onda_param_step_count(program, index);
-    if (!std::isfinite(step) || step <= 0.0 || stepCount == 0U)
+    if (!std::isfinite(step) || step <= 0.0 || stepCount <= 0)
       return std::nullopt;
     mapping.step = step;
     mapping.stepCount = stepCount;
@@ -287,6 +290,70 @@ bool isPluginEvent(const std::string_view name) noexcept {
          std::ranges::any_of(expectedHostContextEvents, named);
 }
 
+int payloadPrimitive(const PayloadScalar scalar) noexcept {
+  switch (scalar) {
+  case PayloadScalar::f32:
+    return ONDA_PRIMITIVE_F32;
+  case PayloadScalar::f64:
+    return ONDA_PRIMITIVE_F64;
+  case PayloadScalar::i32:
+    return ONDA_PRIMITIVE_I32;
+  case PayloadScalar::i64:
+    return ONDA_PRIMITIVE_I64;
+  case PayloadScalar::boolean:
+    return ONDA_PRIMITIVE_BOOL;
+  }
+  return -1;
+}
+
+bool eventTensorMetadataMatches(const onda_program_t *program,
+                                const int eventIndex,
+                                const PayloadSchema &schema) {
+  const auto tensorCount = onda_event_tensor_count(program, eventIndex);
+  if (tensorCount < 0)
+    return false;
+
+  const auto plan = makePayloadPlan(schema);
+  const auto expectedCount = std::accumulate(
+      plan.parameters.begin(), plan.parameters.end(), std::size_t{},
+      [](const auto count, const auto &parameter) {
+        return count + parameter.leaves.size();
+      });
+  if (expectedCount != static_cast<std::size_t>(tensorCount))
+    return false;
+
+  int tensorIndex{};
+  for (std::size_t parameterIndex = 0; parameterIndex < plan.parameters.size();
+       ++parameterIndex) {
+    const auto &parameter = plan.parameters[parameterIndex];
+    for (const auto &leaf : parameter.leaves) {
+      onda_event_tensor_info_t info{};
+      if (onda_event_tensor_info(program, eventIndex, tensorIndex++, &info) !=
+              0 ||
+          info.path == nullptr || info.shape_rank < 0 ||
+          info.parameter_index != static_cast<int>(parameterIndex) ||
+          info.element_type != payloadPrimitive(leaf.scalar) ||
+          info.is_slice != static_cast<int>(parameter.dynamic) ||
+          info.fixed_element_count <= 0 ||
+          static_cast<std::size_t>(info.fixed_element_count) !=
+              leaf.fixedElements ||
+          leaf.path != info.path ||
+          static_cast<std::size_t>(info.shape_rank) != leaf.shape.size() ||
+          (info.shape_rank != 0 && info.shape == nullptr)) {
+        return false;
+      }
+      for (int axis = 0; axis < info.shape_rank; ++axis) {
+        if (info.shape[axis] <= 0 ||
+            static_cast<std::size_t>(info.shape[axis]) !=
+                leaf.shape[static_cast<std::size_t>(axis)]) {
+          return false;
+        }
+      }
+    }
+  }
+  return true;
+}
+
 bool collectVisibleEvents(const onda_program_t *program,
                           std::vector<EventMapping> &events,
                           Diagnostic &diagnostic) {
@@ -298,8 +365,8 @@ bool collectVisibleEvents(const onda_program_t *program,
   events.reserve(static_cast<std::size_t>(count));
   for (int eventIndex = 0; eventIndex < count; ++eventIndex) {
     const auto *rawName = onda_event_name(program, eventIndex);
-    const auto parameterCount = onda_event_param_count(program, eventIndex);
-    if (rawName == nullptr || parameterCount < 0) {
+    const auto *schemaJson = onda_event_schema_json(program, eventIndex);
+    if (rawName == nullptr || schemaJson == nullptr) {
       diagnostic = error("Onda returned invalid event metadata");
       return false;
     }
@@ -309,60 +376,27 @@ bool collectVisibleEvents(const onda_program_t *program,
     EventMapping event{
         .index = eventIndex,
         .name = rawName,
+        .schema = {},
         .parameters = {},
     };
-    event.parameters.reserve(static_cast<std::size_t>(parameterCount));
-    for (int parameterIndex = 0; parameterIndex < parameterCount;
-         ++parameterIndex) {
-      const auto *parameterName =
-          onda_event_param_name(program, eventIndex, parameterIndex);
-      const auto elementType =
-          onda_event_param_elem_type(program, eventIndex, parameterIndex);
-      const auto type = primitiveName(elementType);
-      const auto arrayLength =
-          onda_event_param_array_len(program, eventIndex, parameterIndex);
-      const auto isArray =
-          onda_event_param_is_array(program, eventIndex, parameterIndex);
-      const auto isSlice =
-          onda_event_param_is_slice(program, eventIndex, parameterIndex);
-      if (parameterName == nullptr || type.empty() || arrayLength < 0 ||
-          (isArray != 0 && isArray != 1) || (isSlice != 0 && isSlice != 1) ||
-          (isArray == 1 && (isSlice == 1 || arrayLength <= 0)) ||
-          (isSlice == 1 && arrayLength != 0) ||
-          (isArray == 0 && isSlice == 0 && arrayLength != 1)) {
-        diagnostic = error("Onda returned invalid event metadata");
-        return false;
-      }
-
-      EventParameterMapping parameter{
-          .name = parameterName,
-          .type = std::string{type},
-          .elementType = elementType,
-          .arrayLength = arrayLength,
-          .array = isArray == 1,
-          .slice = isSlice == 1,
-          .defaultBytes = {},
-      };
-      if (parameter.array)
-        parameter.type += "[" + std::to_string(arrayLength) + "]";
-      else if (parameter.slice)
-        parameter.type += "[]";
-
-      const auto defaultBytes = onda_event_param_default_bytes(
-          program, eventIndex, parameterIndex, nullptr, 0);
-      if (defaultBytes < 0) {
-        diagnostic = error("Onda returned invalid event metadata");
-        return false;
-      }
-      parameter.defaultBytes.resize(static_cast<std::size_t>(defaultBytes));
-      if (defaultBytes > 0 &&
-          onda_event_param_default_bytes(program, eventIndex, parameterIndex,
-                                         parameter.defaultBytes.data(),
-                                         defaultBytes) != defaultBytes) {
-        diagnostic = error("Onda returned invalid event metadata");
-        return false;
-      }
-      event.parameters.push_back(std::move(parameter));
+    std::string schemaError;
+    if (!parsePayloadSchema(schemaJson, event.schema, schemaError)) {
+      diagnostic =
+          error("Onda returned invalid event metadata: " + schemaError);
+      return false;
+    }
+    if (!eventTensorMetadataMatches(program, eventIndex, event.schema)) {
+      diagnostic = error("Onda returned inconsistent event tensor metadata");
+      return false;
+    }
+    event.parameters.reserve(event.schema.parameters.size());
+    for (const auto &parameter : event.schema.parameters) {
+      event.parameters.push_back({
+          .name = parameter.name,
+          .type = payloadTypeName(*parameter.type),
+          .payloadType = parameter.type,
+          .defaultValue = parameter.defaultValue,
+      });
     }
     events.push_back(std::move(event));
   }
@@ -387,34 +421,33 @@ bool appendNumber(RuntimeLogEntry &entry, const Value value) noexcept {
          appendText(entry, {text.data(), converted.ptr});
 }
 
-bool appendScalar(RuntimeLogEntry &entry, const int elementType,
-                  const std::uint8_t *bytes) noexcept {
-  switch (elementType) {
-  case ONDA_PRIMITIVE_BOOL:
+template <typename Unsigned>
+Unsigned readLittleEndian(const std::uint8_t *bytes) noexcept {
+  Unsigned value{};
+  for (std::size_t index = 0; index < sizeof(Unsigned); ++index)
+    value |= static_cast<Unsigned>(bytes[index]) << (index * 8U);
+  return value;
+}
+
+bool appendPayloadScalar(RuntimeLogEntry &entry, const PayloadScalar scalar,
+                         const std::uint8_t *bytes) noexcept {
+  switch (scalar) {
+  case PayloadScalar::boolean:
     return appendText(entry, bytes[0] == 0U ? "false" : "true");
-  case ONDA_PRIMITIVE_F32: {
-    float value{};
-    std::memcpy(&value, bytes, sizeof(value));
-    return appendNumber(entry, value);
+  case PayloadScalar::f32:
+    return appendNumber(
+        entry, std::bit_cast<float>(readLittleEndian<std::uint32_t>(bytes)));
+  case PayloadScalar::f64:
+    return appendNumber(
+        entry, std::bit_cast<double>(readLittleEndian<std::uint64_t>(bytes)));
+  case PayloadScalar::i32:
+    return appendNumber(entry, std::bit_cast<std::int32_t>(
+                                   readLittleEndian<std::uint32_t>(bytes)));
+  case PayloadScalar::i64:
+    return appendNumber(entry, std::bit_cast<std::int64_t>(
+                                   readLittleEndian<std::uint64_t>(bytes)));
   }
-  case ONDA_PRIMITIVE_F64: {
-    double value{};
-    std::memcpy(&value, bytes, sizeof(value));
-    return appendNumber(entry, value);
-  }
-  case ONDA_PRIMITIVE_I32: {
-    std::int32_t value{};
-    std::memcpy(&value, bytes, sizeof(value));
-    return appendNumber(entry, value);
-  }
-  case ONDA_PRIMITIVE_I64: {
-    std::int64_t value{};
-    std::memcpy(&value, bytes, sizeof(value));
-    return appendNumber(entry, value);
-  }
-  default:
-    return false;
-  }
+  return false;
 }
 
 template <std::size_t Size>
@@ -503,7 +536,20 @@ bool writePayload(std::array<std::byte, 32U> &payload, const int payloadBytes,
                         static_cast<std::size_t>(payloadBytes)) {
     return false;
   }
-  std::memcpy(payload.data() + offset, &value, sizeof(Value));
+  const auto bits = [&] {
+    if constexpr (std::is_same_v<Value, bool>)
+      return static_cast<std::uint8_t>(value);
+    else if constexpr (std::is_same_v<Value, float>)
+      return std::bit_cast<std::uint32_t>(value);
+    else if constexpr (std::is_same_v<Value, double>)
+      return std::bit_cast<std::uint64_t>(value);
+    else
+      return std::bit_cast<std::make_unsigned_t<Value>>(value);
+  }();
+  for (std::size_t byte = 0; byte < sizeof(bits); ++byte) {
+    payload[static_cast<std::size_t>(offset) + byte] =
+        static_cast<std::byte>((bits >> (byte * 8U)) & decltype(bits){0xff});
+  }
   return true;
 }
 
@@ -529,10 +575,10 @@ bool PreparedEngine::trigger(const EventBinding &binding,
 }
 
 PreparedEngine::PreparedEngine(
-    const double sampleRate, const int blockSize,
-    ProgramHandle program, InstanceHandle instance, const int inputChannels,
-    const int outputChannels, std::vector<float> inputSlab,
-    std::vector<float> outputSlab, std::vector<BufferStorage> bufferStorage,
+    const double sampleRate, const int blockSize, ProgramHandle program,
+    InstanceHandle instance, const int inputChannels, const int outputChannels,
+    std::vector<float> inputSlab, std::vector<float> outputSlab,
+    std::vector<BufferStorage> bufferStorage,
     std::vector<BufferMapping> bufferMappings) noexcept
     : sampleRate_(sampleRate), blockSize_(blockSize),
       program_(std::move(program)), inputChannels_(inputChannels),
@@ -552,41 +598,20 @@ bool PreparedEngine::prepareRuntimeOutput(Diagnostic &diagnostic) {
   delegates_.reserve(static_cast<std::size_t>(delegateCount));
   for (int delegateIndex = 0; delegateIndex < delegateCount; ++delegateIndex) {
     const auto *name = onda_delegate_name(program_.get(), delegateIndex);
-    const auto parameterCount =
-        onda_delegate_param_count(program_.get(), delegateIndex);
-    if (name == nullptr || parameterCount < 0) {
+    const auto *schemaJson =
+        onda_delegate_schema_json(program_.get(), delegateIndex);
+    if (name == nullptr || schemaJson == nullptr) {
       diagnostic = error("Onda returned invalid delegate metadata");
       return false;
     }
-    DelegateMetadata delegate{.name = name, .parameters = {}};
-    delegate.parameters.reserve(static_cast<std::size_t>(parameterCount));
-    for (int parameterIndex = 0; parameterIndex < parameterCount;
-         ++parameterIndex) {
-      const auto *parameterName = onda_delegate_param_name(
-          program_.get(), delegateIndex, parameterIndex);
-      const auto elementType = onda_delegate_param_elem_type(
-          program_.get(), delegateIndex, parameterIndex);
-      const auto arrayLength = onda_delegate_param_array_len(
-          program_.get(), delegateIndex, parameterIndex);
-      const auto array = onda_delegate_param_is_array(
-          program_.get(), delegateIndex, parameterIndex);
-      const auto slice = onda_delegate_param_is_slice(
-          program_.get(), delegateIndex, parameterIndex);
-      if (parameterName == nullptr || primitiveBytes(elementType) == 0U ||
-          arrayLength < 0 || (array != 0 && array != 1) ||
-          (slice != 0 && slice != 1) || (array == 1 && slice == 1)) {
-        diagnostic = error("Onda returned invalid delegate metadata");
-        return false;
-      }
-      delegate.parameters.push_back({
-          .name = parameterName,
-          .elementType = elementType,
-          .arrayLength = arrayLength,
-          .array = array == 1,
-          .slice = slice == 1,
-      });
+    PayloadSchema schema;
+    std::string schemaError;
+    if (!parsePayloadSchema(schemaJson, schema, schemaError)) {
+      diagnostic =
+          error("Onda returned invalid delegate metadata: " + schemaError);
+      return false;
     }
-    delegates_.push_back(std::move(delegate));
+    delegates_.push_back({.name = name, .plan = makePayloadPlan(schema)});
   }
 
   logSites_.reserve(static_cast<std::size_t>(logSiteCount));
@@ -644,7 +669,7 @@ bool PreparedEngine::prepareRuntimeOutput(Diagnostic &diagnostic) {
 
 bool PreparedEngine::initialize() noexcept {
   const auto status =
-      onda_init(instance_.get(), ONDA_INIT_FULL, &executionOutput_);
+      onda_init_checked(instance_.get(), ONDA_INIT_FULL, &executionOutput_);
   collectExecutionOutput();
   return status == 0;
 }
@@ -765,50 +790,55 @@ bool PreparedEngine::publishDelegate(
         const auto &delegate = delegates_[occurrence.delegate_index];
         auto valid =
             appendText(entry, "delegate ") && appendText(entry, delegate.name);
-        if (!delegate.parameters.empty())
+        if (!delegate.plan.parameters.empty())
           valid = valid && appendText(entry, ": ");
 
         std::size_t cursor{};
-        for (std::size_t parameterIndex = 0;
-             valid && parameterIndex < delegate.parameters.size();
-             ++parameterIndex) {
-          const auto &parameter = delegate.parameters[parameterIndex];
-          if (parameterIndex != 0U)
-            valid = appendText(entry, " ");
-          valid = valid && appendText(entry, parameter.name) &&
-                  appendText(entry, "=");
-
-          std::size_t count = static_cast<std::size_t>(parameter.arrayLength);
-          if (parameter.slice) {
-            if (cursor + sizeof(std::uint32_t) >
-                occurrence.payload_size_bytes) {
+        std::size_t displayed{};
+        for (const auto &parameter : delegate.plan.parameters) {
+          std::size_t dynamicCount{1U};
+          if (parameter.dynamic) {
+            if (cursor > occurrence.payload_size_bytes ||
+                sizeof(std::uint32_t) >
+                    occurrence.payload_size_bytes - cursor) {
               valid = false;
               break;
             }
-            std::uint32_t dynamicCount{};
-            std::memcpy(&dynamicCount, occurrence.payload + cursor,
-                        sizeof(dynamicCount));
-            cursor += sizeof(dynamicCount);
-            count = dynamicCount;
+            dynamicCount =
+                readLittleEndian<std::uint32_t>(occurrence.payload + cursor);
+            cursor += sizeof(std::uint32_t);
           }
-          const auto scalarBytes = primitiveBytes(parameter.elementType);
-          if (scalarBytes == 0U ||
-              count > (occurrence.payload_size_bytes - cursor) / scalarBytes) {
-            valid = false;
-            break;
+          for (const auto &leaf : parameter.leaves) {
+            if (displayed++ != 0U)
+              valid = valid && appendText(entry, " ");
+            valid =
+                valid && appendText(entry, leaf.path) && appendText(entry, "=");
+            const auto scalarBytes = payloadScalarBytes(leaf.scalar);
+            if (dynamicCount >
+                std::numeric_limits<std::size_t>::max() / leaf.fixedElements) {
+              valid = false;
+              break;
+            }
+            const auto count = dynamicCount * leaf.fixedElements;
+            if (scalarBytes == 0U || cursor > occurrence.payload_size_bytes ||
+                count >
+                    (occurrence.payload_size_bytes - cursor) / scalarBytes) {
+              valid = false;
+              break;
+            }
+            const auto collection = parameter.dynamic || count != 1U;
+            if (collection)
+              valid = valid && appendText(entry, "[");
+            for (std::size_t index = 0; valid && index < count; ++index) {
+              if (index != 0U)
+                valid = appendText(entry, ", ");
+              valid = valid && appendPayloadScalar(entry, leaf.scalar,
+                                                   occurrence.payload + cursor);
+              cursor += scalarBytes;
+            }
+            if (collection)
+              valid = valid && appendText(entry, "]");
           }
-          const auto collection = parameter.array || parameter.slice;
-          if (collection)
-            valid = appendText(entry, "[");
-          for (std::size_t index = 0; valid && index < count; ++index) {
-            if (index != 0U)
-              valid = appendText(entry, ", ");
-            valid = valid && appendScalar(entry, parameter.elementType,
-                                          occurrence.payload + cursor);
-            cursor += scalarBytes;
-          }
-          if (collection)
-            valid = valid && appendText(entry, "]");
         }
         return valid && cursor == occurrence.payload_size_bytes;
       });
@@ -822,10 +852,10 @@ void PreparedEngine::collectExecutionOutput() noexcept {
   onda_print_occurrence_t print{};
   auto hasDelegate = executionOutput_.delegate_batch != nullptr &&
                      onda_delegate_batch_next(&delegateBatch_, &delegateCursor,
-                                              &delegate) != 0;
+                                              &delegate) == 1;
   auto hasPrint =
       executionOutput_.print_batch != nullptr &&
-      onda_print_batch_next(&printBatch_, &printCursor, &print) != 0;
+      onda_print_batch_next(&printBatch_, &printCursor, &print) == 1;
   std::uint64_t delegateDrops{};
   std::uint64_t printDrops{};
   while (hasDelegate || hasPrint) {
@@ -833,11 +863,11 @@ void PreparedEngine::collectExecutionOutput() noexcept {
       if (!publishDelegate(delegate))
         addSaturated(delegateDrops, 1U);
       hasDelegate = onda_delegate_batch_next(&delegateBatch_, &delegateCursor,
-                                             &delegate) != 0;
+                                             &delegate) == 1;
     } else {
       if (!publishPrint(print))
         addSaturated(printDrops, 1U);
-      hasPrint = onda_print_batch_next(&printBatch_, &printCursor, &print) != 0;
+      hasPrint = onda_print_batch_next(&printBatch_, &printCursor, &print) == 1;
     }
   }
   addTransportDrop(RuntimeLogKind::delegate, delegateDrops);
@@ -1165,8 +1195,8 @@ void PreparedEngine::applyParameter(const std::size_t slot,
 
 void PreparedEngine::applyParameters(
     const std::array<std::atomic<float> *, slotCount> &slots) noexcept {
-  const auto useDefaults =
-      parameterSeed_ && !parameterSeed_->applied.load(std::memory_order_acquire);
+  const auto useDefaults = parameterSeed_ && !parameterSeed_->applied.load(
+                                                 std::memory_order_acquire);
   for (std::size_t index = 0; index < parameterMappingCount_; ++index) {
     applyParameter(index, useDefaults && index < parameterSeed_->count
                               ? parameterSeed_->values[index]
@@ -1277,7 +1307,8 @@ bool PreparedEngine::dispatch(const MidiEvent &event) noexcept {
 
 bool PreparedEngine::dispatchHostContext(
     const HostContext &hostContext, const int hostCallbackOffset) noexcept {
-  const auto positionOffset = hostContext.timelinePlaying ? hostCallbackOffset : 0;
+  const auto positionOffset =
+      hostContext.timelinePlaying ? hostCallbackOffset : 0;
   const auto binding = [this](const HostContextKind event) -> const auto & {
     return hostContextEvents_[static_cast<std::size_t>(event)];
   };
@@ -1293,8 +1324,7 @@ bool PreparedEngine::dispatchHostContext(
       hostContext.samplePosition) {
     const auto sample = *hostContext.samplePosition;
     if (positionOffset <= 0 ||
-        sample <=
-            std::numeric_limits<std::int64_t>::max() - positionOffset) {
+        sample <= std::numeric_limits<std::int64_t>::max() - positionOffset) {
       const auto projected =
           sample + static_cast<std::int64_t>(std::max(positionOffset, 0));
       if (!trigger(binding(HostContextKind::samplePosition), projected)) {
@@ -1425,7 +1455,7 @@ bool PreparedEngine::process(
   return true;
 }
 
-bool PreparedEngine::triggerEvent(
+EventTriggerResult PreparedEngine::triggerEvent(
     const int index, const std::span<const std::byte> payload,
     const std::array<std::atomic<float> *, slotCount> &slots,
     const HostContext &hostContext) noexcept {
@@ -1433,13 +1463,17 @@ bool PreparedEngine::triggerEvent(
       payload.size() >
           static_cast<std::size_t>(std::numeric_limits<int>::max()) ||
       !ensureBlockStarted(slots, hostContext, 0)) {
-    return false;
+    return EventTriggerResult::runtimeFailure;
   }
   const auto status = onda_trigger_event_by_index_unchecked(
       instance_.get(), index, payload.data(), static_cast<int>(payload.size()),
       &executionOutput_);
   collectExecutionOutput();
-  return status == 0;
+  if (status == ONDA_EXECUTION_OK)
+    return EventTriggerResult::success;
+  if (status == ONDA_EXECUTION_INPUT_REJECTED)
+    return EventTriggerResult::inputRejected;
+  return EventTriggerResult::runtimeFailure;
 }
 
 bool PreparedEngine::reset(

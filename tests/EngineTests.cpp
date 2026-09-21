@@ -234,6 +234,10 @@ init {
   transient = i32(0)
   print("init", preserved, transient)
 }
+event report(value: i32) {
+  print("event", value)
+  observed(value, i64(9007199254740993), true, Bins, Steps)
+}
 sample {
   preserved = preserved + 1
   transient = transient + 1
@@ -682,6 +686,42 @@ int main() {
           "delegate observed: value=1 exact=9007199254740993 active=true "
           "bins=[0.25, 0.5] steps=[3, 5]") {
     std::cerr << "pending init and ordered runtime output were not captured\n";
+    return 1;
+  }
+
+  const auto eventMappings = runtimeOutput.engine->eventMappings();
+  const auto report = std::ranges::find(eventMappings, "report",
+                                        &onda::plugin::EventMapping::name);
+  const std::array reportPayload{std::byte{7}, std::byte{0}, std::byte{0},
+                                 std::byte{0}};
+  if (report == eventMappings.end() ||
+      runtimeOutput.engine->triggerEvent(report->index, reportPayload, slots) !=
+          onda::plugin::EventTriggerResult::success) {
+    std::cerr << "runtime-output event did not dispatch\n";
+    return 1;
+  }
+  logEntries = drain(runtimeLog);
+  if (logEntries.size() != 2U || text(logEntries[0]) != "event: 7" ||
+      text(logEntries[1]) !=
+          "delegate observed: value=7 exact=9007199254740993 active=true "
+          "bins=[0.25, 0.5] steps=[3, 5]") {
+    std::cerr << "runtime-output event was not captured\n";
+    return 1;
+  }
+
+  const auto truncatedPayload =
+      std::span<const std::byte>{reportPayload}.first(3U);
+  if (runtimeOutput.engine->triggerEvent(report->index, truncatedPayload,
+                                         slots) !=
+          onda::plugin::EventTriggerResult::inputRejected ||
+      !drain(runtimeLog).empty()) {
+    std::cerr << "rejected event replayed stale runtime output\n";
+    return 1;
+  }
+  if (runtimeOutput.engine->triggerEvent(report->index, reportPayload, slots) !=
+          onda::plugin::EventTriggerResult::success ||
+      drain(runtimeLog).size() != 2U) {
+    std::cerr << "engine did not recover after rejecting event input\n";
     return 1;
   }
 

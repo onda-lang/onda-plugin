@@ -80,14 +80,23 @@ Windows explicitly uses WebView2 with a writable per-user data folder, and its
 editor lifecycle test requires the native browser's ready handshake.
 
 The view lists user-defined events but omits the canonical `plugin_midi` and
-`plugin_host` families, which the host drives. Scalar, fixed-array, and slice
-arguments are validated and packed on the message thread into a bounded SPSC
-queue. The callback dispatches them at its next boundary without allocation or
-locking; a build generation on every command prevents stale event indices from
-crossing an engine replacement. Automatic filesystem reloads advance this
-generation as well as explicit requests. The worker atomically replaces and
-destroys an unconsumed queued engine, so a suspended host cannot cause repeated
-compilation or prevent preparation from completing.
+`plugin_host` families, which the host drives. The host consumes Onda's
+recursive event schemas, including nested structs, tuples, fixed arrays, and
+struct slices. Arguments are validated and packed into Onda's little-endian
+structure-of-arrays wire format on the message thread before entering a bounded
+SPSC queue. Onda's flat event-tensor metadata is checked against the recursive
+schema plan when an engine is prepared. The native borrowed-view entry point is
+not used because values cross both UI/audio threads and the queue; the packed
+entry keeps ownership explicit and dispatch allocation-free. The callback
+dispatches events at its next boundary without allocation or locking; payload
+rejection returns an empty execution-output batch and remains non-fatal, while
+handler safety failures quarantine the engine. Structured delegate records are
+decoded from the same schema into the runtime log. A build generation on every
+command prevents stale event indices from crossing an engine replacement.
+Automatic filesystem reloads advance this generation as well as explicit
+requests. The worker atomically replaces and destroys an unconsumed queued
+engine, so a suspended host cannot cause repeated compilation or prevent
+preparation from completing.
 Each published engine owns an immutable snapshot of its interface and project
 checkpoint. The worker keeps weak references to these snapshots and selects
 the audio thread's active generation when retaining a previous engine after a

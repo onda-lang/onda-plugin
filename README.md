@@ -106,6 +106,11 @@ Configure and build the plugins:
 cmake -S . -B build -G Ninja \
   -DCMAKE_BUILD_TYPE=Release
 cmake --build build
+```
+
+To run tests:
+
+```sh
 ctest --test-dir build --output-on-failure
 ```
 

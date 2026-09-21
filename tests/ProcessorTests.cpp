@@ -53,12 +53,14 @@ void *allocateAligned(const std::size_t size, const std::size_t alignment) {
   return _aligned_malloc(requested, alignment);
 #else
   // Darwin rejects small alignments even when malloc would satisfy them.
-  const auto effectiveAlignment = std::max(alignment, alignof(std::max_align_t));
+  const auto effectiveAlignment =
+      std::max(alignment, alignof(std::max_align_t));
   if (requested >
       std::numeric_limits<std::size_t>::max() - (effectiveAlignment - 1U))
     return nullptr;
-  const auto padded = ((requested + effectiveAlignment - 1U) /
-                       effectiveAlignment) * effectiveAlignment;
+  const auto padded =
+      ((requested + effectiveAlignment - 1U) / effectiveAlignment) *
+      effectiveAlignment;
   return std::aligned_alloc(effectiveAlignment, padded);
 #endif
 }
@@ -912,6 +914,174 @@ bool exerciseUserEvents() {
   return true;
 }
 
+bool exerciseStructuredEvents() {
+  onda::plugin::PayloadType floatType;
+  floatType.kind = onda::plugin::PayloadType::Kind::scalar;
+  floatType.scalar = onda::plugin::PayloadScalar::f64;
+  for (const auto &[schemaValue, webValue] :
+       std::array<std::pair<const char *, const char *>, 2U>{
+           {{"inf", "Infinity"}, {"-inf", "-Infinity"}}}) {
+    const auto value = onda::plugin::payloadDefaultValue(
+        floatType, onda::plugin::PayloadDefault{
+                       .scalar = std::string{schemaValue}, .elements = {}});
+    if (!value.isString() || value.toString() != webValue) {
+      std::cerr << "non-finite event default was not web-safe\n";
+      return false;
+    }
+  }
+
+  TemporarySource source;
+  if (!source.write(R"(
+struct Note:
+  enabled: bool
+  gain: f64 = 4.0
+  bins: f32[2]
+  mode: i64 = 0 {range = -3..=3, mode = wrap}
+  pair: (i32, bool) = (2, true)
+proc Bank:
+  delegate accepted(notes: Note[])
+  event configure(notes: Note[]):
+    accepted(notes)
+  sample:
+    out1 = 0.0
+outs { out1, out2 }
+init:
+  bank = Bank()
+  observed: f64 = 0.0
+  count: i32 = 0
+  tail_value: i32 = 0
+delegate configured(notes: Note[])
+when configured(notes):
+  count = notes.len()
+  if count > 0:
+    note = notes[0]
+    observed = note.gain + f64(note.mode) + f64(note.bins[1])
+    if note.enabled:
+      observed += 10.0
+  else:
+    observed = 0.0
+when bank.accepted(notes):
+  configured(notes)
+event configure(prefix: bool, prototype: Note, notes: Note[], tail: i32):
+  bank.configure(notes)
+  tail_value = tail
+  if prefix:
+    tail_value += 2
+sample:
+  out1 = f32(observed) + f32(count + tail_value)
+  out2 = f32(observed) + f32(count + tail_value)
+)"))
+    return false;
+
+  onda::plugin::Processor processor(onda::plugin::Product::effect);
+  processor.prepareToPlay(48'000.0, 64);
+  processor.loadFile(juce::File(onda::plugin::pathToJuce(source.path())),
+                     false);
+  if (!waitForOutput(processor, 0.0F)) {
+    std::cerr << "structured-event processor did not become active: "
+              << processor.workerStatus().message << '\n';
+    return false;
+  }
+
+  const auto status = processor.workerStatus();
+  if (status.events.size() != 1U || status.events[0].parameters.size() != 4U ||
+      status.events[0].parameters[1].type != "Note" ||
+      status.events[0].parameters[2].type != "Note[]") {
+    std::cerr << "structured event schema was not published\n";
+    return false;
+  }
+  const auto message = onda::plugin::makeRunViewState(
+      processor, status, processor.canExportProject(), {}, true);
+  const auto *arguments =
+      message["state"]["events"].getArray()->getReference(0)["args"].getArray();
+  const auto &prototype = arguments->getReference(1);
+  const auto &argument = arguments->getReference(2);
+  const auto *shape = argument["shape"].getDynamicObject();
+  const auto *element = shape == nullptr
+                            ? nullptr
+                            : shape->getProperty("element").getDynamicObject();
+  const auto *fields =
+      element == nullptr ? nullptr : element->getProperty("fields").getArray();
+  if (shape == nullptr || shape->getProperty("kind") != "slice" ||
+      element == nullptr || element->getProperty("name") != "Note" ||
+      fields == nullptr || fields->size() != 5 ||
+      argument["default"].getArray() == nullptr ||
+      !argument["default"].getArray()->isEmpty()) {
+    std::cerr << "structured run-view metadata was invalid\n";
+    return false;
+  }
+  const auto *prototypeDefault = prototype["default"].getDynamicObject();
+  const auto *prototypeBins =
+      prototypeDefault == nullptr
+          ? nullptr
+          : prototypeDefault->getProperty("bins").getArray();
+  const auto *prototypePair =
+      prototypeDefault == nullptr
+          ? nullptr
+          : prototypeDefault->getProperty("pair").getArray();
+  if (prototypeDefault == nullptr ||
+      static_cast<bool>(prototypeDefault->getProperty("enabled")) ||
+      !test::withinTolerance(
+          static_cast<double>(prototypeDefault->getProperty("gain")) - 4.0,
+          1.0e-9) ||
+      prototypeBins == nullptr || prototypeBins->size() != 2 ||
+      prototypeDefault->getProperty("mode").toString() != "0" ||
+      prototypePair == nullptr || prototypePair->size() != 2 ||
+      static_cast<int>(prototypePair->getReference(0)) != 2 ||
+      !static_cast<bool>(prototypePair->getReference(1))) {
+    std::cerr << "structured event defaults were invalid\n";
+    return false;
+  }
+
+  const auto note = [](const bool enabled, const double gain,
+                       juce::Array<juce::var> bins, const char *mode,
+                       juce::Array<juce::var> pair) {
+    auto result = juce::var{new juce::DynamicObject};
+    result.getDynamicObject()->setProperty("enabled", enabled);
+    result.getDynamicObject()->setProperty("gain", gain);
+    result.getDynamicObject()->setProperty("bins", std::move(bins));
+    result.getDynamicObject()->setProperty("mode", mode);
+    result.getDynamicObject()->setProperty("pair", std::move(pair));
+    return result;
+  };
+  auto prototypeValue = note(false, 4.0, {0.0, 0.0}, "0", {2, true});
+  juce::Array<juce::var> notes{
+      note(true, 4.0, {1.0, 2.0}, "5", {2, true}),
+      note(false, 6.0, {3.0, 4.0}, "-3", {7, false}),
+  };
+  juce::Array<juce::var> values{true, prototypeValue, std::move(notes), 5};
+  const auto error = processor.triggerEvent("configure", values);
+  if (!error.empty() || !waitForOutput(processor, 23.0F)) {
+    std::cerr << "structured event was not dispatched: " << error << '\n';
+    return false;
+  }
+  const auto log = processor.runtimeLogSnapshot();
+  if (log.records.empty() ||
+      log.records.back().text !=
+          "delegate configured: notes.enabled=[true, false] "
+          "notes.gain=[4, 6] notes.bins=[1, 2, 3, 4] "
+          "notes.mode=[-2, -3] notes.pair.__0=[2, 7] "
+          "notes.pair.__1=[true, false]") {
+    std::cerr << "structured delegate payload was not decoded\n";
+    return false;
+  }
+
+  auto invalid = juce::var{new juce::DynamicObject};
+  invalid.getDynamicObject()->setProperty("enabled", true);
+  juce::Array<juce::var> invalidNotes{std::move(invalid)};
+  if (processor
+          .triggerEvent("configure",
+                        juce::Array<juce::var>{false, prototypeValue,
+                                               std::move(invalidNotes), 0})
+          .empty() ||
+      !processor.workerStatus().active) {
+    std::cerr
+        << "invalid structured input was accepted or faulted the engine\n";
+    return false;
+  }
+  return true;
+}
+
 bool exerciseScopeCapture() {
   TemporarySource source;
   if (!source.write(validSource(onda::plugin::Product::effect)))
@@ -1052,7 +1222,8 @@ bool exerciseRuntimeLogging() {
   const auto parameterUpdate = onda::plugin::makeRunViewState(
       processor, processor.workerStatus(), processor.canExportProject(), {},
       false, false);
-  const auto *update = parameterUpdate.getProperty("state", {}).getDynamicObject();
+  const auto *update =
+      parameterUpdate.getProperty("state", {}).getDynamicObject();
   if (update == nullptr || !update->hasProperty("params") ||
       update->hasProperty("logText") || update->hasProperty("logEntries") ||
       update->hasProperty("printTransportDropCount")) {
@@ -1064,7 +1235,8 @@ bool exerciseRuntimeLogging() {
   const auto clearedMessage = onda::plugin::makeRunViewState(
       processor, processor.workerStatus(), processor.canExportProject(), {});
   const auto clearedState = clearedMessage.getProperty("state", {});
-  const auto *clearedEntries = clearedState.getProperty("logEntries", {}).getArray();
+  const auto *clearedEntries =
+      clearedState.getProperty("logEntries", {}).getArray();
   if (clearedEntries == nullptr || !clearedEntries->isEmpty() ||
       clearedState.getProperty("logText", {}).toString().isNotEmpty()) {
     std::cerr << "cleared log was not sent to the browser\n";
@@ -1461,9 +1633,8 @@ bool exerciseStateRestore() {
     const juce::File unicodeDirectory{onda::plugin::pathToJuce(
         testTemporaryRoot() /
         std::filesystem::path{u8"\u00d8nda/\u72b6\u614b"})};
-    const auto hostileState =
-        makeState({}, unicodeDirectory.getFullPathName(), hostileValues,
-                  -100, 100'000);
+    const auto hostileState = makeState({}, unicodeDirectory.getFullPathName(),
+                                        hostileValues, -100, 100'000);
     onda::plugin::Processor normalized(onda::plugin::Product::effect);
     normalized.setStateInformation(hostileState.getData(),
                                    static_cast<int>(hostileState.getSize()));
@@ -1632,7 +1803,8 @@ sample { out1 = clip[0, 0] + retained[1, 0]; out2 = clip[0, 0] + retained[1, 0] 
                        false);
     test::service(processor);
     if (listener.nonParameterChanges == 0) {
-      std::cerr << "incomplete source selection did not mark host state dirty\n";
+      std::cerr
+          << "incomplete source selection did not mark host state dirty\n";
       return false;
     }
     const auto changes = listener.nonParameterChanges;
@@ -1640,7 +1812,8 @@ sample { out1 = clip[0, 0] + retained[1, 0]; out2 = clip[0, 0] + retained[1, 0] 
         "retained", juce::File(onda::plugin::pathToJuce(retained.path())));
     test::service(processor);
     if (listener.nonParameterChanges <= changes) {
-      std::cerr << "incomplete buffer selection did not mark host state dirty\n";
+      std::cerr
+          << "incomplete buffer selection did not mark host state dirty\n";
       return false;
     }
     if (clearPreviouslyBound) {
@@ -1730,7 +1903,8 @@ sample {
     processor.loadFile(juce::File(onda::plugin::pathToJuce(projectPath)),
                        false);
     if (!waitForOutput(processor, 0.625F, 8)) {
-      std::cerr << "project default failed: " << processor.workerStatus().message << '\n';
+      std::cerr << "project default failed: "
+                << processor.workerStatus().message << '\n';
       return false;
     }
     test::service(processor);
@@ -1738,7 +1912,8 @@ sample {
     processor.bindBufferFile(
         "clip", juce::File(onda::plugin::pathToJuce(audio.path())));
     if (!waitForOutput(processor, expectedOverride, 8)) {
-      std::cerr << "project override failed: " << processor.workerStatus().message << '\n';
+      std::cerr << "project override failed: "
+                << processor.workerStatus().message << '\n';
       return false;
     }
     test::service(processor);
@@ -2210,7 +2385,8 @@ sample { out1 = level; out2 = level }
     return false;
   onda::plugin::Processor processor(onda::plugin::Product::instrument);
   processor.prepareToPlay(48'000.0, 8);
-  processor.loadFile(juce::File(onda::plugin::pathToJuce(source.path())), false);
+  processor.loadFile(juce::File(onda::plugin::pathToJuce(source.path())),
+                     false);
   if (!waitForPublishedReplacement(processor) ||
       !waitForOutput(processor, 0.0F, 8))
     return false;
@@ -2230,22 +2406,29 @@ sample { out1 = level; out2 = level }
     return true;
   };
   processor.triggerMidiNote(60, 0.75F, true);
-  if (!renders(0.75F)) return false;
+  if (!renders(0.75F))
+    return false;
   processor.triggerMidiNote(60, 0.0F, false);
-  if (!renders(0.0F)) return false;
+  if (!renders(0.0F))
+    return false;
   processor.triggerMidiNote(60, 0.5F, true);
-  if (!renders(0.5F)) return false;
+  if (!renders(0.5F))
+    return false;
   processor.releaseKeyboardNotes();
-  if (!renders(0.0F)) return false;
+  if (!renders(0.0F))
+    return false;
   // Pending presses must also be cancelled when the editor closes.
   processor.triggerMidiNote(60, 0.5F, true);
   processor.releaseKeyboardNotes();
-  if (!renders(0.0F)) return false;
+  if (!renders(0.0F))
+    return false;
   processor.triggerMidiNote(60, 0.5F, true);
-  if (!renders(0.5F)) return false;
+  if (!renders(0.5F))
+    return false;
   for (int index = 0; index < 257; ++index)
     processor.triggerMidiNote(60, 0.5F, true);
-  if (!renders(0.0F)) return false;
+  if (!renders(0.0F))
+    return false;
   processor.triggerMidiNote(-1, 1.0F, true);
   processor.triggerMidiNote(128, 1.0F, true);
   return renders(0.0F);
@@ -2445,20 +2628,23 @@ bool exerciseTimelineProjection() {
   const std::array events{
       PositionEvent{"event sample_position(sample: i64) { held = f64(sample) }",
                     100.0, 1.0},
-      PositionEvent{"event time_position(seconds: f64) { held = seconds }",
-                    2.0, 1.0 / 48'000.0},
-      PositionEvent{"event musical_position(quarter_note: f64) { held = quarter_note }",
-                    4.0, 2.0 / 48'000.0},
+      PositionEvent{"event time_position(seconds: f64) { held = seconds }", 2.0,
+                    1.0 / 48'000.0},
+      PositionEvent{
+          "event musical_position(quarter_note: f64) { held = quarter_note }",
+          4.0, 2.0 / 48'000.0},
   };
   for (const auto &event : events) {
     for (const auto playing : {false, true}) {
       for (const auto declaresTransport : {false, true}) {
         TemporarySource source;
-        auto text = std::string{"outs { out1, out2 }\ninit { held = f64(0) }\n"} +
-                    event.declaration +
-                    "\nsample { out1 = f32(held); out2 = f32(held) }\n";
+        auto text =
+            std::string{"outs { out1, out2 }\ninit { held = f64(0) }\n"} +
+            event.declaration +
+            "\nsample { out1 = f32(held); out2 = f32(held) }\n";
         if (declaresTransport)
-          text += "event transport(playing: bool, recording: bool, looping: bool) {}\n";
+          text += "event transport(playing: bool, recording: bool, looping: "
+                  "bool) {}\n";
         if (!source.write(text))
           return false;
 
@@ -2484,8 +2670,10 @@ bool exerciseTimelineProjection() {
         for (int callback = 0; callback < 2; ++callback) {
           processor.processBlock(audio, midi);
           for (int frame = 0; frame < 6; ++frame) {
-            const auto offset = callback == 1 && frame >= 2 && playing ? 2.0 : 0.0;
-            const auto expected = static_cast<float>(event.value + offset * event.perFrame);
+            const auto offset =
+                callback == 1 && frame >= 2 && playing ? 2.0 : 0.0;
+            const auto expected =
+                static_cast<float>(event.value + offset * event.perFrame);
             if (std::abs(audio.getSample(0, frame) - expected) > 1.0e-6F) {
               std::cerr << "timeline projection ignored playback state: "
                         << event.declaration << '\n';
@@ -2653,18 +2841,21 @@ bool exerciseReplacementDuringRuntimeFailure() {
   };
 
   enum class Failure { process, reset, event };
-  for (const auto failure : {Failure::process, Failure::reset, Failure::event}) {
+  for (const auto failure :
+       {Failure::process, Failure::reset, Failure::event}) {
     TemporarySource source;
     TemporarySource replacement;
     const auto sample = failure == Failure::process
                             ? "value = f32(i32(1) / i32(in1))\n"
                             : "divisor = i32(0)\nvalue = 0.25\n";
     if (!source.write(
-            std::string{"ins { in1, in2 }\nouts { out1, out2 }\n"
-                        "event tempo(bpm: f64) {}\n"
-                        "init { pin divisor = i32(1); held = i32(1) / divisor }\n"
-                        "event fail() { divisor = i32(1) / divisor }\n"
-                        "sample {\n"} + sample +
+            std::string{
+                "ins { in1, in2 }\nouts { out1, out2 }\n"
+                "event tempo(bpm: f64) {}\n"
+                "init { pin divisor = i32(1); held = i32(1) / divisor }\n"
+                "event fail() { divisor = i32(1) / divisor }\n"
+                "sample {\n"} +
+            sample +
             "out1 = value * f32(held); out2 = value * f32(held)\n}\n") ||
         !replacement.write("outs { out1, out2 }\n"
                            "sample { out1 = 0.75; out2 = 0.75 }\n")) {
@@ -2674,8 +2865,8 @@ bool exerciseReplacementDuringRuntimeFailure() {
     processor.loadFile(juce::File(onda::plugin::pathToJuce(source.path())),
                        false);
     processor.prepareToPlay(48'000.0, 64);
-    if (!processWithoutAllocation(
-            processor, failure == Failure::process ? 1.0F : 0.25F)) {
+    if (!processWithoutAllocation(processor,
+                                  failure == Failure::process ? 1.0F : 0.25F)) {
       return false;
     }
     const auto generation = processor.workerStatus().engineGeneration;
@@ -2692,8 +2883,8 @@ bool exerciseReplacementDuringRuntimeFailure() {
     audio.clear();
     juce::MidiBuffer midi;
     std::thread callback([&] { processor.processBlock(audio, midi); });
-    const auto deadline = std::chrono::steady_clock::now() +
-                          std::chrono::seconds(5);
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
     while (!playhead.entered.load(std::memory_order_acquire) &&
            std::chrono::steady_clock::now() < deadline) {
       std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -2806,7 +2997,8 @@ bool exerciseSupersededHandoff() {
                                    static_cast<int>(saved.getSize()));
       restored.prepareToPlay(48'000.0, 64);
       if (!waitForProjectImageOutput(restored, 0.25F)) {
-        std::cerr << "superseded replacement displaced the running checkpoint\n";
+        std::cerr
+            << "superseded replacement displaced the running checkpoint\n";
         return false;
       }
       return true;
@@ -2827,11 +3019,12 @@ bool exerciseSeededHandoff() {
           "event note_on(id: i32, channel: i32, key: i32, velocity: f32) {}\n"
           "event note_off(id: i32, channel: i32, key: i32, velocity: f32) {}\n";
       if (!first.write(events + "outs { out1, out2 }\n"
-                               "params { gain = 0.25 { 0.0, 1.0 } }\n"
-                               "sample { out1 = gain; out2 = gain }\n") ||
-          !replacement.write(events + "outs { out1, out2 }\n"
-                                     "params { gain = 0.75 { 0.0, 1.0 } }\n"
-                                     "sample { out1 = gain; out2 = gain }\n") ||
+                                "params { gain = 0.25 { 0.0, 1.0 } }\n"
+                                "sample { out1 = gain; out2 = gain }\n") ||
+          !replacement.write(events +
+                             "outs { out1, out2 }\n"
+                             "params { gain = 0.75 { 0.0, 1.0 } }\n"
+                             "sample { out1 = gain; out2 = gain }\n") ||
           !invalid.write("not valid Onda source\n"))
         return false;
 
@@ -2877,7 +3070,8 @@ bool exerciseSeededHandoff() {
               (adoptReplacement ? replacementGeneration : firstGeneration) ||
           !processWithoutAllocation(processor, expected) ||
           !test::withinTolerance(processor.slotValue(0) - expected, 1.0e-6F)) {
-        std::cerr << "failed selection lost the committed engine or parameters\n";
+        std::cerr
+            << "failed selection lost the committed engine or parameters\n";
         return false;
       }
       juce::MemoryBlock checkpoint;
@@ -2886,7 +3080,7 @@ bool exerciseSeededHandoff() {
       replacement.remove();
       Processor restored(product);
       restored.setStateInformation(checkpoint.getData(),
-                                    static_cast<int>(checkpoint.getSize()));
+                                   static_cast<int>(checkpoint.getSize()));
       restored.prepareToPlay(48'000.0, 64);
       if (!restored.workerStatus().usingProjectImage ||
           !processWithoutAllocation(restored, expected)) {
@@ -2950,10 +3144,11 @@ bool exerciseReplacementDuringSeeding() {
       !test::withinTolerance(processor.slotValue(0) - 0.25F, 1.0e-6F) ||
       !test::withinTolerance(processor.slotValue(1) - 0.75F, 1.0e-6F) ||
       !processWithoutAllocation(processor, 2.0F)) {
-    std::cerr << "replacement observed partially applied host defaults (callback "
-              << listener.called << ", success " << succeeded << ", slots "
-              << processor.slotValue(0) << ", " << processor.slotValue(1)
-              << ", status " << processor.workerStatus().message << ")\n";
+    std::cerr
+        << "replacement observed partially applied host defaults (callback "
+        << listener.called << ", success " << succeeded << ", slots "
+        << processor.slotValue(0) << ", " << processor.slotValue(1)
+        << ", status " << processor.workerStatus().message << ")\n";
     return false;
   }
   // Finishing the inherited seed must let subsequent automation reach DSP.
@@ -3206,7 +3401,7 @@ bool exerciseStateSaveDuringNotification() {
       return false;
     Processor restored(Product::effect);
     restored.setStateInformation(listener.saved.getData(),
-                                static_cast<int>(listener.saved.getSize()));
+                                 static_cast<int>(listener.saved.getSize()));
     restored.prepareToPlay(48'000.0, 64);
     if (!rendersImmediately(restored, 64, 1.0F) ||
         !test::withinTolerance(restored.slotValue(0) - 0.25F, 1.0e-6F) ||
@@ -3245,7 +3440,8 @@ bool exerciseFailedSelectionReconfiguration() {
     juce::MemoryBlock retained;
     processor.getStateInformation(retained);
     if (!processor.workerStatus().usingProjectImage ||
-        !rendersImmediately(processor, frames, 0.6F) || retained != checkpoint) {
+        !rendersImmediately(processor, frames, 0.6F) ||
+        retained != checkpoint) {
       std::cerr << "failed selection lost checkpoint during reconfiguration\n";
       return false;
     }
@@ -3310,7 +3506,8 @@ sample { out1 = held; out2 = pinned }
   original.getStateInformation(saved);
   source.remove();
   Processor restored(Product::effect);
-  restored.setStateInformation(saved.getData(), static_cast<int>(saved.getSize()));
+  restored.setStateInformation(saved.getData(),
+                               static_cast<int>(saved.getSize()));
   restored.prepareToPlay(48'000.0, 64);
   if (!restored.workerStatus().usingProjectImage ||
       !processWithoutAllocation(restored, 0.6F)) {
@@ -3354,9 +3551,10 @@ sample { out1 = clip[0, 0] + extra[0, 0]; out2 = clip[0, 0] + extra[0, 0] }
       pending.bufferChoices().size() != 2U || pending.mappings.size() != 1U ||
       pending.events.size() != 1U || pending.events[0].name != "alpha" ||
       !rendersImmediately(processor, 64, 0.25F)) {
-    std::cerr << "failed replacement hid its buffers or replaced active metadata: "
-              << pending.message << " (choices " << pending.bufferChoices().size()
-              << ", events " << pending.events.size() << ")\n";
+    std::cerr
+        << "failed replacement hid its buffers or replaced active metadata: "
+        << pending.message << " (choices " << pending.bufferChoices().size()
+        << ", events " << pending.events.size() << ")\n";
     return false;
   }
   juce::MemoryBlock retained;
@@ -3544,7 +3742,7 @@ bool exerciseConcurrentStateRestoreAndLogDrain() {
   std::thread host([&] {
     for (int iteration = 0; iteration < 300; ++iteration) {
       processor.setStateInformation(state.getData(),
-                                     static_cast<int>(state.getSize()));
+                                    static_cast<int>(state.getSize()));
       std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
     done.store(true, std::memory_order_release);
@@ -3668,6 +3866,7 @@ int main(const int argc, const char *const *argv) {
       {"RunViewAdapter", exerciseRunViewAdapter},
       {"ScopeCapture", exerciseScopeCapture},
       {"UserEvents", exerciseUserEvents},
+      {"StructuredEvents", exerciseStructuredEvents},
       {"RuntimeLogging", exerciseRuntimeLogging},
       {"effect", +[] { return exercise(onda::plugin::Product::effect); }},
       {"instrument",

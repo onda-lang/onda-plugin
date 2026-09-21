@@ -1,5 +1,6 @@
 #pragma once
 
+#include "EventPayload.h"
 #include "OndaSdk.h"
 #include "Product.h"
 #include "RuntimeLog.h"
@@ -20,7 +21,8 @@ namespace onda::plugin {
 inline constexpr std::size_t slotCount = 32U;
 using ParameterValues = std::array<float, slotCount>;
 
-// Published with an engine. Audio uses these values until host seeding finishes.
+// Published with an engine. Audio uses these values until host seeding
+// finishes.
 struct SeedValues {
   std::uint64_t revision{};
   ParameterValues values{};
@@ -103,23 +105,27 @@ struct ParameterMapping {
   std::string scale{"linear"};
   std::optional<double> curve;
   std::optional<double> step;
-  std::optional<std::uint32_t> stepCount;
+  std::optional<std::int64_t> stepCount;
 };
 
 struct EventParameterMapping {
   std::string name;
   std::string type;
-  int elementType{-1};
-  int arrayLength{1};
-  bool array{};
-  bool slice{};
-  std::vector<std::byte> defaultBytes;
+  PayloadTypePtr payloadType;
+  std::optional<PayloadDefault> defaultValue;
 };
 
 struct EventMapping {
   int index{-1};
   std::string name;
+  PayloadSchema schema;
   std::vector<EventParameterMapping> parameters;
+};
+
+enum class EventTriggerResult : std::uint8_t {
+  success,
+  inputRejected,
+  runtimeFailure,
 };
 
 struct BufferFileBinding {
@@ -198,7 +204,7 @@ public:
   [[nodiscard]] std::span<const EventMapping> eventMappings() const {
     return eventMappings_;
   }
-  [[nodiscard]] bool
+  [[nodiscard]] EventTriggerResult
   triggerEvent(int index, std::span<const std::byte> payload,
                const std::array<std::atomic<float> *, slotCount> &slots,
                const HostContext &hostContext = {}) noexcept;
@@ -216,17 +222,9 @@ private:
     float sampleRate{};
   };
 
-  struct DelegateParamMetadata {
-    std::string name;
-    int elementType{-1};
-    int arrayLength{};
-    bool array{};
-    bool slice{};
-  };
-
   struct DelegateMetadata {
     std::string name;
-    std::vector<DelegateParamMetadata> parameters;
+    PayloadPlan plan;
   };
 
   struct LogSiteMetadata {
@@ -235,9 +233,8 @@ private:
     std::uint32_t line{};
   };
 
-  PreparedEngine(double sampleRate, int blockSize,
-                 ProgramHandle program, InstanceHandle instance,
-                 int inputChannels, int outputChannels,
+  PreparedEngine(double sampleRate, int blockSize, ProgramHandle program,
+                 InstanceHandle instance, int inputChannels, int outputChannels,
                  std::vector<float> inputSlab, std::vector<float> outputSlab,
                  std::vector<BufferStorage> bufferStorage,
                  std::vector<BufferMapping> bufferMappings) noexcept;

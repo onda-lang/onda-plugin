@@ -2,7 +2,6 @@
 
 #include "JucePath.h"
 #include "Processor.h"
-#include "Primitive.h"
 
 #include <OndaRunResources.h>
 
@@ -40,63 +39,6 @@ juce::int64 logCounter(const std::uint64_t value) noexcept {
   return static_cast<juce::int64>(std::min(
       value,
       static_cast<std::uint64_t>(std::numeric_limits<juce::int64>::max())));
-}
-
-juce::var scalarEventValue(const int type, const std::byte *bytes) {
-  switch (type) {
-  case ONDA_PRIMITIVE_BOOL:
-    return std::to_integer<std::uint8_t>(*bytes) != 0U;
-  case ONDA_PRIMITIVE_F32: {
-    float value{};
-    std::memcpy(&value, bytes, sizeof(value));
-    return static_cast<double>(value);
-  }
-  case ONDA_PRIMITIVE_F64: {
-    double value{};
-    std::memcpy(&value, bytes, sizeof(value));
-    return value;
-  }
-  case ONDA_PRIMITIVE_I32: {
-    std::int32_t value{};
-    std::memcpy(&value, bytes, sizeof(value));
-    return static_cast<int>(value);
-  }
-  case ONDA_PRIMITIVE_I64: {
-    std::int64_t value{};
-    std::memcpy(&value, bytes, sizeof(value));
-    return juce::String{value};
-  }
-  default:
-    return {};
-  }
-}
-
-juce::var defaultEventValue(const EventParameterMapping &parameter) {
-  if (parameter.slice)
-    return juce::Array<juce::var>{};
-  const auto scalarBytes = primitiveBytes(parameter.elementType);
-  const auto zero =
-      parameter.elementType == ONDA_PRIMITIVE_BOOL
-          ? juce::var{false}
-          : (parameter.elementType == ONDA_PRIMITIVE_I64 ? juce::var{"0"}
-                                                         : juce::var{0});
-  if (!parameter.array) {
-    return parameter.defaultBytes.size() == scalarBytes
-               ? scalarEventValue(parameter.elementType,
-                                  parameter.defaultBytes.data())
-               : zero;
-  }
-
-  juce::Array<juce::var> values;
-  values.ensureStorageAllocated(parameter.arrayLength);
-  for (int index = 0; index < parameter.arrayLength; ++index) {
-    const auto offset = static_cast<std::size_t>(index) * scalarBytes;
-    values.add(offset + scalarBytes <= parameter.defaultBytes.size()
-                   ? scalarEventValue(parameter.elementType,
-                                      parameter.defaultBytes.data() + offset)
-                   : zero);
-  }
-  return values;
 }
 
 void appendRuntimeLog(juce::var &state, const RuntimeLogSnapshot &runtimeLog) {
@@ -209,7 +151,8 @@ juce::var makeRunViewState(Processor &processor, const WorkerStatus &status,
     appendRuntimeLog(state, processor.runtimeLogSnapshot());
 
   juce::Array<juce::var> buffers;
-  buffers.ensureStorageAllocated(static_cast<int>(status.bufferChoices().size()));
+  buffers.ensureStorageAllocated(
+      static_cast<int>(status.bufferChoices().size()));
   for (const auto &mapping : status.bufferChoices()) {
     auto buffer = object();
     set(buffer, "index", mapping.index);
@@ -255,11 +198,25 @@ juce::var makeRunViewState(Processor &processor, const WorkerStatus &status,
       set(argument, "index", static_cast<int>(index));
       set(argument, "name", juce::String(mappingParameter.name));
       set(argument, "type", juce::String(mappingParameter.type));
-      set(argument, "scalar",
-          juce::String(primitiveName(mappingParameter.elementType).data()));
-      set(argument, "arrayLength", mappingParameter.arrayLength);
-      set(argument, "isSlice", mappingParameter.slice);
-      auto defaultValue = defaultEventValue(mappingParameter);
+      set(argument, "shape", payloadTypeValue(*mappingParameter.payloadType));
+      const auto &payloadType = *mappingParameter.payloadType;
+      if (payloadType.kind == PayloadType::Kind::scalar) {
+        set(argument, "scalar", juce::String(mappingParameter.type));
+        set(argument, "arrayLength", 1);
+        set(argument, "isSlice", false);
+      } else if ((payloadType.kind == PayloadType::Kind::array ||
+                  payloadType.kind == PayloadType::Kind::slice) &&
+                 payloadType.element->kind == PayloadType::Kind::scalar) {
+        set(argument, "scalar",
+            juce::String(payloadTypeName(*payloadType.element)));
+        set(argument, "arrayLength",
+            payloadType.kind == PayloadType::Kind::array
+                ? juce::var{static_cast<juce::int64>(payloadType.arrayLength)}
+                : juce::var{0});
+        set(argument, "isSlice", payloadType.kind == PayloadType::Kind::slice);
+      }
+      auto defaultValue =
+          payloadDefaultValue(payloadType, mappingParameter.defaultValue);
       set(argument, "default", defaultValue);
       if (resetEventArguments)
         set(argument, "value", std::move(defaultValue));
