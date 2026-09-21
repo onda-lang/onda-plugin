@@ -218,20 +218,19 @@ public:
         slotName_(slotName(index)) {}
 
   bool setMapping(const ParameterMapping *const mapping) {
-    const auto current = mapping_.load(std::memory_order_acquire);
-    if ((mapping == nullptr && !current) ||
-        (mapping != nullptr && current && *mapping == *current)) {
+    std::lock_guard lock(mappingMutex_);
+    if ((mapping == nullptr && !mapping_) ||
+        (mapping != nullptr && mapping_ && *mapping == *mapping_)) {
       return false;
     }
-    mapping_.store(mapping == nullptr
-                       ? std::shared_ptr<const ParameterMapping>{}
-                       : std::make_shared<const ParameterMapping>(*mapping),
-                   std::memory_order_release);
+    mapping_ = mapping == nullptr
+                   ? std::shared_ptr<const ParameterMapping>{}
+                   : std::make_shared<const ParameterMapping>(*mapping);
     return true;
   }
 
   juce::String getName(const int maximumLength) const override {
-    const auto mapping = mapping_.load(std::memory_order_acquire);
+    const auto mapping = mappingSnapshot();
     if (mapping && maximumLength <= 8)
       return juce::String(mapping->name).substring(0, maximumLength);
     const auto displayName =
@@ -241,17 +240,17 @@ public:
   }
 
   juce::String getLabel() const override {
-    const auto mapping = mapping_.load(std::memory_order_acquire);
+    const auto mapping = mappingSnapshot();
     return mapping ? juce::String(mapping->unit) : juce::String{};
   }
 
   float getDefaultValue() const override {
-    const auto mapping = mapping_.load(std::memory_order_acquire);
+    const auto mapping = mappingSnapshot();
     return mapping ? static_cast<float>(mapping->defaultNormalized) : 0.5F;
   }
 
   int getNumSteps() const override {
-    const auto mapping = mapping_.load(std::memory_order_acquire);
+    const auto mapping = mappingSnapshot();
     if (!mapping)
       return juce::AudioProcessorParameter::getDefaultNumParameterSteps();
     if (mapping->type == "bool")
@@ -265,18 +264,18 @@ public:
   }
 
   bool isDiscrete() const override {
-    const auto mapping = mapping_.load(std::memory_order_acquire);
+    const auto mapping = mappingSnapshot();
     return mapping && (mapping->type == "bool" || mapping->stepCount);
   }
 
   bool isBoolean() const override {
-    const auto mapping = mapping_.load(std::memory_order_acquire);
+    const auto mapping = mappingSnapshot();
     return mapping && mapping->type == "bool";
   }
 
   juce::String getText(const float normalizedValue,
                        const int maximumLength) const override {
-    const auto mapping = mapping_.load(std::memory_order_acquire);
+    const auto mapping = mappingSnapshot();
     if (!mapping)
       return truncate(juce::String(normalizedValue), maximumLength);
     if (mapping->type == "bool")
@@ -293,7 +292,7 @@ public:
   }
 
   float getValueForText(const juce::String &text) const override {
-    const auto mapping = mapping_.load(std::memory_order_acquire);
+    const auto mapping = mappingSnapshot();
     if (!mapping)
       return normalizedText(text);
     if (mapping->type == "bool") {
@@ -314,6 +313,12 @@ public:
   }
 
 private:
+  [[nodiscard]] std::shared_ptr<const ParameterMapping>
+  mappingSnapshot() const {
+    std::lock_guard lock(mappingMutex_);
+    return mapping_;
+  }
+
   static juce::String slotName(const std::size_t index) {
     return "Slot " + juce::String(static_cast<int>(index + 1U));
   }
@@ -355,7 +360,8 @@ private:
   }
 
   const juce::String slotName_;
-  std::atomic<std::shared_ptr<const ParameterMapping>> mapping_;
+  mutable std::mutex mappingMutex_;
+  std::shared_ptr<const ParameterMapping> mapping_;
 };
 
 Processor::Processor(const Product product)
@@ -904,20 +910,23 @@ Processor::saveProjectSnapshot(const ProjectExportSnapshot &snapshot,
 }
 
 bool Processor::saveProjectAsAsync(
-    const juce::File &directory, std::function<void(std::string)> completion) {
+    const juce::File &directory,
+    std::function<void(std::string)> completionHandler) {
   if (exportPending_.exchange(true, std::memory_order_acq_rel))
     return false;
   try {
     const auto snapshot =
         worker_->projectExportSnapshot().value_or(ProjectExportSnapshot{});
     exportPool_.addJob(
-        [this, snapshot, directory, completion = std::move(completion)] {
-          auto result = saveProjectSnapshot(snapshot, directory);
+        [this, snapshot, directory,
+         callback = std::move(completionHandler)]() mutable {
+          auto saveResult = saveProjectSnapshot(snapshot, directory);
           exportPending_.store(false, std::memory_order_release);
-          if (completion) {
+          if (callback) {
             juce::MessageManager::callAsync(
-                [completion, result = std::move(result)]() mutable {
-                  completion(std::move(result));
+                [callback = std::move(callback),
+                 deliveredResult = std::move(saveResult)]() mutable {
+                  callback(std::move(deliveredResult));
                 });
           }
         });
