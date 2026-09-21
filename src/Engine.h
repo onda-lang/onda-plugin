@@ -7,6 +7,7 @@
 
 #include <array>
 #include <atomic>
+#include <compare>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -107,8 +108,28 @@ struct ParameterMapping {
   std::optional<double> step;
   std::optional<std::int64_t> stepCount;
 
-  friend bool operator==(const ParameterMapping &,
-                         const ParameterMapping &) = default;
+  friend bool operator==(const ParameterMapping &left,
+                         const ParameterMapping &right) noexcept {
+    const auto equalDouble = [](const double a, const double b) noexcept {
+      return std::is_eq(a <=> b);
+    };
+    const auto equalOptionalDouble =
+        [&equalDouble](const std::optional<double> &a,
+                       const std::optional<double> &b) noexcept {
+          return a.has_value() == b.has_value() && (!a || equalDouble(*a, *b));
+        };
+    return left.parameterIndex == right.parameterIndex &&
+           left.name == right.name && left.type == right.type &&
+           left.unit == right.unit &&
+           equalDouble(left.defaultNormalized, right.defaultNormalized) &&
+           equalDouble(left.defaultPlain, right.defaultPlain) &&
+           equalDouble(left.rangeMin, right.rangeMin) &&
+           equalDouble(left.rangeMax, right.rangeMax) &&
+           left.scale == right.scale &&
+           equalOptionalDouble(left.curve, right.curve) &&
+           equalOptionalDouble(left.step, right.step) &&
+           left.stepCount == right.stepCount;
+  }
 };
 
 struct EventParameterMapping {

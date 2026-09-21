@@ -42,12 +42,13 @@ namespace allocation_audit {
 thread_local bool enabled{};
 std::atomic<std::uint64_t> count{};
 
-void record() noexcept {
+static void record() noexcept {
   if (enabled)
     count.fetch_add(1, std::memory_order_relaxed);
 }
 
-void *allocateAligned(const std::size_t size, const std::size_t alignment) {
+static void *allocateAligned(const std::size_t size,
+                             const std::size_t alignment) {
   const auto requested = std::max(size, std::size_t{1});
 #if defined(_MSC_VER)
   return _aligned_malloc(requested, alignment);
@@ -65,7 +66,7 @@ void *allocateAligned(const std::size_t size, const std::size_t alignment) {
 #endif
 }
 
-void freeAligned(void *memory) noexcept {
+static void freeAligned(void *memory) noexcept {
 #if defined(_MSC_VER)
   if (memory != nullptr)
     record();
@@ -3557,7 +3558,7 @@ bool exerciseFailedSelectionReconfiguration() {
   if (!rendersImmediately(processor, 64, 0.25F))
     return false;
   source.remove();
-  for (const auto [rate, frames] :
+  for (const auto &[rate, frames] :
        {std::pair{96'000.0, 64}, std::pair{96'000.0, 128},
         std::pair{48'000.0, 128}}) {
     processor.prepareToPlay(rate, frames);

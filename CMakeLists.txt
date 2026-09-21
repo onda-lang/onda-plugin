@@ -301,12 +301,12 @@ file(GLOB ONDA_JUCE_MODULE_SOURCES
     "${ONDA_JUCE_SOURCE_DIR}/modules/*/*.m"
     "${ONDA_JUCE_SOURCE_DIR}/modules/*/*.mm")
 if(MSVC)
-    set(ONDA_JUCE_WARNING_SUPPRESSION /w)
+    set(ONDA_JUCE_WARNING_SUPPRESSION /w /wd9025)
 else()
     set(ONDA_JUCE_WARNING_SUPPRESSION -w)
 endif()
 set_property(SOURCE ${ONDA_JUCE_MODULE_SOURCES} APPEND PROPERTY
-    COMPILE_OPTIONS "${ONDA_JUCE_WARNING_SUPPRESSION}")
+    COMPILE_OPTIONS ${ONDA_JUCE_WARNING_SUPPRESSION})
 
 function(onda_treat_juce_headers_as_system target)
     target_include_directories(${target} SYSTEM PRIVATE
@@ -607,7 +607,7 @@ if(BUILD_TESTING AND ONDA_PLUGIN_BUILD_TESTS)
             # The test intentionally pairs malloc/free in replacement
             # new/delete operators so it can audit real-time allocations.
             target_compile_options(onda_processor_tests PRIVATE
-                -Wno-mismatched-new-delete)
+                $<$<COMPILE_LANGUAGE:CXX>:-Wno-mismatched-new-delete>)
         endif()
     endif()
     if(ONDA_PLUGIN_INPUT_CHANNELS EQUAL 2 AND

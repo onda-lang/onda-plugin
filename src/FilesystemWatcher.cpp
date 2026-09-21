@@ -154,7 +154,10 @@ public:
   ~NativeWatcher() {
     if (thread_.joinable()) {
       const std::uint64_t signal = 1;
-      static_cast<void>(write(stop_, &signal, sizeof(signal)));
+      ssize_t written;
+      do {
+        written = write(stop_, &signal, sizeof(signal));
+      } while (written < 0 && errno == EINTR);
       thread_.join();
     }
     if (stop_ >= 0)
@@ -314,7 +317,8 @@ private:
       }
       Paths changed;
       for (int index = 0; index < count; ++index) {
-        const auto descriptor = static_cast<int>(events[index].ident);
+        const auto descriptor =
+            static_cast<int>(events[static_cast<std::size_t>(index)].ident);
         if (descriptor == stopPipe_[0])
           return;
         if (const auto root = roots_.find(descriptor); root != roots_.end())

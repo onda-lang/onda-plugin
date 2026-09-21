@@ -924,9 +924,9 @@ bool Processor::saveProjectAsAsync(
           exportPending_.store(false, std::memory_order_release);
           if (callback) {
             juce::MessageManager::callAsync(
-                [callback = std::move(callback),
+                [deliveredCallback = std::move(callback),
                  deliveredResult = std::move(saveResult)]() mutable {
-                  callback(std::move(deliveredResult));
+                  deliveredCallback(std::move(deliveredResult));
                 });
           }
         });

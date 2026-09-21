@@ -213,14 +213,14 @@ sample {
         return false;
     }
 #if defined(_WIN32)
-    std::error_code ignored;
-    std::filesystem::remove(path_, ignored);
+    std::error_code removeError;
+    std::filesystem::remove(path_, removeError);
 #endif
     std::error_code error;
     std::filesystem::rename(replacement, path_, error);
     if (error) {
-      std::error_code ignored;
-      std::filesystem::remove(replacement, ignored);
+      std::error_code cleanupError;
+      std::filesystem::remove(replacement, cleanupError);
       return false;
     }
     return true;
@@ -1680,11 +1680,11 @@ sample { out1 = in1; out2 = in2 }
     using namespace onda::plugin;
     SpscSlot<PreparedEngine *> publications;
     SpscSlot<PreparedEngine *> retired;
-    std::atomic<bool> deactivate{};
+    std::atomic<bool> adoptionDeactivate{};
     std::mutex gateMutex;
     std::condition_variable gateWake;
     bool blockBuild{}, entered{}, release{};
-    Worker worker(Product::effect, publications, retired, deactivate,
+    Worker worker(Product::effect, publications, retired, adoptionDeactivate,
                   [&](const auto &path, const auto product, const auto rate,
                       const auto blockSize, const auto bindings,
                       const auto &parameters) {
