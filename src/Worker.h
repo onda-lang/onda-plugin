@@ -1,10 +1,12 @@
 #pragma once
 
 #include "Engine.h"
+#include "FilesystemWatcher.h"
 #include "SpscSlot.h"
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <filesystem>
@@ -82,6 +84,7 @@ public:
       std::function<BuildResult(const ProjectImage &, Product, double, int,
                                 const std::optional<ParameterValues> &)>;
   using ParameterSource = std::function<ParameterValues()>;
+  using ParameterMappingsChanged = std::function<void()>;
   using RetirementObserver = void (*)(PreparedEngine *) noexcept;
 
   Worker(Product product, SpscSlot<PreparedEngine *> &replacements,
@@ -90,7 +93,8 @@ public:
          BuildFunction buildFunction = {},
          RetirementObserver retirementObserver = nullptr,
          ParameterSource parameterSource = {},
-         ProjectBuildFunction projectBuildFunction = {});
+         ProjectBuildFunction projectBuildFunction = {},
+         ParameterMappingsChanged parameterMappingsChanged = {});
   ~Worker();
 
   Worker(const Worker &) = delete;
@@ -124,7 +128,14 @@ public:
 
   [[nodiscard]] WorkerStatus status() const;
   [[nodiscard]] std::uint64_t statusRevision() const;
+  [[nodiscard]] std::vector<ParameterMapping> parameterMappings() const;
+  // Non-realtime caller wakes the worker after the audio thread retires an
+  // engine.
+  void requestRetirementCollection();
   [[nodiscard]] std::shared_ptr<SeedValues> takeSeedValues();
+  [[nodiscard]] bool hasPendingSeedValues() const noexcept {
+    return hasPendingSeedValues_.load(std::memory_order_acquire);
+  }
   void finishSeeding(const std::shared_ptr<SeedValues> &seed);
   [[nodiscard]] PersistedProjectState persistedProjectState() const;
   // Caller serializes this with parameter seeding and host state restoration.
@@ -175,9 +186,13 @@ private:
                            std::shared_ptr<SeedValues> pendingDefaults = {});
   // Caller holds mutex_; a complete checkpoint takes precedence over requests.
   void publishIncompleteProjectState();
+  // Caller holds mutex_.
+  void incrementStatusRevision() noexcept;
   // Caller holds mutex_; pending committed defaults override raw host slots.
   [[nodiscard]] ParameterValues parameterValuesLocked() const;
   void deactivateStatus() noexcept;
+  // Caller holds mutex_. The callback only schedules message-thread work.
+  void setParameterMappings(std::vector<ParameterMapping> mappings) noexcept;
   void clearPublishedInterface() noexcept;
   void reportFailure(const char *message) noexcept;
   void collectRetired() noexcept;
@@ -186,9 +201,9 @@ private:
   // adoption races a newer publication; expired entries are pruned on publish.
   [[nodiscard]] std::shared_ptr<const EnginePublication>
   activePublication() const;
-  [[nodiscard]] bool updateStatus(
-      const Request &request, std::string message, bool compiling,
-      std::vector<BufferMapping> buffers = {});
+  [[nodiscard]] bool updateStatus(const Request &request, std::string message,
+                                  bool compiling,
+                                  std::vector<BufferMapping> buffers = {});
   [[nodiscard]] bool matchesDesiredLocked(const Request &request) const;
   [[nodiscard]] bool stillCurrent(const Request &request) const;
   [[nodiscard]] static std::vector<FileStamp>
@@ -204,6 +219,10 @@ private:
   [[nodiscard]] static std::vector<std::filesystem::path>
   mergedPaths(std::vector<std::filesystem::path> first,
               const std::vector<std::filesystem::path> &second);
+  void filesystemChanged(std::vector<std::filesystem::path> paths) noexcept;
+  void refreshFilesystemWatcher();
+  [[nodiscard]] bool
+  watchedFilesChanged(const std::vector<std::filesystem::path> &paths);
 
   Product product_;
   SpscSlot<PreparedEngine *> &replacements_;
@@ -213,6 +232,7 @@ private:
   ProjectBuildFunction projectBuildFunction_;
   // Must support concurrent non-realtime reads and outlive the worker.
   ParameterSource parameterSource_;
+  ParameterMappingsChanged parameterMappingsChanged_;
   RetirementObserver retirementObserver_{};
 
   mutable std::mutex mutex_;
@@ -226,12 +246,20 @@ private:
   std::shared_ptr<SeedValues> publishedSeedValues_;
   bool stopping_{};
   bool forceRebuild_{};
+  bool retirementCollectionRequested_{};
   bool workerStopped_{};
-  bool projectStateChanged_{};
+  std::atomic<bool> projectStateChanged_{};
   std::atomic<bool> hasPreparedEngine_{};
+  std::atomic<bool> hasPendingSeedValues_{};
+  std::atomic<std::uint64_t> publishedStatusRevision_{};
   std::atomic<std::uint64_t> requestGeneration_{};
   std::atomic<std::uint64_t> activeGeneration_{};
 
+  FilesystemWatcher filesystemWatcher_;
+  std::vector<std::filesystem::path> pendingFilesystemChanges_;
+  std::vector<std::filesystem::path> filesystemFallbackPaths_;
+  std::chrono::steady_clock::time_point lastFilesystemChange_{};
+  std::uint64_t filesystemChangeSerial_{};
   std::vector<std::filesystem::path> watchedPaths_;
   std::vector<std::filesystem::path> successfulPaths_;
   std::vector<FileStamp> watchedStamp_;

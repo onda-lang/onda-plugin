@@ -97,6 +97,8 @@ public:
                              const ChangeDetails &details) override {
     if (details.nonParameterStateChanged)
       ++nonParameterChanges;
+    if (details.parameterInfoChanged)
+      ++parameterInfoChanges;
   }
 
   bool waitForChangeSince(const int previous) const {
@@ -104,6 +106,7 @@ public:
   }
 
   int nonParameterChanges{};
+  int parameterInfoChanges{};
 
 private:
   juce::AudioProcessor &processor_;
@@ -1082,6 +1085,118 @@ sample:
   return true;
 }
 
+bool exerciseHostParameterPresentation() {
+  TemporarySource source;
+  if (!source.write(R"(
+ins { in1, in2 }
+outs { out1, out2 }
+params {
+  cutoff = 440.0 {20.0, 20000.0, scale = log, unit = "Hz"}
+  mode: i32 = 2 {0, 4, step = 1}
+  enabled = true
+}
+sample { out1 = 0.0; out2 = 0.0 }
+)"))
+    return false;
+
+  onda::plugin::Processor processor(onda::plugin::Product::effect);
+  StateChangeListener listener(processor);
+  processor.loadFile(juce::File(onda::plugin::pathToJuce(source.path())),
+                     false);
+  processor.prepareToPlay(48'000.0, 64);
+  if (!waitForOutput(processor, 0.0F))
+    return false;
+
+  const auto &parameters = processor.getParameters();
+  const auto *cutoff = parameters[0];
+  const auto *mode = parameters[1];
+  const auto *enabled = parameters[2];
+  const auto *unused = parameters[3];
+  const auto cutoffDefault =
+      static_cast<float>(std::log(440.0 / 20.0) / std::log(20000.0 / 20.0));
+  if (listener.parameterInfoChanges == 0 ||
+      cutoff->getName(128) != "cutoff [Slot 1]" ||
+      cutoff->getName(8) != "cutoff" || cutoff->getLabel() != "Hz" ||
+      cutoff->isDiscrete() ||
+      !test::withinTolerance(cutoff->getDefaultValue() - cutoffDefault,
+                             1.0e-5F) ||
+      !test::withinTolerance(cutoff->getText(0.5F, 128).getDoubleValue() -
+                                 std::sqrt(20.0 * 20000.0),
+                             1.0e-3) ||
+      !test::withinTolerance(cutoff->getValueForText("440 Hz") - cutoffDefault,
+                             1.0e-5F) ||
+      mode->getName(128) != "mode [Slot 2]" || !mode->isDiscrete() ||
+      mode->isBoolean() || mode->getNumSteps() != 5 ||
+      !test::withinTolerance(mode->getDefaultValue() - 0.5F, 1.0e-6F) ||
+      mode->getText(0.75F, 128) != "3" ||
+      enabled->getName(128) != "enabled [Slot 3]" || !enabled->isDiscrete() ||
+      !enabled->isBoolean() || enabled->getNumSteps() != 2 ||
+      !test::withinTolerance(enabled->getDefaultValue() - 1.0F, 1.0e-6F) ||
+      enabled->getText(0.0F, 128) != "Off" ||
+      !test::withinTolerance(enabled->getValueForText("On") - 1.0F, 1.0e-6F) ||
+      unused->getName(128) != "Slot 4" || unused->getLabel().isNotEmpty() ||
+      unused->isDiscrete() ||
+      !test::withinTolerance(unused->getDefaultValue() - 0.5F, 1.0e-6F)) {
+    std::cerr << "host parameter presentation did not reflect Onda metadata: "
+              << cutoff->getName(128) << ", label=" << cutoff->getLabel()
+              << ", default=" << cutoff->getDefaultValue()
+              << ", midpoint=" << cutoff->getText(0.5F, 128)
+              << ", parsed=" << cutoff->getValueForText("440 Hz")
+              << "; mode=" << mode->getName(128)
+              << ", steps=" << mode->getNumSteps()
+              << ", value=" << mode->getText(0.75F, 128)
+              << "; enabled=" << enabled->getName(128)
+              << ", default=" << enabled->getDefaultValue()
+              << "; notifications=" << listener.parameterInfoChanges << '\n';
+    return false;
+  }
+
+  const auto previousRevision = processor.workerStatus().revision;
+  const auto previousChanges = listener.parameterInfoChanges;
+  if (!source.write(R"(
+ins { in1, in2 }
+outs { out1, out2 }
+params { frequency = 2.0 {1.0, 4.0, unit = "kHz"} }
+sample { out1 = 0.0; out2 = 0.0 }
+)"))
+    return false;
+  processor.requestReload();
+  if (!waitForActiveRevision(processor, previousRevision) ||
+      listener.parameterInfoChanges <= previousChanges ||
+      processor.getParameters()[0] != cutoff ||
+      cutoff->getName(128) != "frequency [Slot 1]" ||
+      cutoff->getLabel() != "kHz" || cutoff->isDiscrete() ||
+      mode->getName(128) != "Slot 2") {
+    std::cerr << "recompile did not refresh the fixed host slot metadata\n";
+    return false;
+  }
+  if (!waitForOutput(processor, 0.0F))
+    return false;
+
+  const auto unchangedRevision = processor.workerStatus().revision;
+  const auto unchangedChanges = listener.parameterInfoChanges;
+  processor.requestReload();
+  if (!waitForActiveRevision(processor, unchangedRevision))
+    return false;
+  test::service(processor);
+  if (listener.parameterInfoChanges != unchangedChanges) {
+    std::cerr << "identical recompilation emitted a parameter-info change\n";
+    return false;
+  }
+
+  const auto changesBeforeUnload = listener.parameterInfoChanges;
+  processor.unload();
+  test::service(processor);
+  if (listener.parameterInfoChanges <= changesBeforeUnload ||
+      cutoff->getName(128) != "Slot 1" || cutoff->getLabel().isNotEmpty() ||
+      cutoff->isDiscrete() ||
+      !test::withinTolerance(cutoff->getDefaultValue() - 0.5F, 1.0e-6F)) {
+    std::cerr << "unload did not restore generic host slot metadata\n";
+    return false;
+  }
+  return true;
+}
+
 bool exerciseScopeCapture() {
   TemporarySource source;
   if (!source.write(validSource(onda::plugin::Product::effect)))
@@ -1097,6 +1212,11 @@ bool exerciseScopeCapture() {
   }
 
   processor.setScopeCaptureEnabled(true);
+  const auto pendingScope = processor.scopeRevision();
+  if (!pendingScope.enabled || pendingScope.frames != 0U) {
+    std::cerr << "scope reset was not published before capture\n";
+    return false;
+  }
   juce::AudioBuffer<float> audio(2, 64);
   juce::MidiBuffer midi;
   allocation_audit::count.store(0, std::memory_order_relaxed);
@@ -1121,10 +1241,13 @@ bool exerciseScopeCapture() {
   }
 
   const auto snapshot = processor.scopeSnapshot();
+  const auto capturedScope = processor.scopeRevision();
   const auto firstCapturedFrame =
       renderedFrames -
       static_cast<int>(onda::plugin::ScopeCapture::snapshotFrames);
-  if (snapshot.channels != 2 ||
+  if (!capturedScope.enabled || capturedScope == pendingScope ||
+      capturedScope.frames != static_cast<std::uint64_t>(renderedFrames) ||
+      snapshot.channels != 2 ||
       snapshot.samples.size() !=
           onda::plugin::ScopeCapture::snapshotFrames * 2U) {
     std::cerr << "scope snapshot dimensions were invalid\n";
@@ -1158,7 +1281,8 @@ bool exerciseScopeCapture() {
   }
 
   processor.setScopeCaptureEnabled(false);
-  if (processor.scopeSnapshot().channels != 0 ||
+  if (processor.scopeRevision().enabled ||
+      processor.scopeSnapshot().channels != 0 ||
       !processor.scopeSnapshot().samples.empty()) {
     std::cerr << "disabled scope capture remained visible\n";
     return false;
@@ -3867,6 +3991,7 @@ int main(const int argc, const char *const *argv) {
       {"ScopeCapture", exerciseScopeCapture},
       {"UserEvents", exerciseUserEvents},
       {"StructuredEvents", exerciseStructuredEvents},
+      {"HostParameterPresentation", exerciseHostParameterPresentation},
       {"RuntimeLogging", exerciseRuntimeLogging},
       {"effect", +[] { return exercise(onda::plugin::Product::effect); }},
       {"instrument",

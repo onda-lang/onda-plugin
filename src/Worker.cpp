@@ -12,7 +12,8 @@
 namespace onda::plugin {
 namespace {
 
-constexpr auto pollInterval = std::chrono::milliseconds(200);
+constexpr auto filesystemFallbackInterval = std::chrono::milliseconds(500);
+constexpr auto filesystemDebounceInterval = std::chrono::milliseconds(200);
 // Each VST3 module statically owns one Onda/LLVM image. Serialize compilation
 // within that loaded image; separate images do not share compiler state.
 std::mutex compileMutex;
@@ -68,13 +69,18 @@ Worker::Worker(Product product, SpscSlot<PreparedEngine *> &replacements,
                BuildFunction buildFunction,
                const RetirementObserver retirementObserver,
                ParameterSource parameterSource,
-               ProjectBuildFunction projectBuildFunction)
+               ProjectBuildFunction projectBuildFunction,
+               ParameterMappingsChanged parameterMappingsChanged)
     : product_(product), replacements_(replacements), retirements_(retirements),
       deactivateRequested_(deactivateRequested),
       buildFunction_(std::move(buildFunction)),
       projectBuildFunction_(std::move(projectBuildFunction)),
       parameterSource_(std::move(parameterSource)),
-      retirementObserver_(retirementObserver), thread_([this] { run(); }) {}
+      parameterMappingsChanged_(std::move(parameterMappingsChanged)),
+      retirementObserver_(retirementObserver),
+      filesystemWatcher_(
+          [this](auto paths) { filesystemChanged(std::move(paths)); }),
+      thread_([this] { run(); }) {}
 
 Worker::~Worker() {
   {
@@ -86,6 +92,8 @@ Worker::~Worker() {
   prepared_.notify_all();
   if (thread_.joinable())
     thread_.join();
+  static_cast<void>(
+      filesystemWatcher_.watch(std::span<const std::filesystem::path>{}));
   collectRetired();
 }
 
@@ -103,7 +111,7 @@ void Worker::configure(const double sampleRate, const int blockSize) {
       status_.message = "Waiting for host specialization";
       status_.compiling = false;
       deactivateStatus();
-      ++status_.revision;
+      incrementStatusRevision();
     }
   }
   wake_.notify_one();
@@ -144,12 +152,16 @@ void Worker::publishProjectState(PersistedProjectState state,
       publishedProjectState_.bufferBindings != state.bufferBindings;
   publishedProjectState_ = std::move(state);
   publishedSeedValues_ = std::move(pendingDefaults);
-  projectStateChanged_ = projectStateChanged_ || (notifyHost && changed);
+  hasPendingSeedValues_.store(
+      publishedSeedValues_ &&
+          !publishedSeedValues_->applied.load(std::memory_order_acquire),
+      std::memory_order_release);
+  if (notifyHost && changed)
+    projectStateChanged_.store(true, std::memory_order_release);
 }
 
 bool Worker::takeProjectStateChange() {
-  std::lock_guard lock(mutex_);
-  return std::exchange(projectStateChanged_, false);
+  return projectStateChanged_.exchange(false, std::memory_order_acq_rel);
 }
 
 void Worker::loadLocked(std::filesystem::path path, const bool seedDefaults,
@@ -175,7 +187,7 @@ void Worker::loadLocked(std::filesystem::path path, const bool seedDefaults,
     deactivateRequested_.store(true, std::memory_order_release);
   }
   publishIncompleteProjectState();
-  ++status_.revision;
+  incrementStatusRevision();
 }
 
 void Worker::load(std::filesystem::path path, const bool seedDefaults,
@@ -242,7 +254,7 @@ void Worker::restore(std::filesystem::path path, ProjectImage projectImage,
     desired_.recoverCheckpoint = false;
     desired_.seedDefaults = false;
     desired_.notifyProjectChange = false;
-    projectStateChanged_ = false;
+    projectStateChanged_.store(false, std::memory_order_release);
     publishProjectState(
         {
             .path = desired_.path,
@@ -261,7 +273,7 @@ void Worker::restore(std::filesystem::path path, ProjectImage projectImage,
       clearPublishedInterface();
       deactivateRequested_.store(true, std::memory_order_release);
     }
-    ++status_.revision;
+    incrementStatusRevision();
   }
   wake_.notify_one();
 }
@@ -277,14 +289,14 @@ void Worker::unload(const bool notifyHost) {
     forceRebuild_ = false;
     publishProjectState({}, notifyHost);
     if (!notifyHost)
-      projectStateChanged_ = false;
+      projectStateChanged_.store(false, std::memory_order_release);
     status_.path.clear();
     status_.message = "No Onda file loaded";
     status_.compiling = false;
     clearPublishedInterface();
     status_.usingProjectImage = false;
     deactivateRequested_.store(true, std::memory_order_release);
-    ++status_.revision;
+    incrementStatusRevision();
   }
   wake_.notify_one();
 }
@@ -321,7 +333,7 @@ void Worker::bindBufferFile(std::string name, std::filesystem::path path) {
     status_.message = "Waiting to bind audio file";
     status_.compiling = false;
     publishIncompleteProjectState();
-    ++status_.revision;
+    incrementStatusRevision();
   }
   wake_.notify_one();
 }
@@ -350,8 +362,8 @@ void Worker::clearBuffer(const std::string_view name) {
                           true);
       deactivateRequested_.store(true, std::memory_order_release);
     }
-    auto &buffers = status_.pendingBuffers ? *status_.pendingBuffers
-                                          : status_.buffers;
+    auto &buffers =
+        status_.pendingBuffers ? *status_.pendingBuffers : status_.buffers;
     for (auto &buffer : buffers) {
       if (buffer.name == name) {
         buffer.loadedPath.clear();
@@ -360,7 +372,7 @@ void Worker::clearBuffer(const std::string_view name) {
         buffer.loadedSampleRate = 0.0F;
       }
     }
-    ++status_.revision;
+    incrementStatusRevision();
   }
   wake_.notify_one();
 }
@@ -385,8 +397,20 @@ WorkerStatus Worker::status() const {
 }
 
 std::uint64_t Worker::statusRevision() const {
+  return publishedStatusRevision_.load(std::memory_order_acquire);
+}
+
+std::vector<ParameterMapping> Worker::parameterMappings() const {
   std::lock_guard lock(mutex_);
-  return status_.revision;
+  return status_.mappings;
+}
+
+void Worker::requestRetirementCollection() {
+  {
+    std::lock_guard lock(mutex_);
+    retirementCollectionRequested_ = true;
+  }
+  wake_.notify_one();
 }
 
 std::shared_ptr<SeedValues> Worker::takeSeedValues() {
@@ -401,6 +425,8 @@ std::shared_ptr<SeedValues> Worker::takeSeedValues() {
 void Worker::finishSeeding(const std::shared_ptr<SeedValues> &seed) {
   std::lock_guard lock(mutex_);
   seed->applied.store(true, std::memory_order_release);
+  if (publishedSeedValues_ == seed)
+    hasPendingSeedValues_.store(false, std::memory_order_release);
   if (seed->revision == desired_.generation)
     desired_.seedDefaults = false;
 }
@@ -433,6 +459,11 @@ void Worker::advanceGeneration() noexcept {
   requestGeneration_.store(desired_.generation, std::memory_order_release);
 }
 
+void Worker::incrementStatusRevision() noexcept {
+  ++status_.revision;
+  publishedStatusRevision_.store(status_.revision, std::memory_order_release);
+}
+
 void Worker::publishIncompleteProjectState() {
   // Until a complete checkpoint exists, save the user's source and bindings
   // immediately, even before host preparation or while a buffer is missing.
@@ -450,9 +481,22 @@ void Worker::deactivateStatus() noexcept {
   status_.engineGeneration = 0;
 }
 
+void Worker::setParameterMappings(
+    std::vector<ParameterMapping> mappings) noexcept {
+  if (status_.mappings == mappings)
+    return;
+  status_.mappings = std::move(mappings);
+  if (parameterMappingsChanged_) {
+    try {
+      parameterMappingsChanged_();
+    } catch (...) {
+    }
+  }
+}
+
 void Worker::clearPublishedInterface() noexcept {
   deactivateStatus();
-  status_.mappings.clear();
+  setParameterMappings({});
   status_.buffers.clear();
   status_.pendingBuffers.reset();
   status_.events.clear();
@@ -463,7 +507,7 @@ void Worker::reportFailure(const char *const message) noexcept {
   try {
     std::lock_guard lock(mutex_);
     status_.compiling = false;
-    ++status_.revision;
+    incrementStatusRevision();
     try {
       status_.message = message;
     } catch (...) {
@@ -504,7 +548,7 @@ bool Worker::updateStatus(const Request &request, std::string message,
   const auto retained = activePublication();
   if (retained) {
     status_.engineGeneration = retained->status.engineGeneration;
-    status_.mappings = retained->status.mappings;
+    setParameterMappings(retained->status.mappings);
     status_.buffers = retained->status.buffers;
     if (!buffers.empty())
       status_.pendingBuffers = std::move(buffers);
@@ -522,7 +566,7 @@ bool Worker::updateStatus(const Request &request, std::string message,
   status_.path = desired_.path;
   status_.message = std::move(message);
   status_.compiling = compiling;
-  ++status_.revision;
+  incrementStatusRevision();
   return true;
 }
 
@@ -604,6 +648,74 @@ Worker::mergedPaths(std::vector<std::filesystem::path> first,
   return first;
 }
 
+void Worker::filesystemChanged(
+    std::vector<std::filesystem::path> paths) noexcept {
+  try {
+    {
+      std::lock_guard lock(mutex_);
+      if (stopping_)
+        return;
+      pendingFilesystemChanges_.insert(pendingFilesystemChanges_.end(),
+                                       std::make_move_iterator(paths.begin()),
+                                       std::make_move_iterator(paths.end()));
+      lastFilesystemChange_ = std::chrono::steady_clock::now();
+      ++filesystemChangeSerial_;
+    }
+    wake_.notify_one();
+  } catch (...) {
+  }
+}
+
+void Worker::refreshFilesystemWatcher() {
+  filesystemFallbackPaths_ = filesystemWatcher_.watch(watchedPaths_);
+}
+
+bool Worker::watchedFilesChanged(
+    const std::vector<std::filesystem::path> &paths) {
+  auto changedPaths = paths;
+  std::sort(changedPaths.begin(), changedPaths.end());
+  changedPaths.erase(std::unique(changedPaths.begin(), changedPaths.end()),
+                     changedPaths.end());
+
+  std::vector<FileStamp> previous;
+  std::vector<std::filesystem::path> selected;
+  previous.reserve(changedPaths.size());
+  selected.reserve(changedPaths.size());
+  for (const auto &path : changedPaths) {
+    const auto found = std::lower_bound(
+        watchedStamp_.begin(), watchedStamp_.end(), path,
+        [](const FileStamp &stamp, const std::filesystem::path &candidate) {
+          return stamp.path < candidate;
+        });
+    if (found == watchedStamp_.end() || found->path != path)
+      continue;
+    previous.push_back(*found);
+    selected.push_back(path);
+  }
+  if (selected.empty())
+    return false;
+
+  const auto metadata = captureMetadata(selected);
+  if (sameMetadata(previous, metadata))
+    return false;
+
+  auto current = capture(selected);
+  if (!sameContents(previous, current))
+    return true;
+
+  for (auto &stamp : current) {
+    const auto destination = std::lower_bound(
+        watchedStamp_.begin(), watchedStamp_.end(), stamp.path,
+        [](const FileStamp &candidate, const std::filesystem::path &path) {
+          return candidate.path < path;
+        });
+    if (destination != watchedStamp_.end() && destination->path == stamp.path) {
+      *destination = std::move(stamp);
+    }
+  }
+  return false;
+}
+
 void Worker::build(const Request &request) {
   bool hadActiveEngine;
   PersistedStateSnapshot fallback;
@@ -627,7 +739,9 @@ void Worker::build(const Request &request) {
   for (const auto &binding : request.bufferBindings)
     prePaths.push_back(binding.path);
   prePaths = mergedPaths(std::move(prePaths), {});
+  filesystemFallbackPaths_ = filesystemWatcher_.watch(prePaths);
   const auto before = capture(prePaths);
+  const auto watchRevision = filesystemWatcher_.revision();
 
   // Use the same host values for disk preparation and image fallback. New
   // patch selections deliberately initialize with their declared defaults.
@@ -674,23 +788,33 @@ void Worker::build(const Request &request) {
   const auto discoveredNewPath =
       !std::includes(prePaths.begin(), prePaths.end(), attemptPaths.begin(),
                      attemptPaths.end());
+  // Register newly discovered paths before the post-compile snapshot so no
+  // change can fall between validation and native watch installation.
+  filesystemFallbackPaths_ =
+      filesystemWatcher_.watch(mergedPaths(successfulPaths_, attemptPaths));
   auto after = capture(prePaths);
   const auto knownChanged = before != after;
+  const auto changedDuringCompilation =
+      filesystemWatcher_.revision() != watchRevision;
 
   if (!stillCurrent(request))
     return;
 
-  if (discoveredNewPath || knownChanged) {
+  const auto retryChangedSources = [this, &request, &attemptPaths] {
     watchedPaths_ = mergedPaths(successfulPaths_, attemptPaths);
+    refreshFilesystemWatcher();
     watchedStamp_ = capture(watchedPaths_);
     {
       std::lock_guard lock(mutex_);
       forceRebuild_ = true;
     }
-    static_cast<void>(
-        updateStatus(request, "Sources changed during compilation; retrying",
-                     false));
+    static_cast<void>(updateStatus(
+        request, "Sources changed during compilation; retrying", false));
     wake_.notify_one();
+  };
+
+  if (discoveredNewPath || knownChanged || changedDuringCompilation) {
+    retryChangedSources();
     return;
   }
 
@@ -716,13 +840,14 @@ void Worker::build(const Request &request) {
         request, "Linked project failed; restoring saved project image", true));
     try {
       std::lock_guard compileLock(compileMutex);
-      result = projectBuildFunction_
-                   ? projectBuildFunction_(fallback.project.projectImage, product_,
-                                           request.sampleRate, request.blockSize,
-                                           fallback.parameters)
-                   : PreparedEngine::build(fallback.project.projectImage, product_,
-                                           request.sampleRate, request.blockSize,
-                                           fallback.parameters);
+      result =
+          projectBuildFunction_
+              ? projectBuildFunction_(fallback.project.projectImage, product_,
+                                      request.sampleRate, request.blockSize,
+                                      fallback.parameters)
+              : PreparedEngine::build(fallback.project.projectImage, product_,
+                                      request.sampleRate, request.blockSize,
+                                      fallback.parameters);
       usingProjectImage = result.engine != nullptr;
     } catch (const std::bad_alloc &) {
       result.diagnostic.message =
@@ -737,9 +862,22 @@ void Worker::build(const Request &request) {
   if (!stillCurrent(request))
     return;
 
+  // Saved-image preparation may outlive the failed disk attempt. A native
+  // event observed in that interval must not be swallowed when watches are
+  // reattached below.
+  if (filesystemWatcher_.revision() != watchRevision) {
+    retryChangedSources();
+    return;
+  }
+
   if (!result.engine) {
     watchedPaths_ = mergedPaths(successfulPaths_, attemptPaths);
     retainWatchSnapshot();
+    refreshFilesystemWatcher();
+    if (watchedFilesChanged(watchedPaths_)) {
+      retryChangedSources();
+      return;
+    }
     auto message = diagnosticMessage(result.diagnostic);
     if (attemptedProjectImage)
       message = diskFailure + "; saved project image also failed: " + message;
@@ -755,6 +893,11 @@ void Worker::build(const Request &request) {
                       ? mergedPaths(successfulPaths_, attemptPaths)
                       : attemptPaths;
   retainWatchSnapshot();
+  refreshFilesystemWatcher();
+  if (watchedFilesChanged(watchedPaths_)) {
+    retryChangedSources();
+    return;
+  }
 
   std::vector<ParameterMapping> mappings(
       result.engine->parameterMappings().begin(),
@@ -800,7 +943,7 @@ void Worker::build(const Request &request) {
     hasPreparedEngine_.store(true, std::memory_order_release);
     status_.usingProjectImage = usingProjectImage;
     status_.engineGeneration = request.generation;
-    status_.mappings = std::move(mappings);
+    setParameterMappings(std::move(mappings));
     status_.buffers = std::move(buffers);
     status_.pendingBuffers.reset();
     status_.events = std::move(events);
@@ -809,12 +952,13 @@ void Worker::build(const Request &request) {
     result.engine->parameterSeed_ = seed;
     result.engine->publication_ = std::make_shared<const EnginePublication>(
         EnginePublication{status_, publishedProjectState_, seed});
-    std::erase_if(publications_, [](const auto &entry) { return entry.expired(); });
+    std::erase_if(publications_,
+                  [](const auto &entry) { return entry.expired(); });
     publications_.push_back(result.engine->publication_);
     destroy(replacements_.replace(result.engine.release()));
 
     deactivateRequested_.store(false, std::memory_order_release);
-    ++status_.revision;
+    incrementStatusRevision();
     completedGeneration_ = request.generation;
   }
   prepared_.notify_all();
@@ -822,19 +966,55 @@ void Worker::build(const Request &request) {
 
 void Worker::run() noexcept {
   try {
+    std::uint64_t observedGeneration{};
     for (;;) {
       collectRetired();
 
       Request request;
       bool forceRebuild = false;
+      bool fallbackValidation = false;
       bool stopped = false;
+      std::vector<std::filesystem::path> filesystemChanges;
       {
         std::unique_lock lock(mutex_);
-        wake_.wait_for(lock, pollInterval,
-                       [this] { return stopping_ || forceRebuild_; });
+        const auto workRequested = [this, &observedGeneration] {
+          return stopping_ || forceRebuild_ || retirementCollectionRequested_ ||
+                 !pendingFilesystemChanges_.empty() ||
+                 desired_.generation != observedGeneration;
+        };
+        if (filesystemFallbackPaths_.empty()) {
+          wake_.wait(lock, workRequested);
+        } else {
+          fallbackValidation =
+              !wake_.wait_for(lock, filesystemFallbackInterval, workRequested);
+        }
+        if (!pendingFilesystemChanges_.empty()) {
+          auto serial = filesystemChangeSerial_;
+          auto deadline = lastFilesystemChange_ + filesystemDebounceInterval;
+          for (;;) {
+            const auto interrupted = wake_.wait_until(
+                lock, deadline, [this, &observedGeneration, &serial] {
+                  return stopping_ || forceRebuild_ ||
+                         retirementCollectionRequested_ ||
+                         desired_.generation != observedGeneration ||
+                         filesystemChangeSerial_ != serial;
+                });
+            if (!interrupted || stopping_ || forceRebuild_ ||
+                retirementCollectionRequested_ ||
+                desired_.generation != observedGeneration) {
+              break;
+            }
+            serial = filesystemChangeSerial_;
+            deadline = lastFilesystemChange_ + filesystemDebounceInterval;
+          }
+        }
         stopped = stopping_;
         request = desired_;
+        observedGeneration = request.generation;
         forceRebuild = std::exchange(forceRebuild_, false);
+        retirementCollectionRequested_ = false;
+        filesystemChanges = std::move(pendingFilesystemChanges_);
+        pendingFilesystemChanges_.clear();
       }
       if (stopped)
         break;
@@ -844,6 +1024,7 @@ void Worker::run() noexcept {
         watchedPaths_.clear();
         successfulPaths_.clear();
         watchedStamp_.clear();
+        refreshFilesystemWatcher();
         finishRequest(request.generation);
         continue;
       }
@@ -851,14 +1032,16 @@ void Worker::run() noexcept {
         continue;
 
       auto filesChanged = false;
-      if (!watchedPaths_.empty()) {
-        const auto metadata = captureMetadata(watchedPaths_);
-        if (!sameMetadata(metadata, watchedStamp_)) {
-          auto currentStamp = capture(watchedPaths_);
-          filesChanged = !sameContents(currentStamp, watchedStamp_);
-          if (!filesChanged)
-            watchedStamp_ = std::move(currentStamp);
+      if (!filesystemChanges.empty() || fallbackValidation) {
+        if (fallbackValidation) {
+          filesystemChanges.insert(filesystemChanges.end(),
+                                   filesystemFallbackPaths_.begin(),
+                                   filesystemFallbackPaths_.end());
         }
+        // Reattach macOS inode watches after atomic replacement and move a
+        // missing path's watch inward as its directory chain appears.
+        refreshFilesystemWatcher();
+        filesChanged = watchedFilesChanged(filesystemChanges);
       }
       bool shouldBuild = false;
       {

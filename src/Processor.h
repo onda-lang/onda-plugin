@@ -61,7 +61,9 @@ struct UserEventCommand {
   }
 };
 
-class Processor final : public juce::AudioProcessor, private juce::Timer {
+class Processor final : public juce::AudioProcessor,
+                        private juce::Timer,
+                        private juce::AsyncUpdater {
 public:
   explicit Processor(Product product);
   ~Processor() override;
@@ -124,6 +126,7 @@ public:
   void releaseKeyboardNotes() noexcept;
   void clearRuntimeLog();
   void setScopeCaptureEnabled(bool enabled) noexcept;
+  [[nodiscard]] ScopeRevision scopeRevision() const noexcept;
   [[nodiscard]] ScopeSnapshot scopeSnapshot() const;
   [[nodiscard]] juce::File lastBrowseDirectory() const;
   [[nodiscard]] float slotValue(std::size_t index) const noexcept;
@@ -146,9 +149,12 @@ public:
 
 private:
   friend struct ProcessorTestAccess;
+  class SlotParameter;
   static BusesProperties buses();
   static juce::AudioProcessorValueTreeState::ParameterLayout parameters();
   void timerCallback() override;
+  void handleAsyncUpdate() override;
+  [[nodiscard]] bool refreshSlotParameterInfo();
   void acquireEngine() noexcept;
   // Caller holds preparationMutex_; host audio is suspended or offline.
   [[nodiscard]] std::size_t synchronizeEngine();
@@ -173,6 +179,7 @@ private:
   juce::AudioProcessorValueTreeState parameterState_;
   std::array<std::atomic<float> *, slotCount> slotAtomics_{};
   std::array<juce::RangedAudioParameter *, slotCount> slotParameters_{};
+  std::array<SlotParameter *, slotCount> presentedSlotParameters_{};
 
   SpscSlot<PreparedEngine *> replacements_;
   SpscSlot<PreparedEngine *> retirements_;
@@ -197,6 +204,7 @@ private:
   std::atomic<std::uint64_t> activeLogGeneration_{};
   std::uint64_t consumedLogGeneration_{};
   std::uint64_t consumedLogEpoch_{};
+  std::atomic<std::uint64_t> consumedLogActivityRevision_{};
   RuntimeLogCounters consumedLogCounterTotals_{};
   std::atomic<std::uint64_t> runtimeLogRevision_{};
   static constexpr std::size_t midiChannelCount = 16U;

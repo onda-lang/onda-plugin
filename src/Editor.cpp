@@ -358,7 +358,16 @@ void Editor::publishState(const bool force) {
                        actionError_, resetEventArguments, includeRuntimeLog));
 }
 
-void Editor::publishScope() {
+void Editor::publishScope(const bool force) {
+  if (!browser_->isVisible()) {
+    hasPublishedScope_ = false;
+    return;
+  }
+  const auto revision = processor_.scopeRevision();
+  if (!force && hasPublishedScope_ && revision == publishedScopeRevision_)
+    return;
+  publishedScopeRevision_ = revision;
+  hasPublishedScope_ = true;
   browser_->emitEventIfBrowserIsVisible("ondaState",
                                         makeRunViewScope(processor_));
 }
@@ -373,6 +382,7 @@ void Editor::handleCommand(const juce::var &command) {
     loadingOverlay_.setVisible(false);
     publishState(true);
     publishMidiActivity(true);
+    publishScope(true);
   } else if (type == "midiNote") {
     const auto key = input->getProperty("key");
     const auto velocity = input->getProperty("velocity");

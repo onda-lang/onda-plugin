@@ -77,6 +77,7 @@ public:
     if (!std::forward<Writer>(writer)(entry))
       return false;
     write_.store(next, std::memory_order_release);
+    activityRevision_.fetch_add(1U, std::memory_order_release);
     return true;
   }
 
@@ -119,14 +120,18 @@ public:
 
   void addGeneratedOverflow(const RuntimeLogKind kind,
                             const std::uint64_t count) noexcept {
-    if (count != 0U)
+    if (count != 0U) {
       addEpochCounter(generatedOverflow(kind), count);
+      activityRevision_.fetch_add(1U, std::memory_order_release);
+    }
   }
 
   void addTransportDrops(const RuntimeLogKind kind,
                          const std::uint64_t count = 1U) noexcept {
-    if (count != 0U)
+    if (count != 0U) {
       addEpochCounter(transportDrops(kind), count);
+      activityRevision_.fetch_add(1U, std::memory_order_release);
+    }
   }
 
   [[nodiscard]] RuntimeLogCounters
@@ -140,11 +145,17 @@ public:
   }
 
   [[nodiscard]] std::uint64_t beginEpoch() noexcept {
-    return epoch_.fetch_add(1U, std::memory_order_acq_rel) + 1U;
+    const auto epoch = epoch_.fetch_add(1U, std::memory_order_acq_rel) + 1U;
+    activityRevision_.fetch_add(1U, std::memory_order_release);
+    return epoch;
   }
 
   [[nodiscard]] std::uint64_t epoch() const noexcept {
     return epoch_.load(std::memory_order_acquire);
+  }
+
+  [[nodiscard]] std::uint64_t activityRevision() const noexcept {
+    return activityRevision_.load(std::memory_order_acquire);
   }
 
 private:
@@ -218,6 +229,7 @@ private:
   std::atomic<std::size_t> read_{};
   std::atomic<std::size_t> write_{};
   std::atomic<std::uint64_t> epoch_{1U};
+  std::atomic<std::uint64_t> activityRevision_{};
   EpochCounter printOverflow_;
   EpochCounter printTransportDrops_;
   EpochCounter delegateOverflow_;

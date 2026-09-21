@@ -5,7 +5,12 @@ project state with an Onda project image, two one-slot realtime
 handoffs, a bounded UI-event queue, and the active engine pointer, accessed
 only by processing or suspended host preparation. The VST3 wrapper
 adds its format-required `Bypass` parameter outside
-the permanent 32-slot Onda set. It also exposes the fixed, non-automatable
+the permanent 32-slot Onda set. Slot IDs and normalized storage never change.
+An immutable presentation snapshot gives mapped slots their compiled Onda
+names, units, defaults, discrete step counts, and ABI-backed plain-value text.
+The worker schedules a message-thread parameter-info notification only when
+that mapping changes; the audio thread never reads presentation metadata. The
+wrapper also exposes the fixed, non-automatable
 controller mappings that VST3 requires to deliver pitch bend, channel pressure,
 and CC through JUCE's MIDI buffer.
 
@@ -121,13 +126,25 @@ constraints. The browser bridge projects the saved layout into the shared view
 instead of relying on webview-local storage. Coherent project-image publication,
 buffer changes, export relinking, and unload also notify the host that saved
 state changed. Identical recompilation and initial host-state restoration do not
-mark the host dirty. Notifications are delivered by the message-thread timer.
+mark the host dirty. Project-state notifications are delivered by the
+message-thread timer.
+The editor's revision check is lock-free, and the processor timer avoids worker
+and preparation mutexes while there is no pending seed, block-size change, or
+runtime recovery. Runtime-log draining similarly returns after an atomic
+activity check when no output was produced.
+The worker uses native filesystem notifications for the exact linked source and
+asset graph, filters unrelated sibling activity, and debounces relevant changes
+for 200 ms before validating contents. It otherwise blocks on its condition
+variable indefinitely. Only paths whose native subscription failed receive a
+targeted 500 ms disk-validation fallback.
 
 While an editor exists, the callback writes interleaved output into a bounded,
-lock-free scope ring owned by `Processor`. The editor snapshots its newest
-1,024 frames at 20 Hz and publishes them through the shared view's separate
-`scopeData` message. Capturing is disabled when the editor closes; the callback
-never allocates, locks, or interacts with the browser.
+lock-free scope ring owned by `Processor`. Reset generations avoid a
+read-modify-write in steady-state processing, and the editor only snapshots
+and publishes the scope after its frame revision changes. The snapshot uses its
+newest 1,024 frames at 20 Hz and publishes them through the shared view's
+separate `scopeData` message. Capturing is disabled when the editor closes; the
+callback never allocates, locks, or interacts with the browser.
 
 Host note-on/off state is retained per MIDI channel in atomic bitsets and
 published separately as `midiActivity`. Notes remain lit while any host channel holds the corresponding key.

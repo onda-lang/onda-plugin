@@ -8,6 +8,7 @@ namespace onda::plugin {
 
 template <typename Item, std::size_t Capacity> class SpscQueue final {
   static_assert(Capacity > 0U);
+  static_assert(std::atomic<std::size_t>::is_always_lock_free);
 
 public:
   [[nodiscard]] bool tryPush(const Item &item) noexcept {

@@ -1,5 +1,7 @@
 #pragma once
 
+#include "ScopeCapture.h"
+
 #include <juce_audio_processors/juce_audio_processors.h>
 #include <juce_gui_extra/juce_gui_extra.h>
 
@@ -26,7 +28,7 @@ private:
   void handleCommand(const juce::var &command);
   void publishState(bool force);
   void publishMidiActivity(bool force = false);
-  void publishScope();
+  void publishScope(bool force = false);
 
   Processor &processor_;
   std::unique_ptr<Browser> browser_;
@@ -36,10 +38,12 @@ private:
   std::uint64_t publishedEngineGeneration_{};
   std::uint64_t publishedLogRevision_{};
   std::uint64_t publishedMidiRevision_{};
+  ScopeRevision publishedScopeRevision_{};
   std::array<float, 32U> publishedSlots_{};
   bool publishedKnobLayout_{};
   bool hasPublished_{};
   bool hasPublishedMidi_{};
+  bool hasPublishedScope_{};
   std::array<bool, 32U> activeGestures_{};
   std::string actionError_;
 

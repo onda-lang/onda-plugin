@@ -14,6 +14,7 @@ struct ProcessorTestAccess {
     if (!juce::MessageManager::getInstance()->isThisTheMessageThread())
       throw std::logic_error("Processor updates require the message thread");
     processor.timerCallback();
+    processor.handleUpdateNowIfNeeded();
   }
 };
 

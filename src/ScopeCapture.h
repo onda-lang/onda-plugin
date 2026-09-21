@@ -16,6 +16,15 @@ struct ScopeSnapshot {
   std::vector<float> samples;
 };
 
+struct ScopeRevision {
+  std::uint64_t reset{};
+  std::uint64_t frames{};
+  bool enabled{};
+
+  friend bool operator==(const ScopeRevision &,
+                         const ScopeRevision &) = default;
+};
+
 class ScopeCapture final {
   static constexpr std::size_t outputChannels =
       static_cast<std::size_t>(pluginOutputChannels);
@@ -26,22 +35,23 @@ public:
 
   void setEnabled(const bool enabled) noexcept {
     enabled_.store(enabled, std::memory_order_release);
-    if (enabled)
-      resetRequested_.store(true, std::memory_order_release);
+    requestReset();
   }
 
   void requestReset() noexcept {
-    resetRequested_.store(true, std::memory_order_release);
+    requestedReset_.fetch_add(1U, std::memory_order_release);
   }
 
   void push(const std::array<float *, outputChannels> &channels,
             const int frames) noexcept {
     if (frames <= 0 || !enabled_.load(std::memory_order_acquire))
       return;
-    if (resetRequested_.exchange(false, std::memory_order_acq_rel))
-      framesWritten_.store(0U, std::memory_order_relaxed);
 
-    const auto firstFrame = framesWritten_.load(std::memory_order_relaxed);
+    const auto requestedReset = requestedReset_.load(std::memory_order_acquire);
+    const auto reset =
+        requestedReset != appliedReset_.load(std::memory_order_relaxed);
+    const auto firstFrame =
+        reset ? 0U : framesWritten_.load(std::memory_order_relaxed);
     for (auto frame = 0; frame < frames; ++frame) {
       const auto ringFrame = static_cast<std::size_t>(
           (firstFrame + static_cast<std::uint64_t>(frame)) % capacityFrames);
@@ -52,14 +62,31 @@ public:
     }
     framesWritten_.store(firstFrame + static_cast<std::uint64_t>(frames),
                          std::memory_order_release);
+    if (reset)
+      appliedReset_.store(requestedReset, std::memory_order_release);
+  }
+
+  [[nodiscard]] ScopeRevision revision() const noexcept {
+    const auto enabled = enabled_.load(std::memory_order_acquire);
+    const auto requestedReset = requestedReset_.load(std::memory_order_acquire);
+    if (!enabled ||
+        appliedReset_.load(std::memory_order_acquire) != requestedReset) {
+      return {.reset = requestedReset, .enabled = enabled};
+    }
+    return {
+        .reset = requestedReset,
+        .frames = framesWritten_.load(std::memory_order_acquire),
+        .enabled = true,
+    };
   }
 
   [[nodiscard]] ScopeSnapshot snapshot() const {
     ScopeSnapshot result;
-    if (!enabled_.load(std::memory_order_acquire) ||
-        resetRequested_.load(std::memory_order_acquire)) {
+    if (!enabled_.load(std::memory_order_acquire))
       return result;
-    }
+    const auto requestedReset = requestedReset_.load(std::memory_order_acquire);
+    if (appliedReset_.load(std::memory_order_acquire) != requestedReset)
+      return result;
 
     const auto framesWritten = framesWritten_.load(std::memory_order_acquire);
     const auto frames = static_cast<std::size_t>(
@@ -85,8 +112,9 @@ private:
 
   std::array<std::atomic<float>, capacityFrames * outputChannels> samples_{};
   std::atomic<std::uint64_t> framesWritten_{};
+  std::atomic<std::uint64_t> requestedReset_{};
+  std::atomic<std::uint64_t> appliedReset_{};
   std::atomic<bool> enabled_{};
-  std::atomic<bool> resetRequested_{};
 };
 
 } // namespace onda::plugin

@@ -5,6 +5,8 @@
 #include "ProjectExport.h"
 #include "ProjectPath.h"
 
+#include <onda_processor_abi.h>
+
 #include <algorithm>
 #include <bit>
 #include <cmath>
@@ -23,6 +25,12 @@ constexpr int maximumBufferNameBytes = 1024;
 constexpr int maximumBufferBindings = 1024;
 constexpr std::size_t maximumRuntimeLogEntries = 1024U;
 constexpr std::size_t maximumRuntimeLogBytes = 256U * 1024U;
+
+static_assert(std::atomic<bool>::is_always_lock_free);
+static_assert(std::atomic<int>::is_always_lock_free);
+static_assert(std::atomic<float>::is_always_lock_free);
+static_assert(std::atomic<double>::is_always_lock_free);
+static_assert(std::atomic<std::uint64_t>::is_always_lock_free);
 
 [[nodiscard]] std::size_t
 runtimeLogPayloadBytes(const RuntimeLogRecord &record) noexcept {
@@ -201,6 +209,155 @@ ProjectImage readProjectImage(juce::MemoryInputStream &stream, bool &valid) {
 
 } // namespace
 
+class Processor::SlotParameter final : public juce::AudioParameterFloat {
+public:
+  explicit SlotParameter(const std::size_t index)
+      : AudioParameterFloat(juce::ParameterID{slotId(index), 1},
+                            slotName(index),
+                            juce::NormalisableRange<float>{0.0F, 1.0F}, 0.5F),
+        slotName_(slotName(index)) {}
+
+  bool setMapping(const ParameterMapping *const mapping) {
+    const auto current = mapping_.load(std::memory_order_acquire);
+    if ((mapping == nullptr && !current) ||
+        (mapping != nullptr && current && *mapping == *current)) {
+      return false;
+    }
+    mapping_.store(mapping == nullptr
+                       ? std::shared_ptr<const ParameterMapping>{}
+                       : std::make_shared<const ParameterMapping>(*mapping),
+                   std::memory_order_release);
+    return true;
+  }
+
+  juce::String getName(const int maximumLength) const override {
+    const auto mapping = mapping_.load(std::memory_order_acquire);
+    if (mapping && maximumLength <= 8)
+      return juce::String(mapping->name).substring(0, maximumLength);
+    const auto displayName =
+        mapping ? juce::String(mapping->name) + " [" + slotName_ + "]"
+                : slotName_;
+    return displayName.substring(0, maximumLength);
+  }
+
+  juce::String getLabel() const override {
+    const auto mapping = mapping_.load(std::memory_order_acquire);
+    return mapping ? juce::String(mapping->unit) : juce::String{};
+  }
+
+  float getDefaultValue() const override {
+    const auto mapping = mapping_.load(std::memory_order_acquire);
+    return mapping ? static_cast<float>(mapping->defaultNormalized) : 0.5F;
+  }
+
+  int getNumSteps() const override {
+    const auto mapping = mapping_.load(std::memory_order_acquire);
+    if (!mapping)
+      return juce::AudioProcessorParameter::getDefaultNumParameterSteps();
+    if (mapping->type == "bool")
+      return 2;
+    if (!mapping->stepCount)
+      return juce::AudioProcessorParameter::getDefaultNumParameterSteps();
+    constexpr auto maximum = std::numeric_limits<int>::max();
+    if (*mapping->stepCount >= static_cast<std::int64_t>(maximum - 1))
+      return maximum;
+    return static_cast<int>(*mapping->stepCount + 1);
+  }
+
+  bool isDiscrete() const override {
+    const auto mapping = mapping_.load(std::memory_order_acquire);
+    return mapping && (mapping->type == "bool" || mapping->stepCount);
+  }
+
+  bool isBoolean() const override {
+    const auto mapping = mapping_.load(std::memory_order_acquire);
+    return mapping && mapping->type == "bool";
+  }
+
+  juce::String getText(const float normalizedValue,
+                       const int maximumLength) const override {
+    const auto mapping = mapping_.load(std::memory_order_acquire);
+    if (!mapping)
+      return truncate(juce::String(normalizedValue), maximumLength);
+    if (mapping->type == "bool")
+      return truncate(normalizedValue >= 0.5F ? "On" : "Off", maximumLength);
+
+    const auto parameterDomain = domain(*mapping);
+    const auto plain = onda_processor_param_normalized_to_plain(
+        &parameterDomain, static_cast<double>(normalizedValue));
+    const auto text =
+        mapping->type == "i32" || mapping->type == "i64"
+            ? juce::String(static_cast<juce::int64>(std::llround(plain)))
+            : juce::String(plain);
+    return truncate(text, maximumLength);
+  }
+
+  float getValueForText(const juce::String &text) const override {
+    const auto mapping = mapping_.load(std::memory_order_acquire);
+    if (!mapping)
+      return normalizedText(text);
+    if (mapping->type == "bool") {
+      const auto lowered = text.trim().toLowerCase();
+      if (lowered == "on" || lowered == "true" || lowered == "yes")
+        return 1.0F;
+      if (lowered == "off" || lowered == "false" || lowered == "no")
+        return 0.0F;
+      return lowered.getDoubleValue() >= 0.5 ? 1.0F : 0.0F;
+    }
+
+    const auto parameterDomain = domain(*mapping);
+    const auto normalizedValue = onda_processor_param_plain_to_normalized(
+        &parameterDomain, text.getDoubleValue());
+    return std::isfinite(normalizedValue)
+               ? static_cast<float>(std::clamp(normalizedValue, 0.0, 1.0))
+               : 0.5F;
+  }
+
+private:
+  static juce::String slotName(const std::size_t index) {
+    return "Slot " + juce::String(static_cast<int>(index + 1U));
+  }
+
+  static juce::String truncate(juce::String text, const int maximumLength) {
+    return maximumLength > 0 ? text.substring(0, maximumLength) : text;
+  }
+
+  static float normalizedText(const juce::String &text) {
+    const auto value = text.getDoubleValue();
+    return std::isfinite(value)
+               ? static_cast<float>(std::clamp(value, 0.0, 1.0))
+               : 0.5F;
+  }
+
+  static onda_processor_param_scalar scalar(const std::string_view type) {
+    if (type == "f64")
+      return ONDA_PROCESSOR_PARAM_SCALAR_F64;
+    if (type == "i32")
+      return ONDA_PROCESSOR_PARAM_SCALAR_I32;
+    if (type == "i64")
+      return ONDA_PROCESSOR_PARAM_SCALAR_I64;
+    return ONDA_PROCESSOR_PARAM_SCALAR_F32;
+  }
+
+  static onda_processor_param_domain domain(const ParameterMapping &mapping) {
+    return {
+        .minimum = mapping.rangeMin,
+        .maximum = mapping.rangeMax,
+        .step = mapping.step.value_or(0.0),
+        .curve = mapping.curve.value_or(0.0),
+        .step_count = static_cast<std::uint32_t>(mapping.stepCount.value_or(0)),
+        .scale = mapping.scale == "log" ? ONDA_PROCESSOR_PARAM_SCALE_LOG
+                                        : ONDA_PROCESSOR_PARAM_SCALE_LINEAR,
+        .scalar = scalar(mapping.type),
+        .has_curve = static_cast<std::uint8_t>(mapping.curve.has_value()),
+        .unit = nullptr,
+    };
+  }
+
+  const juce::String slotName_;
+  std::atomic<std::shared_ptr<const ParameterMapping>> mapping_;
+};
+
 Processor::Processor(const Product product)
     : AudioProcessor(buses()), product_(product),
       parameterState_(*this, nullptr, "OndaSlots", parameters()) {
@@ -208,17 +365,22 @@ Processor::Processor(const Product product)
     const auto id = slotId(index);
     slotAtomics_[index] = parameterState_.getRawParameterValue(id);
     slotParameters_[index] = parameterState_.getParameter(id);
+    presentedSlotParameters_[index] =
+        dynamic_cast<SlotParameter *>(slotParameters_[index]);
     jassert(slotAtomics_[index] != nullptr &&
-            slotParameters_[index] != nullptr);
+            slotParameters_[index] != nullptr &&
+            presentedSlotParameters_[index] != nullptr);
   }
   worker_ = std::make_unique<Worker>(
       product_, replacements_, retirements_, deactivateRequested_,
-      Worker::BuildFunction{}, nullptr, [this] {
+      Worker::BuildFunction{}, nullptr,
+      [this] {
         ParameterValues values;
         for (std::size_t index = 0; index < slotCount; ++index)
           values[index] = slotValue(index);
         return values;
-      });
+      },
+      Worker::ProjectBuildFunction{}, [this] { triggerAsyncUpdate(); });
   startTimerHz(20);
 }
 
@@ -226,6 +388,7 @@ Processor::~Processor() {
   stopTimer();
   exportPool_.removeAllJobs(false, -1);
   worker_.reset();
+  cancelPendingUpdate();
   delete replacements_.tryPop();
   delete retirements_.tryPop();
   delete active_;
@@ -245,12 +408,8 @@ juce::AudioProcessor::BusesProperties Processor::buses() {
 
 juce::AudioProcessorValueTreeState::ParameterLayout Processor::parameters() {
   juce::AudioProcessorValueTreeState::ParameterLayout layout;
-  for (std::size_t index = 0; index < slotCount; ++index) {
-    layout.add(std::make_unique<juce::AudioParameterFloat>(
-        juce::ParameterID{slotId(index), 1},
-        "Slot " + juce::String(static_cast<int>(index + 1U)),
-        juce::NormalisableRange<float>{0.0F, 1.0F}, 0.5F));
-  }
+  for (std::size_t index = 0; index < slotCount; ++index)
+    layout.add(std::make_unique<SlotParameter>(index));
   return layout;
 }
 
@@ -931,6 +1090,10 @@ void Processor::setScopeCaptureEnabled(const bool enabled) noexcept {
   scopeCapture_.setEnabled(enabled);
 }
 
+ScopeRevision Processor::scopeRevision() const noexcept {
+  return scopeCapture_.revision();
+}
+
 ScopeSnapshot Processor::scopeSnapshot() const {
   return scopeCapture_.snapshot();
 }
@@ -996,6 +1159,15 @@ void Processor::setParamControlLayout(const ParamControlLayout layout) {
 }
 
 void Processor::drainRuntimeLogs() {
+  const auto activityRevision = runtimeLogSink_.activityRevision();
+  const auto observedGeneration =
+      activeLogGeneration_.load(std::memory_order_acquire);
+  if (activityRevision ==
+          consumedLogActivityRevision_.load(std::memory_order_acquire) &&
+      observedGeneration == consumedLogGeneration_) {
+    return;
+  }
+
   struct StagedRecord {
     std::uint64_t generation{};
     std::uint64_t epoch{};
@@ -1056,8 +1228,11 @@ void Processor::drainRuntimeLogs() {
       counters.delegateOverflow != 0U || counters.delegateTransportDrops != 0U;
   const auto hasRecords = !records.empty();
   const auto generationChanged = generation != consumedLogGeneration_;
-  if (!generationChanged && !hasRecords && !hasCounters)
+  if (!generationChanged && !hasRecords && !hasCounters) {
+    consumedLogActivityRevision_.store(activityRevision,
+                                       std::memory_order_release);
     return;
+  }
 
   if (generationChanged) {
     runtimeLogRecords_.clear();
@@ -1101,6 +1276,8 @@ void Processor::drainRuntimeLogs() {
     consumedLogEpoch_ = epoch;
     consumedLogCounterTotals_ = counterTotals;
   }
+  consumedLogActivityRevision_.store(activityRevision,
+                                     std::memory_order_release);
   runtimeLogRevision_.fetch_add(1U, std::memory_order_release);
 }
 
@@ -1133,14 +1310,31 @@ std::size_t Processor::applySeedValues() {
 
 void Processor::timerCallback() {
   drainRuntimeLogs();
-  std::unique_lock preparationLock(preparationMutex_, std::try_to_lock);
-  if (!preparationLock.owns_lock())
-    return;
-  const auto seeded = applySeedValues();
+  if (!retirements_.empty())
+    worker_->requestRetirementCollection();
   const auto notifyProjectChange = worker_->takeProjectStateChange();
   const auto expected = expectedBlockSize_.load(std::memory_order_acquire);
-  if (expected > 0 &&
-      expected != configuredBlockSize_.load(std::memory_order_acquire)) {
+  const auto needsResize =
+      expected > 0 &&
+      expected != configuredBlockSize_.load(std::memory_order_acquire);
+  const auto needsRecovery =
+      runtimeRecoveryRequested_.load(std::memory_order_acquire);
+  if (!worker_->hasPendingSeedValues() && !needsResize && !needsRecovery) {
+    if (notifyProjectChange)
+      updateHostDisplay(juce::AudioProcessorListener::ChangeDetails{}
+                            .withNonParameterStateChanged(true));
+    return;
+  }
+
+  std::unique_lock preparationLock(preparationMutex_, std::try_to_lock);
+  if (!preparationLock.owns_lock()) {
+    if (notifyProjectChange)
+      updateHostDisplay(juce::AudioProcessorListener::ChangeDetails{}
+                            .withNonParameterStateChanged(true));
+    return;
+  }
+  const auto seeded = applySeedValues();
+  if (needsResize) {
     for (auto &channel : dryScratch_)
       channel.resize(static_cast<std::size_t>(expected));
     worker_->configure(expectedSampleRate_.load(std::memory_order_acquire),
@@ -1151,10 +1345,26 @@ void Processor::timerCallback() {
     worker_->requestRebuild();
   preparationLock.unlock();
   notifySlotValues(seeded);
-  if (notifyProjectChange) {
+  if (notifyProjectChange)
     updateHostDisplay(juce::AudioProcessorListener::ChangeDetails{}
                           .withNonParameterStateChanged(true));
+}
+
+void Processor::handleAsyncUpdate() {
+  if (refreshSlotParameterInfo())
+    updateHostDisplay(
+        juce::AudioProcessorListener::ChangeDetails{}.withParameterInfoChanged(
+            true));
+}
+
+bool Processor::refreshSlotParameterInfo() {
+  const auto mappings = worker_->parameterMappings();
+  auto changed = false;
+  for (std::size_t index = 0; index < slotCount; ++index) {
+    const auto *mapping = index < mappings.size() ? &mappings[index] : nullptr;
+    changed = presentedSlotParameters_[index]->setMapping(mapping) || changed;
   }
+  return changed;
 }
 
 void Processor::getStateInformation(juce::MemoryBlock &destination) {

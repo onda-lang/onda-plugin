@@ -64,6 +64,15 @@ projected at an interior boundary only when the same snapshot also supplies
 tempo. Stopped timeline positions remain unchanged, including when the program
 does not declare a `transport` event. Bar position and loop points use the host-provided values. 
 
+## Parameters and automation
+
+The VST3 exposes 32 permanent, normalized automation slots so parameter IDs
+and saved DAW automation remain stable while Onda programs are recompiled.
+After a successful compile, mapped slots present their Onda names, units,
+defaults, boolean/discrete step counts, and normalized-to-plain text conversion
+to the host. Logarithmic scaling, curves, and step snapping use Onda's processor
+ABI. 
+
 ## Audio buffers
 
 An `.ondaproject` input uses the immutable buffer defaults retained by Onda's
@@ -77,8 +86,8 @@ the loader accepts Onda's canonical `.ondabuffer` container.
 
 Audio-file bindings must be read-only: programs that may write a bound buffer
 are rejected during preparation because Onda project assets are immutable.
-The worker watches both source and bound audio files, so an edited audio file
-prepares a new engine while the current one keeps running.
+The worker uses native filesystem notifications for source and bound audio
+files, so an edit prepares a new engine while the current one keeps running.
 
 Plugin state stores buffer names and absolute audio-file paths for live disk
 reloading, while the project image always contains the matching canonical
@@ -167,4 +176,3 @@ ctest --test-dir build --output-on-failure
 
 The same checks can be run directly with
 `scripts/validate-vst3.sh /path/to/validator build`.
-

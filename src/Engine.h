@@ -106,6 +106,9 @@ struct ParameterMapping {
   std::optional<double> curve;
   std::optional<double> step;
   std::optional<std::int64_t> stepCount;
+
+  friend bool operator==(const ParameterMapping &,
+                         const ParameterMapping &) = default;
 };
 
 struct EventParameterMapping {

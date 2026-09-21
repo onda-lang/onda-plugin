@@ -200,10 +200,30 @@ sample {
   }
 
   void writeConstantEffect(const std::string_view value) const {
-    writeText("ins { in1, in2 }\nouts { out1, out2 }\nsample {\n"
-              "  out1 = " +
-              std::string{value} + "\n  out2 = " + std::string{value} +
-              "\n}\n");
+    writeText(constantEffect(value));
+  }
+
+  bool replaceConstantEffect(const std::string_view value) const {
+    auto replacement = path_;
+    replacement += ".replacement";
+    {
+      std::ofstream output(replacement, std::ios::binary | std::ios::trunc);
+      output << constantEffect(value);
+      if (!output)
+        return false;
+    }
+#if defined(_WIN32)
+    std::error_code ignored;
+    std::filesystem::remove(path_, ignored);
+#endif
+    std::error_code error;
+    std::filesystem::rename(replacement, path_, error);
+    if (error) {
+      std::error_code ignored;
+      std::filesystem::remove(replacement, ignored);
+      return false;
+    }
+    return true;
   }
 
   void writeBufferEffect() const {
@@ -259,6 +279,12 @@ sample {
   }
 
 private:
+  static std::string constantEffect(const std::string_view value) {
+    return "ins { in1, in2 }\nouts { out1, out2 }\nsample {\n"
+           "  out1 = " +
+           std::string{value} + "\n  out2 = " + std::string{value} + "\n}\n";
+  }
+
   std::filesystem::path path_;
   std::filesystem::path dependencyPath_;
 };
@@ -280,6 +306,54 @@ bool exerciseDiagnosticOwnership() {
       return false;
     }
   }
+  return true;
+}
+
+bool exerciseNativeFilesystemWatcher() {
+  using onda::plugin::FilesystemWatcher;
+  const auto directory = testTemporaryRoot() / "native-watcher-missing";
+  const auto watched = directory / "nested" / "source.onda";
+  std::error_code ignored;
+  std::filesystem::remove_all(directory, ignored);
+  std::filesystem::create_directory(directory, ignored);
+  if (ignored)
+    return false;
+
+  std::mutex mutex;
+  std::condition_variable wake;
+  bool observed{};
+  FilesystemWatcher watcher([&](FilesystemWatcher::Paths paths) {
+    {
+      std::lock_guard lock(mutex);
+      observed = std::find(paths.begin(), paths.end(), watched) != paths.end();
+    }
+    wake.notify_one();
+  });
+  const std::array paths{watched};
+  if (!watcher.watch(paths).empty()) {
+    std::cerr << "native watcher did not cover a missing nested path\n";
+    return false;
+  }
+
+  std::filesystem::create_directory(directory / "nested", ignored);
+  if (ignored) {
+    std::cerr << "could not create native watcher test directory\n";
+    return false;
+  }
+  {
+    std::ofstream output(watched, std::ios::binary);
+    output << "outs { out1 }\nsample { out1 = 0.0 }\n";
+  }
+  {
+    std::unique_lock lock(mutex);
+    if (!wake.wait_for(lock, test::waitTimeout, [&] { return observed; }) ||
+        watcher.revision() == 0) {
+      std::cerr << "native watcher missed creation of a nested watched path\n";
+      return false;
+    }
+  }
+  static_cast<void>(watcher.watch(std::span<const std::filesystem::path>{}));
+  std::filesystem::remove_all(directory, ignored);
   return true;
 }
 
@@ -456,8 +530,8 @@ bool exerciseDiskRepairDuringFallback() {
   using namespace onda::plugin;
   TemporarySource source;
   source.writeConstantEffect("0.25");
-  const auto initial = PreparedEngine::build(source.path(), Product::effect,
-                                             48'000.0, 8);
+  const auto initial =
+      PreparedEngine::build(source.path(), Product::effect, 48'000.0, 8);
   if (!initial.engine)
     return false;
 
@@ -480,19 +554,19 @@ bool exerciseDiskRepairDuringFallback() {
               fallbackStarted = true;
               gateWake.notify_all();
               if (!gateWake.wait_for(lock, std::chrono::seconds(5),
-                                      [&] { return releaseFallback; })) {
+                                     [&] { return releaseFallback; })) {
                 return BuildResult{};
               }
             }
             if (fallbackSucceeds)
               return PreparedEngine::build(image, product, sampleRate,
-                                            blockSize, parameters);
+                                           blockSize, parameters);
             BuildResult failure;
             failure.diagnostic.message = "Injected saved-image build failure";
             return failure;
           };
-      Worker worker(Product::effect, replacements, retirements, deactivate,
-                    {}, nullptr, {}, std::move(gatedFallback));
+      Worker worker(Product::effect, replacements, retirements, deactivate, {},
+                    nullptr, {}, std::move(gatedFallback));
       worker.configure(48'000.0, 8);
       worker.restore(source.path(), initial.projectImage, {});
       bool started;
@@ -502,7 +576,7 @@ bool exerciseDiskRepairDuringFallback() {
                                     [&] { return fallbackStarted; });
       }
       // The disk post-build check is complete; fallback has not finished.
-      // This repair must remain visible to the next automatic watcher poll.
+      // This repair must remain visible to the pending native watch batch.
       source.writeConstantEffect("0.75");
       {
         std::lock_guard lock(gateMutex);
@@ -537,7 +611,8 @@ bool exerciseDiskRepairDuringFallback() {
 } // namespace
 
 int main() {
-  if (!exerciseDiagnosticOwnership() || !exerciseDiskRepairDuringFallback())
+  if (!exerciseDiagnosticOwnership() || !exerciseNativeFilesystemWatcher() ||
+      !exerciseDiskRepairDuringFallback())
     return 1;
   auto invalidBytes =
       std::make_shared<const std::vector<std::uint8_t>>(3U, 0xffU);
@@ -1215,13 +1290,14 @@ sample { out1 = in1; out2 = in2 }
   std::filesystem::remove_all(assetExportRoot);
   buffered.engine.reset();
 
-  for (const auto writer : {
-           "sample { clip[0, 0] = 0.5; out1 = clip[0, 0] }",
-           "init { clip[0, 0] = 0.5 }\nsample { out1 = clip[0, 0] }",
-           "event overwrite() { clip[0, 0] = 0.5 }\n"
-           "sample { out1 = clip[0, 0] }"}) {
+  for (const auto writer :
+       {"sample { clip[0, 0] = 0.5; out1 = clip[0, 0] }",
+        "init { clip[0, 0] = 0.5 }\nsample { out1 = clip[0, 0] }",
+        "event overwrite() { clip[0, 0] = 0.5 }\n"
+        "sample { out1 = clip[0, 0] }"}) {
     source.writeText(std::string{"buffers { clip: buffer<f32[2]> }\n"
-                                 "outs { out1 }\n"} + writer);
+                                 "outs { out1 }\n"} +
+                     writer);
     const auto writable = onda::plugin::PreparedEngine::build(
         source.path(), onda::plugin::Product::effect, 48'000.0, 8,
         bufferBindings);
@@ -1421,10 +1497,9 @@ sample { out1 = in1; out2 = in2 }
            int, std::span<const onda::plugin::BufferFileBinding>,
            const std::optional<onda::plugin::ParameterValues> &)
         -> onda::plugin::BuildResult { throw 7; };
-    onda::plugin::Worker worker(onda::plugin::Product::effect,
-                                failureReplacements, failureRetirements,
-                                failureDeactivate,
-                                std::move(failOutsideBuildBoundary));
+    onda::plugin::Worker worker(
+        onda::plugin::Product::effect, failureReplacements, failureRetirements,
+        failureDeactivate, std::move(failOutsideBuildBoundary));
     worker.configure(48'000.0, 8);
     worker.load(source.path(), false);
 
@@ -1506,7 +1581,10 @@ sample { out1 = in1; out2 = in2 }
         return 1;
       }
     }
-    source.writeConstantEffect("0.75");
+    if (!source.replaceConstantEffect("0.75")) {
+      std::cerr << "could not atomically replace watcher source\n";
+      return 1;
+    }
     {
       std::lock_guard lock(gateMutex);
       releaseFirst = true;
@@ -1692,15 +1770,16 @@ sample { out1 = in1; out2 = in2 }
           return onda::plugin::PreparedEngine::build(
               path, product, sampleRate, blockSize, bindings, parameters);
         };
-    onda::plugin::Worker worker(
-        onda::plugin::Product::effect, watchReplacements, watchRetirements,
-        watchDeactivate, std::move(countedBuild));
+    onda::plugin::Worker worker(onda::plugin::Product::effect,
+                                watchReplacements, watchRetirements,
+                                watchDeactivate, std::move(countedBuild));
     worker.configure(48'000.0, 8);
     worker.load(source.path(), false);
     std::unique_ptr<onda::plugin::PreparedEngine> initial{
         waitForReplacement(watchReplacements)};
     // Initial compilation may discover imports or canonical path aliases and
-    // retry to validate the expanded watch set. Measure edits after publication.
+    // retry to validate the expanded watch set. Measure edits after
+    // publication.
     const auto initialBuildCalls = buildCalls.load(std::memory_order_relaxed);
     if (!initial || !produces(*initial, 0.5F)) {
       std::cerr << "metadata-gated watcher did not publish the initial program "
@@ -1732,7 +1811,10 @@ sample { out1 = in1; out2 = in2 }
       return 1;
     }
 
-    source.writeConstantEffect("0.75");
+    if (!source.replaceConstantEffect("0.75")) {
+      std::cerr << "could not atomically replace watched source\n";
+      return 1;
+    }
     std::unique_ptr<onda::plugin::PreparedEngine> changed{
         waitForReplacement(watchReplacements)};
     if (!changed ||
@@ -1789,9 +1871,9 @@ sample { out1 = in1; out2 = in2 }
 
     onda::plugin::Worker first(onda::plugin::Product::effect, firstReplacements,
                                firstRetirements, firstDeactivate, countedBuild);
-    onda::plugin::Worker second(
-        onda::plugin::Product::effect, secondReplacements, secondRetirements,
-        secondDeactivate, countedBuild);
+    onda::plugin::Worker second(onda::plugin::Product::effect,
+                                secondReplacements, secondRetirements,
+                                secondDeactivate, countedBuild);
     first.configure(48'000.0, 8);
     second.configure(48'000.0, 8);
     first.load(source.path(), false);
@@ -1834,16 +1916,17 @@ sample { out1 = in1; out2 = in2 }
       retirementCount = 0;
       retirementThread = {};
     }
-    onda::plugin::Worker worker(
-        onda::plugin::Product::effect, retirementReplacements, retirementQueue,
-        retirementDeactivate, {}, observeRetirement);
-    worker.configure(48'000.0, 8);
-    worker.load(source.path(), false);
-    auto *engine = waitForReplacement(retirementReplacements);
-    if (engine == nullptr || !retirementQueue.tryPush(engine)) {
+    onda::plugin::Worker worker(onda::plugin::Product::effect,
+                                retirementReplacements, retirementQueue,
+                                retirementDeactivate, {}, observeRetirement);
+    auto retirementEngine = onda::plugin::PreparedEngine::build(
+        source.path(), onda::plugin::Product::effect, 48'000.0, 8);
+    if (!retirementEngine.engine ||
+        !retirementQueue.tryPush(retirementEngine.engine.release())) {
       std::cerr << "could not enqueue an engine retirement\n";
       return 1;
     }
+    worker.requestRetirementCollection();
     std::unique_lock lock(retirementAuditMutex);
     if (!retirementAuditWake.wait_for(lock, std::chrono::seconds(5),
                                       [] { return retirementCount > 0; }) ||

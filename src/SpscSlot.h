@@ -7,6 +7,7 @@ namespace onda::plugin {
 
 template <typename Item> class SpscSlot final {
   static_assert(std::is_pointer_v<Item>);
+  static_assert(std::atomic<Item>::is_always_lock_free);
 
 public:
   // Transfers ownership of an unconsumed item back to the producer.

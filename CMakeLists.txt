@@ -413,6 +413,8 @@ add_library(onda_plugin_engine STATIC
     src/Engine.h
     src/EventPayload.cpp
     src/EventPayload.h
+    src/FilesystemWatcher.cpp
+    src/FilesystemWatcher.h
     src/OndaSdk.cpp
     src/OndaSdk.h
     src/Primitive.h

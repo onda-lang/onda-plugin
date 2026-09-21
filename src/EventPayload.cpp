@@ -242,6 +242,19 @@ juce::var defaultSchemaValue(const PayloadDefault &value) {
   return result;
 }
 
+std::optional<double> parseFiniteDouble(const std::string &text) {
+  if (text.empty() || text.front() == '+')
+    return std::nullopt;
+
+  juce::CharPointer_UTF8 cursor{text.c_str()};
+  if (cursor != cursor.findEndOfWhitespace())
+    return std::nullopt;
+
+  const auto value = juce::CharacterFunctions::readDoubleValue(cursor);
+  return cursor.isEmpty() && std::isfinite(value) ? std::optional<double>{value}
+                                                  : std::nullopt;
+}
+
 juce::var defaultScalar(const PayloadScalar scalar,
                         const PayloadDefault *value) {
   const auto text = value != nullptr && value->scalar ? *value->scalar : "0";
@@ -263,12 +276,8 @@ juce::var defaultScalar(const PayloadScalar scalar,
     return juce::String{"Infinity"};
   if (text == "-inf" || text == "-Infinity")
     return juce::String{"-Infinity"};
-  double parsed{};
-  const auto result =
-      std::from_chars(text.data(), text.data() + text.size(), parsed);
-  return result.ec == std::errc{} && result.ptr == text.data() + text.size()
-             ? juce::var{parsed}
-             : juce::var{0.0};
+  const auto parsed = parseFiniteDouble(text);
+  return parsed ? juce::var{*parsed} : juce::var{0.0};
 }
 
 const PayloadDefault *defaultChild(const PayloadDefault *value,
