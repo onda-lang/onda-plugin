@@ -8,6 +8,7 @@
 #include <bit>
 #include <charconv>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <limits>
 #include <numeric>
@@ -15,6 +16,10 @@
 #include <string_view>
 #include <type_traits>
 #include <utility>
+
+#if defined(__APPLE__)
+#include <xlocale.h>
+#endif
 
 namespace onda::plugin {
 namespace {
@@ -420,6 +425,21 @@ bool appendNumber(RuntimeLogEntry &entry, const Value value) noexcept {
   return converted.ec == std::errc{} &&
          appendText(entry, {text.data(), converted.ptr});
 }
+
+#if defined(__APPLE__)
+template <typename Value>
+  requires std::is_floating_point_v<Value>
+bool appendNumber(RuntimeLogEntry &entry, const Value value) noexcept {
+  // Floating-point to_chars requires macOS 13.3. The null locale selects
+  // the C locale, and max_digits10 preserves enough digits to round-trip.
+  std::array<char, 64U> text{};
+  const auto written = ::snprintf_l(text.data(), text.size(), nullptr, "%.*g",
+                                    std::numeric_limits<Value>::max_digits10,
+                                    static_cast<double>(value));
+  return written > 0 && static_cast<std::size_t>(written) < text.size() &&
+         appendText(entry, {text.data(), static_cast<std::size_t>(written)});
+}
+#endif
 
 template <typename Unsigned>
 Unsigned readLittleEndian(const std::uint8_t *bytes) noexcept {
