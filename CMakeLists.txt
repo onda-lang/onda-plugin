@@ -49,9 +49,9 @@ if(NOT JUCE_REVISION MATCHES "^[0-9a-f]+$" OR
     message(FATAL_ERROR "Invalid JUCE revision '${JUCE_REVISION}'")
 endif()
 
-# Match the Onda release SDK's minimum macOS version.
+# Apple Silicon first shipped with macOS 11.
 if(CMAKE_HOST_APPLE AND NOT DEFINED CMAKE_OSX_DEPLOYMENT_TARGET)
-    set(CMAKE_OSX_DEPLOYMENT_TARGET "15.0" CACHE STRING "Minimum macOS version")
+    set(CMAKE_OSX_DEPLOYMENT_TARGET "11.0" CACHE STRING "Minimum macOS version")
 endif()
 project(onda-plugin VERSION "${ONDA_PLUGIN_VERSION}" LANGUAGES C CXX)
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
@@ -59,8 +59,8 @@ set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/onda-version"
     "${CMAKE_CURRENT_SOURCE_DIR}/plugin-version")
 
-if(APPLE AND CMAKE_OSX_DEPLOYMENT_TARGET VERSION_LESS "15.0")
-    message(FATAL_ERROR "The Onda SDK requires macOS 15.0 or later")
+if(APPLE AND CMAKE_OSX_DEPLOYMENT_TARGET VERSION_LESS "11.0")
+    message(FATAL_ERROR "Apple Silicon requires macOS 11.0 or later")
 endif()
 
 if(MSVC)
@@ -267,6 +267,19 @@ else()
     set(Onda_DIR "${ONDA_SDK_ROOT}/lib/cmake/Onda")
 endif()
 find_package(Onda CONFIG REQUIRED)
+if(APPLE)
+    get_target_property(ONDA_STATIC_LIBRARY Onda::Static IMPORTED_LOCATION)
+    execute_process(
+        COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/scripts/check-macos-deployment-target.sh"
+            "${CMAKE_OSX_DEPLOYMENT_TARGET}" "${ONDA_STATIC_LIBRARY}"
+        RESULT_VARIABLE ONDA_SDK_TARGET_RESULT)
+    if(NOT ONDA_SDK_TARGET_RESULT EQUAL 0)
+        message(FATAL_ERROR
+            "The Onda SDK requires a newer macOS version than "
+            "${CMAKE_OSX_DEPLOYMENT_TARGET}; rebuild the SDK with "
+            "MACOSX_DEPLOYMENT_TARGET=${CMAKE_OSX_DEPLOYMENT_TARGET}")
+    endif()
+endif()
 
 if(ONDA_JUCE_ROOT)
     execute_process(

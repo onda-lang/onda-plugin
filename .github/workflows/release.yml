@@ -2,7 +2,7 @@ name: Build Onda VST3
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-  MACOSX_DEPLOYMENT_TARGET: "15.0"
+  MACOSX_DEPLOYMENT_TARGET: "11.0"
 
 on:
   push:
@@ -137,6 +137,15 @@ jobs:
       - name: Test
         shell: bash
         run: ctest --test-dir "$BUILD_PATH" -C Release --output-on-failure
+
+      - name: Verify macOS deployment targets
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          bash scripts/check-macos-deployment-target.sh \
+            "$MACOSX_DEPLOYMENT_TARGET" \
+            "$BUILD_PATH/OndaSynth_artefacts/Release/VST3/OndaSynth.vst3/Contents/MacOS/OndaSynth" \
+            "$BUILD_PATH/OndaFX_artefacts/Release/VST3/OndaFX.vst3/Contents/MacOS/OndaFX"
 
       - name: Test zero-input VST3 configuration
         if: runner.os == 'Linux'
