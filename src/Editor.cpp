@@ -277,7 +277,6 @@ Editor::Editor(Processor &owner)
   setResizable(true, true);
   setSize(width, height);
   setResizeLimits(360, 480, 1600, 1400);
-  processor_.setScopeCaptureEnabled(true);
   if (const auto error = browser_->initializationError(); error.isNotEmpty())
     loadingOverlay_.setText(error, juce::dontSendNotification);
   else
@@ -307,12 +306,27 @@ void Editor::resized() {
 }
 
 void Editor::timerCallback() {
+  const auto showing = isShowing() && browser_->isVisible();
+  if (scopeCaptureActive_ != showing) {
+    scopeCaptureActive_ = showing;
+    processor_.setScopeCaptureEnabled(showing);
+  }
+  if (!showing) {
+    hasPublished_ = false;
+    hasPublishedMidi_ = false;
+    hasPublishedScope_ = false;
+    return;
+  }
   publishState(false);
   publishMidiActivity();
   publishScope();
 }
 
 void Editor::publishMidiActivity(const bool force) {
+  if (!isShowing()) {
+    hasPublishedMidi_ = false;
+    return;
+  }
   const auto activity = processor_.midiActivitySnapshot();
   if (!force && hasPublishedMidi_ &&
       activity.revision == publishedMidiRevision_) {
@@ -325,7 +339,7 @@ void Editor::publishMidiActivity(const bool force) {
 }
 
 void Editor::publishState(const bool force) {
-  if (!browser_->isVisible()) {
+  if (!isShowing() || !browser_->isVisible()) {
     hasPublished_ = false;
     return;
   }
@@ -359,7 +373,7 @@ void Editor::publishState(const bool force) {
 }
 
 void Editor::publishScope(const bool force) {
-  if (!browser_->isVisible()) {
+  if (!isShowing() || !browser_->isVisible()) {
     hasPublishedScope_ = false;
     return;
   }

@@ -1086,6 +1086,26 @@ int main() {
                  "parameters\n";
     return 1;
   }
+  if (!parameterAwareInstrument.engine->reset(slots)) {
+    std::cerr << "parameter-aware instrument reset failed\n";
+    return 1;
+  }
+  values[0].store(1.0F);
+  if (!parameterAwareInstrument.engine->process(
+          nullptr, instrumentOutputs.data(), 6, {}, slots)) {
+    std::cerr << "parameter-aware loop setup failed\n";
+    return 1;
+  }
+  values[0].store(0.0F);
+  instrumentLeft.fill(1.0F);
+  if (!parameterAwareInstrument.engine->beginHostCallback(slots) ||
+      !parameterAwareInstrument.engine->process(
+          nullptr, instrumentOutputs.data(), 2, parameterBoundaryEvent,
+          slots) ||
+      !close(instrumentLeft[0], 0.0F)) {
+    std::cerr << "loop-boundary MIDI saw stale host automation\n";
+    return 1;
+  }
   parameterAwareInstrument.engine.reset();
 
   source.writeInvalidMidiInstrument();

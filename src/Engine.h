@@ -210,6 +210,9 @@ public:
           const HostContext &hostContext = {},
           int hostCallbackOffset = 0) noexcept;
 
+  [[nodiscard]] bool beginHostCallback(
+      const std::array<std::atomic<float> *, slotCount> &slots) noexcept;
+
   [[nodiscard]] bool
   reset(const std::array<std::atomic<float> *, slotCount> &slots) noexcept;
   void attachLogSink(RuntimeLogSink &sink) noexcept;
@@ -300,6 +303,10 @@ private:
   void applyParameter(std::size_t slot, float value) noexcept;
   void applyParameters(
       const std::array<std::atomic<float> *, slotCount> &slots) noexcept;
+  [[nodiscard]] float parameterValue(
+      std::size_t slot,
+      const std::array<std::atomic<float> *, slotCount> &slots,
+      bool useDefaults) const noexcept;
 
   std::uint64_t buildGeneration_{};
   // Worker metadata lives until this engine is retired. Audio never accesses
@@ -332,6 +339,7 @@ private:
   RuntimeLogCounters pendingLogCounters_{};
   int logicalFrame_{};
   bool blockStarted_{};
+  std::array<float, slotCount> appliedParameters_{};
   std::array<ParameterMapping, slotCount> parameterMappings_{};
   std::size_t parameterMappingCount_{};
   std::array<EventBinding, static_cast<std::size_t>(MidiKind::count)>

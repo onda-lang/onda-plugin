@@ -138,13 +138,14 @@ for 200 ms before validating contents. It otherwise blocks on its condition
 variable indefinitely. Only paths whose native subscription failed receive a
 targeted 500 ms disk-validation fallback.
 
-While an editor exists, the callback writes interleaved output into a bounded,
+While an editor is showing, the callback writes interleaved output into a bounded,
 lock-free scope ring owned by `Processor`. Reset generations avoid a
 read-modify-write in steady-state processing, and the editor only snapshots
 and publishes the scope after its frame revision changes. The snapshot uses its
 newest 1,024 frames at 20 Hz and publishes them through the shared view's
-separate `scopeData` message. Capturing is disabled when the editor closes; the
-callback never allocates, locks, or interacts with the browser.
+separate `scopeData` message. Capturing is disabled when the editor closes or
+JUCE reports it hidden. The callback never allocates, locks, or interacts with
+the browser.
 
 Host note-on/off state is retained per MIDI channel in atomic bitsets and
 published separately as `midiActivity`. Notes remain lit while any host channel holds the corresponding key.
@@ -154,12 +155,14 @@ are scoped to the compiled engine generation. Closing the editor or overflowing
 the queue releases its held notes. MIDI device selection remains host-owned.
 
 The callback captures aliased host input before clearing output. Logical blocks
-continue across host callbacks without added latency. JUCE playhead state is
-captured once at callback entry. At each new logical block, parameters are
-snapshotted first, available host-context fields are dispatched in canonical
-order, then same-boundary MIDI is dispatched before audio processing. Missing
-JUCE fields produce no context event; `render_mode` is the sole event sent
-unconditionally when declared. Prevalidated event-presence metadata gates capture and
+continue across host callbacks without added latency unless host automation
+changes; then the unfinished block ends before the next callback's events and
+audio. JUCE playhead state is captured once at callback entry. At each new
+logical block, parameters are snapshotted first, available host-context fields
+are dispatched in canonical order, then same-boundary MIDI is dispatched before
+audio processing. Missing JUCE fields produce no context event; `render_mode`
+is the sole event sent unconditionally when declared. Prevalidated event-presence
+metadata gates capture and
 dispatch: undeclared MIDI does not split processing, undeclared context fields
 do not perform projection or payload work, and an engine without position
 events does not query the JUCE playhead.
@@ -184,7 +187,7 @@ substituting defaults still pending for that checkpoint. These defaults survive
 request supersession and stop overriding saved values once seeding is
 acknowledged. Snapshot capture is serialized with seeding and host state
 restoration. Initializers remain on the worker, while subsequent parameter
-automation continues to apply at logical block boundaries.
+automation starts a new logical block at the next host callback when needed.
 
 Host preparation waits on the worker's completion condition before returning
 and adopts the specialization without needing a GUI timer tick. An unchanged

@@ -44,6 +44,7 @@ private:
   bool hasPublished_{};
   bool hasPublishedMidi_{};
   bool hasPublishedScope_{};
+  bool scopeCaptureActive_{};
   std::array<bool, 32U> activeGestures_{};
   std::string actionError_;
 

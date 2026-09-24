@@ -704,6 +704,12 @@ void Processor::processBlock(juce::AudioBuffer<float> &audio,
     return;
   }
 
+  if (!active_->beginHostCallback(slotAtomics_)) {
+    faultActive();
+    fallback(audio);
+    return;
+  }
+
   while (userEvents_.tryPop(userEventScratch_)) {
     if (userEventScratch_.generation != active_->buildGeneration())
       continue;

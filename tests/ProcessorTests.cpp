@@ -2494,6 +2494,68 @@ bool exerciseExtendedMidi() {
   return true;
 }
 
+bool exerciseHostAutomationBeforeMidi() {
+  TemporarySource source;
+  if (!source.write(R"(
+outs { out1, out2 }
+params { level = 1.0 {0.0, 1.0} }
+init { held = 0.0 }
+event note_on(id: i32, channel: i32, key: i32, velocity: f32) {
+  held += velocity
+}
+event note_off(id: i32, channel: i32, key: i32, velocity: f32) {
+  held = 0.0
+}
+sample { out1 = held * level; out2 = held * level }
+)"))
+    return false;
+
+  onda::plugin::Processor processor(onda::plugin::Product::instrument);
+  processor.prepareToPlay(48'000.0, 8);
+  processor.loadFile(juce::File(onda::plugin::pathToJuce(source.path())),
+                     false);
+  if (!waitForPublishedReplacement(processor))
+    return false;
+  test::service(processor);
+
+  auto *const level = processor.getParameters()[0];
+  level->setValueNotifyingHost(1.0F);
+  juce::AudioBuffer<float> previous(2, 6);
+  juce::MidiBuffer emptyMidi;
+  processor.processBlock(previous, emptyMidi);
+
+  level->setValueNotifyingHost(0.0F);
+  juce::AudioBuffer<float> loopStart(2, 2);
+  juce::MidiBuffer noteOn;
+  noteOn.addEvent(juce::MidiMessage::noteOn(1, 60, 1.0F), 0);
+  processor.processBlock(loopStart, noteOn);
+  for (int channel = 0; channel < loopStart.getNumChannels(); ++channel) {
+    for (int frame = 0; frame < loopStart.getNumSamples(); ++frame) {
+      if (!test::withinTolerance(loopStart.getSample(channel, frame),
+                                 1.0e-6F)) {
+        std::cerr << "loop-boundary note used the previous callback's level "
+                  << "(slot " << processor.slotValue(0) << ", output "
+                  << loopStart.getSample(channel, frame) << ")\n";
+        return false;
+      }
+    }
+  }
+
+  level->setValueNotifyingHost(1.0F);
+  juce::AudioBuffer<float> restored(2, 3);
+  processor.processBlock(restored, emptyMidi);
+  for (int channel = 0; channel < restored.getNumChannels(); ++channel) {
+    for (int frame = 0; frame < restored.getNumSamples(); ++frame) {
+      if (!test::withinTolerance(restored.getSample(channel, frame) - 1.0F,
+                                 1.0e-6F)) {
+        std::cerr << "host automation was delayed without another MIDI event\n";
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
 bool exerciseClickableMidiKeyboard() {
   TemporarySource source;
   if (!source.write(R"(
@@ -4006,6 +4068,7 @@ int main(const int argc, const char *const *argv) {
        exerciseSourceGraphFallbackAndDiskAuthority},
       {"ProjectExportRelinksAuthority", exerciseProjectExportRelinksAuthority},
       {"ExtendedMidi", exerciseExtendedMidi},
+      {"HostAutomationBeforeMidi", exerciseHostAutomationBeforeMidi},
       {"MidiKeyboardMonitor", exerciseMidiKeyboardMonitor},
       {"ClickableMidiKeyboard", exerciseClickableMidiKeyboard},
       {"EventMetadataGating", exerciseEventMetadataGating},

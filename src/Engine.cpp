@@ -1191,6 +1191,17 @@ void PreparedEngine::applyParameter(const std::size_t slot,
   static_cast<void>(onda_set_param_normalized(
       instance_.get(), parameterMappings_[slot].parameterIndex,
       static_cast<double>(normalized)));
+  appliedParameters_[slot] = normalized;
+}
+
+float PreparedEngine::parameterValue(
+    const std::size_t slot,
+    const std::array<std::atomic<float> *, slotCount> &slots,
+    const bool useDefaults) const noexcept {
+  const auto value = useDefaults && slot < parameterSeed_->count
+                         ? parameterSeed_->values[slot]
+                         : slots[slot]->load(std::memory_order_relaxed);
+  return std::isfinite(value) ? std::clamp(value, 0.0F, 1.0F) : 0.5F;
 }
 
 void PreparedEngine::applyParameters(
@@ -1198,10 +1209,40 @@ void PreparedEngine::applyParameters(
   const auto useDefaults = parameterSeed_ && !parameterSeed_->applied.load(
                                                  std::memory_order_acquire);
   for (std::size_t index = 0; index < parameterMappingCount_; ++index) {
-    applyParameter(index, useDefaults && index < parameterSeed_->count
-                              ? parameterSeed_->values[index]
-                              : slots[index]->load(std::memory_order_relaxed));
+    applyParameter(index, parameterValue(index, slots, useDefaults));
   }
+}
+
+bool PreparedEngine::beginHostCallback(
+    const std::array<std::atomic<float> *, slotCount> &slots) noexcept {
+  if (!blockStarted_)
+    return true;
+
+  const auto useDefaults = parameterSeed_ && !parameterSeed_->applied.load(
+                                                 std::memory_order_acquire);
+  bool changed = false;
+  for (std::size_t index = 0; index < parameterMappingCount_; ++index)
+    changed |= parameterValue(index, slots, useDefaults) !=
+               appliedParameters_[index];
+  if (!changed)
+    return true;
+
+  if (logicalFrame_ == 0) {
+    blockStarted_ = false;
+    return true;
+  }
+
+  // Parameters in sample work are captured by BEGIN_BLOCK. Complete the
+  // current short block so this callback can begin with the new values.
+  const auto status = onda_process_unchecked_segment(
+      instance_.get(), logicalFrame_, 0, ONDA_PROCESS_END_BLOCK,
+      &executionOutput_);
+  collectExecutionOutput();
+  if (status != 0)
+    return false;
+  logicalFrame_ = 0;
+  blockStarted_ = false;
+  return true;
 }
 
 bool PreparedEngine::ensureBlockStarted(
