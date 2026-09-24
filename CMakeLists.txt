@@ -317,6 +317,17 @@ if(NOT MSVC)
     set_property(SOURCE ${ONDA_JUCE_MODULE_SOURCES} APPEND PROPERTY
         COMPILE_OPTIONS -w)
 endif()
+if(MSVC)
+    # MSVC /O2 and /Ox can break JUCE's WebView2 COM callbacks. Source options
+    # follow target options, so only this JUCE compilation unit uses /O1 and
+    # stays outside link-time optimization.
+    # https://github.com/juce-framework/JUCE/issues/1642
+    set_property(SOURCE
+        "${ONDA_JUCE_SOURCE_DIR}/modules/juce_gui_extra/juce_gui_extra.cpp"
+        APPEND PROPERTY COMPILE_OPTIONS
+        "$<$<NOT:$<CONFIG:Debug>>:/O1>"
+        "$<$<CONFIG:Release>:/GL->")
+endif()
 
 function(onda_treat_juce_headers_as_system target)
     target_include_directories(${target} SYSTEM PRIVATE
