@@ -77,17 +77,15 @@ begins. The worker checks both under its mutex before relinking; a newer user
 request leaves the exported files intact without changing the current project.
 
 `RunViewHost` owns embedded-resource routing and projection of processor state
-into the shared view's host-message schema. `Editor` creates its native browser
-after the host shows the editor and releases it when the editor is hidden. The
-browser loads its page after attachment, and each reopen gets a new native view.
-`Editor` also owns periodic publication and command routing. Processor tests
+into the shared view's host-message schema. `Editor` owns the native browser
+lifetime, periodic publication, and command routing. Processor tests
 exercise the editor lifecycle through JUCE's real browser component; resource
 bytes and capability state are tested directly through `RunViewHost`.
 Windows explicitly uses WebView2 with a writable per-user data folder, and its
 editor lifecycle test requires the native browser's ready handshake.
 The editor publishes its initial state on `webviewReady` and keeps the loading
 overlay until the shared view responds with `runViewReady`, after rendering the
-host state and restoring saved controls and scroll position.
+host state and restoring saved controls and the document scroll position.
 Each restore carries a `readyId` so an acknowledgment from an older render
 cannot uncover a newer one.
 

@@ -262,9 +262,11 @@ private:
 };
 
 Editor::Editor(Processor &owner)
-    : AudioProcessorEditor(owner), processor_(owner) {
+    : AudioProcessorEditor(owner), processor_(owner),
+      browser_(std::make_unique<Browser>(*this)) {
   const auto [width, height] = processor_.editorSize();
   setOpaque(true);
+  addAndMakeVisible(*browser_);
   loadingOverlay_.setComponentID("onda-loading-overlay");
   loadingOverlay_.setText("Loading Onda...", juce::dontSendNotification);
   loadingOverlay_.setJustificationType(juce::Justification::centred);
@@ -275,25 +277,22 @@ Editor::Editor(Processor &owner)
   setResizable(true, true);
   setSize(width, height);
   setResizeLimits(360, 480, 1600, 1400);
+  if (const auto error = browser_->initializationError(); error.isNotEmpty())
+    loadingOverlay_.setText(error, juce::dontSendNotification);
+  else
+    browser_->goToURL(juce::WebBrowserComponent::getResourceProviderRoot());
   startTimerHz(20);
 }
 
 Editor::~Editor() {
   stopTimer();
-  releaseBrowserInteraction();
-  browser_.reset();
-  processor_.setScopeCaptureEnabled(false);
-  processor_.setEditorSize(getWidth(), getHeight());
-}
-
-void Editor::releaseBrowserInteraction() {
   processor_.releaseKeyboardNotes();
+  processor_.setScopeCaptureEnabled(false);
   for (std::size_t index = 0; index < activeGestures_.size(); ++index) {
-    if (activeGestures_[index]) {
+    if (activeGestures_[index])
       processor_.endSlotGesture(index);
-      activeGestures_[index] = false;
-    }
   }
+  processor_.setEditorSize(getWidth(), getHeight());
 }
 
 void Editor::paint(juce::Graphics &graphics) {
@@ -301,36 +300,13 @@ void Editor::paint(juce::Graphics &graphics) {
 }
 
 void Editor::resized() {
-  if (browser_)
-    browser_->setBounds(getLocalBounds());
+  browser_->setBounds(getLocalBounds());
   loadingOverlay_.setBounds(getLocalBounds());
   processor_.setEditorSize(getWidth(), getHeight());
 }
 
 void Editor::timerCallback() {
-  if (!isShowing()) {
-    if (browser_) {
-      releaseBrowserInteraction();
-      browser_.reset();
-      browserReady_ = false;
-      browserLoadStarted_ = false;
-      loadingOverlay_.setVisible(true);
-    }
-  } else if (!browser_) {
-    browser_ = std::make_unique<Browser>(*this);
-    addAndMakeVisible(*browser_, 0);
-    browser_->setBounds(getLocalBounds());
-  } else if (!browserLoadStarted_) {
-    // VST3 editors are constructed before the host attaches their native view.
-    // Load the page on the next tick, after this browser has been attached.
-    browserLoadStarted_ = true;
-    if (const auto error = browser_->initializationError(); error.isNotEmpty())
-      loadingOverlay_.setText(error, juce::dontSendNotification);
-    else
-      browser_->goToURL(juce::WebBrowserComponent::getResourceProviderRoot());
-  }
-
-  const auto showing = browserReady_ && browser_ && browser_->isVisible();
+  const auto showing = browserReady_ && isShowing() && browser_->isVisible();
   if (scopeCaptureActive_ != showing) {
     scopeCaptureActive_ = showing;
     processor_.setScopeCaptureEnabled(showing);
@@ -347,7 +323,7 @@ void Editor::timerCallback() {
 }
 
 void Editor::publishMidiActivity(const bool force) {
-  if (!browser_ || !isShowing()) {
+  if (!isShowing()) {
     hasPublishedMidi_ = false;
     return;
   }
@@ -363,7 +339,7 @@ void Editor::publishMidiActivity(const bool force) {
 }
 
 void Editor::publishState(const bool force) {
-  if (!browserReady_ || !browser_ || !isShowing() || !browser_->isVisible()) {
+  if (!browserReady_ || !isShowing() || !browser_->isVisible()) {
     hasPublished_ = false;
     return;
   }
@@ -416,7 +392,7 @@ void Editor::publishState(const bool force) {
 }
 
 void Editor::publishScope(const bool force) {
-  if (!browser_ || !isShowing() || !browser_->isVisible()) {
+  if (!isShowing() || !browser_->isVisible()) {
     hasPublishedScope_ = false;
     return;
   }
