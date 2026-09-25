@@ -128,6 +128,7 @@ juce::var makeRunViewState(Processor &processor, const WorkerStatus &status,
   set(state, "supportsDeviceSelection", false);
   set(state, "supportsRunSettings", false);
   set(state, "supportsReset", true);
+  set(state, "supportsViewState", true);
   set(state, "supportsScope", true);
   auto midi = object();
   const auto noteOn = status.active && status.midi.noteOn;

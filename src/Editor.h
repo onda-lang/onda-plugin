@@ -38,6 +38,8 @@ private:
   std::uint64_t publishedEngineGeneration_{};
   std::uint64_t publishedLogRevision_{};
   std::uint64_t publishedMidiRevision_{};
+  std::uint64_t publishedViewStateRestoreRevision_{};
+  int publishedReadyId_{};
   ScopeRevision publishedScopeRevision_{};
   std::array<float, 32U> publishedSlots_{};
   bool publishedKnobLayout_{};
@@ -45,6 +47,7 @@ private:
   bool hasPublishedMidi_{};
   bool hasPublishedScope_{};
   bool scopeCaptureActive_{};
+  bool browserReady_{};
   std::array<bool, 32U> activeGestures_{};
   std::string actionError_;
 

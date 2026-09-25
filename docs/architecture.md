@@ -83,6 +83,11 @@ exercise the editor lifecycle through JUCE's real browser component; resource
 bytes and capability state are tested directly through `RunViewHost`.
 Windows explicitly uses WebView2 with a writable per-user data folder, and its
 editor lifecycle test requires the native browser's ready handshake.
+The editor publishes its initial state on `webviewReady` and keeps the loading
+overlay until the shared view responds with `runViewReady`, after rendering the
+host state and restoring saved controls and scroll position.
+Each restore carries a `readyId` so an acknowledgment from an older render
+cannot uncover a newer one.
 
 The view lists user-defined events but omits the canonical `plugin_midi` and
 `plugin_host` families, which the host drives. The host consumes Onda's
@@ -128,6 +133,16 @@ buffer changes, export relinking, and unload also notify the host that saved
 state changed. Identical recompilation and initial host-state restoration do not
 mark the host dirty. Project-state notifications are delivered by the
 message-thread timer.
+
+The shared view reports its page and log scroll positions, keyboard octave and
+velocity, section and argument folds, and event argument drafts as one bounded
+snapshot.
+The processor retains that snapshot per plugin instance, serializes it with the
+project, and includes it with the first state sent to each recreated browser or
+after a host state restore in an open editor.
+Event values are matched to their source path and argument schema when restored;
+audio parameters remain owned by the processor and host automation.
+
 The editor's revision check is lock-free, and the processor timer avoids worker
 and preparation mutexes while there is no pending seed, block-size change, or
 runtime recovery. Runtime-log draining similarly returns after an atomic

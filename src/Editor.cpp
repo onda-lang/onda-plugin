@@ -306,7 +306,7 @@ void Editor::resized() {
 }
 
 void Editor::timerCallback() {
-  const auto showing = isShowing() && browser_->isVisible();
+  const auto showing = browserReady_ && isShowing() && browser_->isVisible();
   if (scopeCaptureActive_ != showing) {
     scopeCaptureActive_ = showing;
     processor_.setScopeCaptureEnabled(showing);
@@ -339,12 +339,13 @@ void Editor::publishMidiActivity(const bool force) {
 }
 
 void Editor::publishState(const bool force) {
-  if (!isShowing() || !browser_->isVisible()) {
+  if (!browserReady_ || !isShowing() || !browser_->isVisible()) {
     hasPublished_ = false;
     return;
   }
   const auto revision = processor_.workerStatusRevision();
   const auto logRevision = processor_.runtimeLogRevision();
+  const auto viewStateRestoreRevision = processor_.viewStateRestoreRevision();
   std::array<float, slotCount> currentSlots{};
   for (std::size_t index = 0; index < currentSlots.size(); ++index)
     currentSlots[index] = processor_.slotValue(index);
@@ -352,24 +353,42 @@ void Editor::publishState(const bool force) {
       processor_.paramControlLayout() == ParamControlLayout::knobs;
   if (!force && hasPublished_ && revision == publishedRevision_ &&
       logRevision == publishedLogRevision_ && currentSlots == publishedSlots_ &&
-      currentKnobLayout == publishedKnobLayout_) {
+      currentKnobLayout == publishedKnobLayout_ &&
+      viewStateRestoreRevision == publishedViewStateRestoreRevision_) {
     return;
   }
   const auto status = processor_.workerStatus();
   const auto resetEventArguments =
-      status.engineGeneration != publishedEngineGeneration_;
+      status.engineGeneration != publishedEngineGeneration_ ||
+      viewStateRestoreRevision != publishedViewStateRestoreRevision_;
   const auto includeRuntimeLog =
       force || !hasPublished_ || logRevision != publishedLogRevision_;
+  const auto initializeViewState =
+      !hasPublished_ ||
+      viewStateRestoreRevision != publishedViewStateRestoreRevision_;
   publishedEngineGeneration_ = status.engineGeneration;
   publishedRevision_ = status.revision;
   publishedLogRevision_ = logRevision;
   publishedSlots_ = currentSlots;
   publishedKnobLayout_ = currentKnobLayout;
+  publishedViewStateRestoreRevision_ = viewStateRestoreRevision;
   hasPublished_ = true;
-  browser_->emitEventIfBrowserIsVisible(
-      "ondaState",
+  auto message =
       makeRunViewState(processor_, status, processor_.canExportProject(),
-                       actionError_, resetEventArguments, includeRuntimeLog));
+                       actionError_, resetEventArguments, includeRuntimeLog);
+  if (initializeViewState) {
+    auto state = message.getDynamicObject()->getProperty("state");
+    juce::var viewState;
+    if (const auto saved = processor_.viewState(); saved.isNotEmpty()) {
+      viewState = juce::JSON::parse(saved);
+    } else {
+      viewState = juce::var{new juce::DynamicObject};
+      viewState.getDynamicObject()->setProperty("reset", true);
+    }
+    viewState.getDynamicObject()->setProperty("readyId", ++publishedReadyId_);
+    state.getDynamicObject()->setProperty("viewState", std::move(viewState));
+  }
+  browser_->emitEventIfBrowserIsVisible("ondaState", message);
 }
 
 void Editor::publishScope(const bool force) {
@@ -393,10 +412,20 @@ void Editor::handleCommand(const juce::var &command) {
   const auto type = input->getProperty("type").toString();
 
   if (type == "webviewReady") {
-    loadingOverlay_.setVisible(false);
+    browserReady_ = true;
+    hasPublished_ = false;
+    hasPublishedMidi_ = false;
+    hasPublishedScope_ = false;
     publishState(true);
     publishMidiActivity(true);
     publishScope(true);
+  } else if (type == "runViewReady") {
+    const auto readyId = input->getProperty("readyId");
+    if (browserReady_ && (readyId.isInt() || readyId.isInt64()) &&
+        static_cast<juce::int64>(readyId) == publishedReadyId_)
+      loadingOverlay_.setVisible(false);
+  } else if (type == "viewState") {
+    processor_.setViewState(input->getProperty("state"));
   } else if (type == "midiNote") {
     const auto key = input->getProperty("key");
     const auto velocity = input->getProperty("velocity");

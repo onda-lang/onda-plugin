@@ -100,7 +100,7 @@ struct ProductExpectation {
   {
     juce::MemoryOutputStream stream(componentState, false);
     stream.writeInt(0x41444e4f);
-    stream.writeInt(3);
+    stream.writeInt(4);
     stream.writeString(source.getFullPathName());
     stream.writeString({});
     stream.writeInt(0);
@@ -110,6 +110,7 @@ struct ProductExpectation {
     stream.writeInt(480);
     stream.writeInt(720);
     stream.writeBool(false);
+    stream.writeString({});
   }
   juce::XmlElement state("VST3PluginState");
   state.createNewChildElement("IComponent")

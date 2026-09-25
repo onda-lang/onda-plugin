@@ -146,6 +146,11 @@ public:
   void setEditorSize(int width, int height);
   [[nodiscard]] ParamControlLayout paramControlLayout() const noexcept;
   void setParamControlLayout(ParamControlLayout layout);
+  [[nodiscard]] juce::String viewState() const;
+  void setViewState(const juce::var &state);
+  [[nodiscard]] std::uint64_t viewStateRestoreRevision() const noexcept {
+    return viewStateRestoreRevision_.load(std::memory_order_acquire);
+  }
 
 private:
   friend struct ProcessorTestAccess;
@@ -232,9 +237,11 @@ private:
   std::atomic<int> editorHeight_{720};
   std::atomic<ParamControlLayout> paramControlLayout_{
       ParamControlLayout::sliders};
+  std::atomic<std::uint64_t> viewStateRestoreRevision_{};
   std::mutex preparationMutex_;
   mutable std::mutex stateMutex_;
   std::filesystem::path lastBrowseDirectory_;
+  juce::String viewState_;
   std::vector<RuntimeLogRecord> runtimeLogRecords_;
   std::size_t runtimeLogBytes_{};
   RuntimeLogCounters runtimeLogCounters_{};

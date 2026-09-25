@@ -561,7 +561,7 @@ sample {
 )";
 
 constexpr std::uint32_t stateMagic = 0x41444e4fU;
-constexpr int stateVersion = 3;
+constexpr int stateVersion = 4;
 
 bool waitForOutput(onda::plugin::Processor &processor, const float expected,
                    const int frames = 64) {
@@ -652,7 +652,8 @@ makeState(const juce::String &path, const juce::String &browseDirectory,
           const std::span<const std::pair<juce::String, juce::String>>
               bufferBindings = {},
           const onda::plugin::ParamControlLayout layout =
-              onda::plugin::ParamControlLayout::sliders) {
+              onda::plugin::ParamControlLayout::sliders,
+          const juce::String &viewState = {}) {
   juce::MemoryBlock state;
   juce::MemoryOutputStream stream(state, false);
   stream.writeInt(static_cast<int>(stateMagic));
@@ -670,6 +671,7 @@ makeState(const juce::String &path, const juce::String &browseDirectory,
   stream.writeInt(width);
   stream.writeInt(height);
   stream.writeBool(layout == onda::plugin::ParamControlLayout::knobs);
+  stream.writeString(viewState);
   return state;
 }
 
@@ -1620,6 +1622,15 @@ bool exerciseStateRestore() {
     }
     original.setEditorSize(777, 888);
     original.setParamControlLayout(onda::plugin::ParamControlLayout::knobs);
+    juce::var viewState{new juce::DynamicObject};
+    viewState.getDynamicObject()->setProperty("octave", 2);
+    StateChangeListener viewStateChanges{original};
+    original.setViewState(viewState);
+    original.setViewState(viewState);
+    if (viewStateChanges.nonParameterChanges != 1) {
+      std::cerr << "view state did not notify the host exactly once\n";
+      return false;
+    }
     original.getStateInformation(state);
 
     const auto unchanged = [&] {
@@ -1628,6 +1639,8 @@ bool exerciseStateRestore() {
              width == 777 && height == 888 &&
              original.paramControlLayout() ==
                  onda::plugin::ParamControlLayout::knobs &&
+             static_cast<int>(juce::JSON::parse(original.viewState())
+                                  .getProperty("octave", {})) == 2 &&
              original.workerStatus().path == source.path();
     };
     const auto reject = [&](const juce::MemoryBlock &candidate) {
@@ -1662,6 +1675,9 @@ bool exerciseStateRestore() {
                   juce::String{"/tmp/audio.flac"}}};
     const auto longBufferName =
         makeState({}, {}, values, 480, 720, longNameBinding);
+    const auto invalidViewState =
+        makeState({}, {}, values, 480, 720, {},
+                  onda::plugin::ParamControlLayout::sliders, "{bad");
     const std::array emptyNameBinding{
         std::pair{juce::String{}, juce::String{"/tmp/audio.flac"}}};
     const auto emptyBufferName =
@@ -1683,8 +1699,8 @@ bool exerciseStateRestore() {
     if (!reject(wrongMagic) || !reject(wrongVersion) || !reject(truncated) ||
         !reject(longPath) || !reject(excessiveBindingCount) ||
         !reject(longBufferName) || !reject(emptyBufferName) ||
-        !reject(unterminatedPath) || !reject(invalidUtf8) ||
-        !reject(oversized)) {
+        !reject(invalidViewState) || !reject(unterminatedPath) ||
+        !reject(invalidUtf8) || !reject(oversized)) {
       std::cerr << "invalid state payload mutated processor state\n";
       return false;
     }
@@ -1732,6 +1748,8 @@ bool exerciseStateRestore() {
     const auto [width, height] = restored.editorSize();
     if (!test::withinTolerance(restored.slotValue(0) - 0.8125F, 1.0e-6F) ||
         width != 777 || height != 888 ||
+        static_cast<int>(juce::JSON::parse(restored.viewState())
+                             .getProperty("octave", {})) != 2 ||
         restored.paramControlLayout() !=
             onda::plugin::ParamControlLayout::knobs ||
         restored.workerStatus().path != source.path()) {

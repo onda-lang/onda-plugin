@@ -6,6 +6,7 @@
 the [Onda](https://onda-lang.org) audio programming language in your favorite DAW.
 
 [Pre-built binaries](https://github.com/onda-lang/onda-plugin/releases) are available for Windows, macOS and Linux.
+The pre-built macOS VST3 binaries are not signed.
 
 ## Examples
 

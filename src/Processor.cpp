@@ -19,10 +19,11 @@ namespace onda::plugin {
 namespace {
 
 constexpr std::uint32_t stateMagic = 0x41444e4fU; // ONDA, little-endian.
-constexpr int stateVersion = 3;
+constexpr int stateVersion = 4;
 constexpr int maximumPathBytes = 16 * 1024;
 constexpr int maximumBufferNameBytes = 1024;
 constexpr int maximumBufferBindings = 1024;
+constexpr int maximumViewStateBytes = 256 * 1024;
 constexpr std::size_t maximumRuntimeLogEntries = 1024U;
 constexpr std::size_t maximumRuntimeLogBytes = 256U * 1024U;
 
@@ -1173,6 +1174,27 @@ void Processor::setParamControlLayout(const ParamControlLayout layout) {
   }
 }
 
+juce::String Processor::viewState() const {
+  std::lock_guard lock(stateMutex_);
+  return viewState_;
+}
+
+void Processor::setViewState(const juce::var &state) {
+  if (state.getDynamicObject() == nullptr)
+    return;
+  const auto json = juce::JSON::toString(state, true);
+  if (json.getNumBytesAsUTF8() > maximumViewStateBytes)
+    return;
+  {
+    std::lock_guard lock(stateMutex_);
+    if (viewState_ == json)
+      return;
+    viewState_ = json;
+  }
+  updateHostDisplay(juce::AudioProcessorListener::ChangeDetails{}
+                        .withNonParameterStateChanged(true));
+}
+
 void Processor::drainRuntimeLogs() {
   const auto activityRevision = runtimeLogSink_.activityRevision();
   const auto observedGeneration =
@@ -1407,6 +1429,7 @@ void Processor::getStateInformation(juce::MemoryBlock &destination) {
   stream.writeInt(editorWidth_.load(std::memory_order_relaxed));
   stream.writeInt(editorHeight_.load(std::memory_order_relaxed));
   stream.writeBool(paramControlLayout() == ParamControlLayout::knobs);
+  stream.writeString(viewState());
 }
 
 void Processor::setStateInformation(const void *data, const int byteCount) {
@@ -1459,6 +1482,11 @@ void Processor::setStateInformation(const void *data, const int byteCount) {
     const auto height = stream.readInt();
     const auto layout = stream.readBool() ? ParamControlLayout::knobs
                                           : ParamControlLayout::sliders;
+    const auto viewState = readBoundedString(stream, maximumViewStateBytes);
+    if (!viewState ||
+        (viewState->isNotEmpty() &&
+         juce::JSON::parse(*viewState).getDynamicObject() == nullptr))
+      return;
 
     std::unique_lock preparationLock(preparationMutex_);
     deactivateRequested_.store(true, std::memory_order_release);
@@ -1477,7 +1505,9 @@ void Processor::setStateInformation(const void *data, const int byteCount) {
     {
       std::lock_guard lock(stateMutex_);
       lastBrowseDirectory_ = pathFromJuce(*browseDirectory);
+      viewState_ = *viewState;
     }
+    viewStateRestoreRevision_.fetch_add(1U, std::memory_order_release);
     preparationLock.unlock();
     notifySlotValues(slotCount);
   } catch (...) {
