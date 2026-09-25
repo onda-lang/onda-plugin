@@ -161,20 +161,6 @@ constexpr auto juceHostBridgeScript = R"JS(
 })();
 )JS";
 
-#if JUCE_MAC
-// The pinned Onda 0.8.13 run view predates the shared scope CSS fix.
-constexpr auto macScopeStyleScript = R"JS(
-document.addEventListener("DOMContentLoaded", () => {
-  // WebKit can retain the canvas layer's old scroll position when the editor reopens.
-  // The opaque scope card needs no backdrop filter. Clipping its contents keeps
-  // the canvas from covering controls while WebKit updates that layer.
-  const style = document.createElement("style");
-  style.textContent = ".scope-section { backdrop-filter: none; overflow: hidden; }";
-  document.head.appendChild(style);
-});
-)JS";
-#endif
-
 std::optional<double> number(const juce::var &value) {
   if (!value.isInt() && !value.isInt64() && !value.isDouble() &&
       !value.isBool()) {
@@ -212,9 +198,6 @@ bool hasBuffer(const WorkerStatus &status, const std::string_view name) {
 juce::WebBrowserComponent::Options browserOptions() {
   juce::WebBrowserComponent::Options options;
   options = options.withUserScript(juceHostBridgeScript);
-#if JUCE_MAC
-  options = options.withUserScript(macScopeStyleScript);
-#endif
 #if JUCE_WINDOWS
   const auto dataFolder =
       juce::File::getSpecialLocation(juce::File::userApplicationDataDirectory)
