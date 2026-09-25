@@ -1,13 +1,64 @@
 diff --git a/run.html b/run.html
 --- a/run.html
 +++ b/run.html
-@@ -196,4 +196,3 @@
+@@ -1,5 +1,5 @@
+ <!DOCTYPE html>
+-<html lang="en" data-run-view-pending>
++<html lang="en">
+   <head>
+     <meta charset="UTF-8" />
+     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+@@ -139,7 +139,6 @@
+         overflow-x: hidden;
+         overflow-y: auto;
+       }
+-      html[data-run-view-pending] .shell { visibility: hidden; }
+-
++
+       .file-picker {
+         display: grid;
+@@ -195,7 +194,6 @@
+         border-radius: var(--radius-section);
          padding: 14px;
          box-shadow: var(--shadow);
 -        backdrop-filter: blur(8px);
        }
-@@ -824,4 +823,3 @@
+-
++
+       .hero {
+@@ -823,7 +821,6 @@
+         border-radius: 0;
          background: var(--panel);
          box-shadow: 0 -12px 36px rgba(3, 10, 18, 0.24);
 -        backdrop-filter: blur(8px);
        }
+-
++
+       .midi-toolbar {
+@@ -1822,7 +1819,6 @@
+           if (pendingEventViewState) return;
+           restoringViewState = false;
+           lastViewStateJson = JSON.stringify(captureViewState());
+-          document.documentElement.removeAttribute("data-run-view-pending");
+           hostBridge.postMessage({ type: "runViewReady", readyId });
+         });
+       }
+@@ -1847,7 +1843,6 @@
+           };
+         }
+         restoringViewState = true;
+-        document.documentElement.setAttribute("data-run-view-pending", "");
+         const generation = ++viewRestoreGeneration;
+         let pendingScroll = false;
+         try {
+@@ -3189,9 +3184,6 @@
+         } else if (hadViewState && incoming.resetEventArguments === true) {
+           publishViewState();
+         }
+-        if (!restoringViewState) {
+-          document.documentElement.removeAttribute("data-run-view-pending");
+-        }
+       });
+-
++
+       // ---------------------------------------------------------------------------
