@@ -57,8 +57,7 @@ project(onda-plugin VERSION "${ONDA_PLUGIN_VERSION}" LANGUAGES C CXX)
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/juce-version"
     "${CMAKE_CURRENT_SOURCE_DIR}/onda-version"
-    "${CMAKE_CURRENT_SOURCE_DIR}/plugin-version"
-    "${CMAKE_CURRENT_SOURCE_DIR}/resources/onda-0.8.13-run-view.patch")
+    "${CMAKE_CURRENT_SOURCE_DIR}/plugin-version")
 
 if(APPLE AND CMAKE_OSX_DEPLOYMENT_TARGET VERSION_LESS "11.0")
     message(FATAL_ERROR "Apple Silicon requires macOS 11.0 or later")
@@ -420,31 +419,11 @@ copy_onda_release_license(
     "${ONDA_JUCE_SOURCE_DIR}/modules/juce_graphics/unicode/sheenbidi/LICENSE"
     "SheenBidi-LICENSE.txt")
 
-set(ONDA_EMBEDDED_RUN_VIEW_DIR "${CMAKE_CURRENT_BINARY_DIR}/embedded-run-view")
-file(MAKE_DIRECTORY "${ONDA_EMBEDDED_RUN_VIEW_DIR}")
-configure_file("${ONDA_RELEASE_SOURCE_DIR}/ui/run/run.html"
-    "${ONDA_EMBEDDED_RUN_VIEW_DIR}/run.html" COPYONLY)
-execute_process(
-    COMMAND git apply "${CMAKE_CURRENT_SOURCE_DIR}/resources/onda-0.8.13-run-view.patch"
-    WORKING_DIRECTORY "${ONDA_EMBEDDED_RUN_VIEW_DIR}"
-    RESULT_VARIABLE ONDA_RUN_VIEW_PATCH_RESULT
-    ERROR_VARIABLE ONDA_RUN_VIEW_PATCH_ERROR)
-if(NOT ONDA_RUN_VIEW_PATCH_RESULT EQUAL 0)
-    execute_process(
-        COMMAND git apply --reverse --check
-            "${CMAKE_CURRENT_SOURCE_DIR}/resources/onda-0.8.13-run-view.patch"
-        WORKING_DIRECTORY "${ONDA_EMBEDDED_RUN_VIEW_DIR}"
-        RESULT_VARIABLE ONDA_RUN_VIEW_ALREADY_PATCHED)
-    if(NOT ONDA_RUN_VIEW_ALREADY_PATCHED EQUAL 0)
-        message(FATAL_ERROR "Could not patch Onda run view: ${ONDA_RUN_VIEW_PATCH_ERROR}")
-    endif()
-endif()
-
 juce_add_binary_data(onda_run_resources
     NAMESPACE OndaRunResources
     HEADER_NAME OndaRunResources.h
     SOURCES
-        "${ONDA_EMBEDDED_RUN_VIEW_DIR}/run.html"
+        "${ONDA_RELEASE_SOURCE_DIR}/ui/run/run.html"
         "${ONDA_RELEASE_SOURCE_DIR}/packages/onda_processor_abi/src/param-control.js"
 )
 

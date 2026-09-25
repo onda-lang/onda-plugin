@@ -141,11 +141,8 @@ CMake reads `plugin-version` for the embedded VST3 version and package release
 identity. `-DONDA_PLUGIN_VERSION=x.y.z` overrides it explicitly; otherwise the
 `ONDA_PLUGIN_VERSION` environment variable takes precedence over the file.
 
-Independently, `onda-version` selects the Onda SDK and the Onda source
-revision used for embedded run-view resources. The 0.8.13 run view is patched
-at build time with `resources/onda-0.8.13-run-view.patch`. The patch keeps the
-scrollable view paintable while restoring its scroll position; the native loading
-overlay remains visible until restoration finishes. `-DONDA_VERSION=x.y.z`
+Independently, `onda-version` selects the Onda SDK and the exact Onda source
+revision used for embedded run-view resources. `-DONDA_VERSION=x.y.z`
 overrides that pin; otherwise the `ONDA_VERSION` environment variable takes
 precedence over the file. This separation allows plug-in-only fixes to ship
 without changing the Onda SDK dependency.

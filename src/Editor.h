@@ -29,6 +29,7 @@ private:
   void publishState(bool force);
   void publishMidiActivity(bool force = false);
   void publishScope(bool force = false);
+  void releaseBrowserInteraction();
 
   Processor &processor_;
   std::unique_ptr<Browser> browser_;
@@ -48,6 +49,7 @@ private:
   bool hasPublishedScope_{};
   bool scopeCaptureActive_{};
   bool browserReady_{};
+  bool browserLoadStarted_{};
   std::array<bool, 32U> activeGestures_{};
   std::string actionError_;
 
