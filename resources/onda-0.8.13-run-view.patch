@@ -1,30 +1,13 @@
 diff --git a/run.html b/run.html
 --- a/run.html
 +++ b/run.html
-@@ -1816,13 +1816,14 @@
-         }, 100);
+@@ -196,4 +196,3 @@
+         padding: 14px;
+         box-shadow: var(--shadow);
+-        backdrop-filter: blur(8px);
        }
- 
--      function finishViewStateRestore(generation, readyId) {
-+      function finishViewStateRestore(generation, readyId, scrollY) {
-         requestAnimationFrame(() => {
-           if (generation !== viewRestoreGeneration) return;
-           if (pendingEventViewState) return;
-+          document.documentElement.removeAttribute("data-run-view-pending");
-+          if (scrollY !== undefined) shellNode.scrollTop = scrollY;
-           restoringViewState = false;
-           lastViewStateJson = JSON.stringify(captureViewState());
--          document.documentElement.removeAttribute("data-run-view-pending");
-           hostBridge.postMessage({ type: "runViewReady", readyId });
-         });
+@@ -824,4 +823,3 @@
+         background: var(--panel);
+         box-shadow: 0 -12px 36px rgba(3, 10, 18, 0.24);
+-        backdrop-filter: blur(8px);
        }
-@@ -1939,8 +1940,7 @@
-             pendingScroll = true;
-             requestAnimationFrame(() => requestAnimationFrame(() => {
-               if (generation !== viewRestoreGeneration) return;
--              shellNode.scrollTop = snapshot.scrollY;
--              finishViewStateRestore(generation, readyId);
-+              finishViewStateRestore(generation, readyId, snapshot.scrollY);
-             }));
-             return;
-           }
