@@ -736,6 +736,8 @@ bool exerciseRunViewAdapter() {
       html.find("delegateOverflowCount") == std::string_view::npos ||
       html.find("id=\"midi-keyboard\"") == std::string_view::npos ||
       html.find("midiKeyboardInteractive") == std::string_view::npos ||
+      html.find("const scrollNode = document.scrollingElement") ==
+          std::string_view::npos ||
       html.find("setMonitoredMidiNotes(message.activeNotes)") ==
           std::string_view::npos) {
     std::cerr << "embedded run view is missing required host capabilities\n";

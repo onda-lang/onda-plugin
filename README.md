@@ -142,9 +142,9 @@ identity. `-DONDA_PLUGIN_VERSION=x.y.z` overrides it explicitly; otherwise the
 `ONDA_PLUGIN_VERSION` environment variable takes precedence over the file.
 
 Independently, `onda-version` selects the Onda SDK and the Onda source revision
-used for embedded run-view resources. The pinned 0.8.13 view is patched at build
-time to restore saved positions through the browser's main scroller. When a MIDI
-keyboard is present, it stays at the bottom of the viewport.
+used for embedded run-view resources. The pinned 0.8.13 view is adapted by
+`cmake/EmbedRunView.cmake` so saved positions use the document scroller. When a
+MIDI keyboard is present, it stays at the bottom of the viewport.
 `-DONDA_VERSION=x.y.z`
 overrides that pin; otherwise the `ONDA_VERSION` environment variable takes
 precedence over the file. This separation allows plug-in-only fixes to ship
