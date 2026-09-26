@@ -57,8 +57,7 @@ project(onda-plugin VERSION "${ONDA_PLUGIN_VERSION}" LANGUAGES C CXX)
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/juce-version"
     "${CMAKE_CURRENT_SOURCE_DIR}/onda-version"
-    "${CMAKE_CURRENT_SOURCE_DIR}/plugin-version"
-    "${CMAKE_CURRENT_SOURCE_DIR}/cmake/EmbedRunView.cmake")
+    "${CMAKE_CURRENT_SOURCE_DIR}/plugin-version")
 
 if(APPLE AND CMAKE_OSX_DEPLOYMENT_TARGET VERSION_LESS "11.0")
     message(FATAL_ERROR "Apple Silicon requires macOS 11.0 or later")
@@ -420,16 +419,11 @@ copy_onda_release_license(
     "${ONDA_JUCE_SOURCE_DIR}/modules/juce_graphics/unicode/sheenbidi/LICENSE"
     "SheenBidi-LICENSE.txt")
 
-# Transform the pinned view with CMake: git apply skips files under ignored build/.
-set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
-    "${ONDA_RELEASE_SOURCE_DIR}/ui/run/run.html")
-include(cmake/EmbedRunView.cmake)
-
 juce_add_binary_data(onda_run_resources
     NAMESPACE OndaRunResources
     HEADER_NAME OndaRunResources.h
     SOURCES
-        "${ONDA_EMBEDDED_RUN_VIEW}"
+        "${ONDA_RELEASE_SOURCE_DIR}/ui/run/run.html"
         "${ONDA_RELEASE_SOURCE_DIR}/packages/onda_processor_abi/src/param-control.js"
 )
 

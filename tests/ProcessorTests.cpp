@@ -736,11 +736,15 @@ bool exerciseRunViewAdapter() {
       html.find("delegateOverflowCount") == std::string_view::npos ||
       html.find("id=\"midi-keyboard\"") == std::string_view::npos ||
       html.find("midiKeyboardInteractive") == std::string_view::npos ||
-      html.find("const scrollNode = document.scrollingElement") ==
-          std::string_view::npos ||
       html.find("setMonitoredMidiNotes(message.activeNotes)") ==
           std::string_view::npos) {
     std::cerr << "embedded run view is missing required host capabilities\n";
+    return false;
+  }
+  if (html.find("const scrollNode = document.scrollingElement") ==
+      std::string_view::npos) {
+    std::cerr << "pinned Onda run view lacks document scrolling; update "
+                 "onda-version to a release with the fix\n";
     return false;
   }
 
