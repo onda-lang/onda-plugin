@@ -1,11 +1,12 @@
 # Plugin examples
 
-These patches are designed for the VST3 host integration rather than Onda's
-standalone example runner:
+These patches are copied from Onda's `examples/plugins` collection and are
+ready to load in the VST3 plugins:
 
-- `instruments/poly_saw.onda` is an eight-voice saw, filter, and saturation
-  instrument. Load it in `OndaSynth`; MIDI note on/off and per-channel pitch
-  bend are delivered through the plug-in's canonical events.
+- `instruments/poly_saw.onda` is an eight-voice saw instrument with independent
+  amplitude and filter ADSR envelopes per voice, stereo saturation and reverb.
+  Load it in `OndaSynth`; MIDI note on/off and per-channel pitch bend are
+  delivered through the plug-in's canonical events.
 - `instruments/fm_bells.onda` is an eight-voice velocity-sensitive FM bell bank
   with ADSR articulation, an inharmonic partial, a filtered strike transient,
   and cross-fed stereo ambience.

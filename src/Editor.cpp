@@ -24,8 +24,15 @@ const auto editorMutedText = juce::Colour::fromRGB(146, 168, 191);
 
 constexpr auto juceHostBridgeScript = R"JS(
 (() => {
-  const parameterDomains = new Map();
+  let parameterDomains = new Map();
+  let parameterPath = "";
+  const activeParameterGestures = new Set();
   let eventDefinitions = [];
+
+  function parameterControlKey(parameter) {
+    const { value, normalizedValue, ...control } = parameter;
+    return JSON.stringify(control);
+  }
 
   function createParameterDomain(parameter) {
     return globalThis.__ONDA_PARAM_CONTROL_V2__.createParamDomain({
@@ -105,10 +112,11 @@ constexpr auto juceHostBridgeScript = R"JS(
         return;
       }
       if (message?.type === "setParam") {
-        const domain = parameterDomains.get(message.name);
-        if (domain) {
-          message.value = domain.plainToNormalized(message.value);
-        }
+        const binding = parameterDomains.get(message.name);
+        if (!binding) return;
+        message.value = binding.domain.plainToNormalized(message.value);
+        if (message.commit) activeParameterGestures.delete(message.name);
+        else activeParameterGestures.add(message.name);
       }
       window.__JUCE__.backend.emitEvent("ondaCommand", message);
     },
@@ -130,19 +138,35 @@ constexpr auto juceHostBridgeScript = R"JS(
       eventDefinitions = message.state.events;
     }
     if (message?.type === "state" && Array.isArray(message.state?.params)) {
-      parameterDomains.clear();
+      const nextDomains = new Map();
+      const nextPath = message.state.path ?? parameterPath;
       for (const parameter of message.state.params) {
         if (parameter.hostValueDomain !== "normalized") {
           continue;
         }
         try {
           const domain = createParameterDomain(parameter);
-          parameterDomains.set(parameter.name, domain);
+          nextDomains.set(parameter.name, {
+            domain, controlKey: parameterControlKey(parameter),
+          });
           parameter.value = domain.normalizedToPlain(parameter.normalizedValue);
         } catch {
           // The shared view will surface malformed parameter metadata.
         }
       }
+      // The shared view discards obsolete drags without committing their value.
+      // Release the DAW gesture separately before the controls are replaced.
+      for (const name of activeParameterGestures) {
+        if (nextPath !== parameterPath || !nextDomains.has(name)
+            || nextDomains.get(name).controlKey !== parameterDomains.get(name)?.controlKey) {
+          activeParameterGestures.delete(name);
+          window.__JUCE__.backend.emitEvent("ondaCommand", {
+            type: "endParamGesture", name,
+          });
+        }
+      }
+      parameterDomains = nextDomains;
+      parameterPath = nextPath;
     }
     if (message?.type === "state") {
       const layout = message.state?.paramLayout;
@@ -288,11 +312,16 @@ Editor::~Editor() {
   stopTimer();
   processor_.releaseKeyboardNotes();
   processor_.setScopeCaptureEnabled(false);
-  for (std::size_t index = 0; index < activeGestures_.size(); ++index) {
-    if (activeGestures_[index])
-      processor_.endSlotGesture(index);
-  }
+  for (std::size_t index = 0; index < activeGestures_.size(); ++index)
+    endParameterGesture(index);
   processor_.setEditorSize(getWidth(), getHeight());
+}
+
+void Editor::endParameterGesture(const std::size_t index) {
+  if (!activeGestures_[index])
+    return;
+  activeGestures_[index] = false;
+  processor_.endSlotGesture(index);
 }
 
 void Editor::paint(juce::Graphics &graphics) {
@@ -351,9 +380,11 @@ void Editor::publishState(const bool force) {
     currentSlots[index] = processor_.slotValue(index);
   const auto currentKnobLayout =
       processor_.paramControlLayout() == ParamControlLayout::knobs;
+  const auto currentSmoothingSeconds = processor_.paramSmoothingSeconds();
   if (!force && hasPublished_ && revision == publishedRevision_ &&
       logRevision == publishedLogRevision_ && currentSlots == publishedSlots_ &&
       currentKnobLayout == publishedKnobLayout_ &&
+      std::is_eq(currentSmoothingSeconds <=> publishedSmoothingSeconds_) &&
       viewStateRestoreRevision == publishedViewStateRestoreRevision_) {
     return;
   }
@@ -371,6 +402,7 @@ void Editor::publishState(const bool force) {
   publishedLogRevision_ = logRevision;
   publishedSlots_ = currentSlots;
   publishedKnobLayout_ = currentKnobLayout;
+  publishedSmoothingSeconds_ = currentSmoothingSeconds;
   publishedViewStateRestoreRevision_ = viewStateRestoreRevision;
   hasPublished_ = true;
   auto message =
@@ -412,6 +444,8 @@ void Editor::handleCommand(const juce::var &command) {
   const auto type = input->getProperty("type").toString();
 
   if (type == "webviewReady") {
+    for (std::size_t index = 0; index < activeGestures_.size(); ++index)
+      endParameterGesture(index);
     browserReady_ = true;
     hasPublished_ = false;
     hasPublishedMidi_ = false;
@@ -487,6 +521,14 @@ void Editor::handleCommand(const juce::var &command) {
     processor_.unload();
   } else if (type == "resetParams") {
     processor_.resetParametersToDefaults();
+  } else if (type == "setParamSmoothing") {
+    const auto milliseconds = number(input->getProperty("milliseconds"));
+    actionError_ = milliseconds && processor_.setParamSmoothingSeconds(
+                                       *milliseconds / 1000.0)
+                       ? std::string{}
+                       : "Smoothing duration must be finite, non-negative, and "
+                         "fit the host sample counter";
+    publishState(true);
   } else if (type == "reset") {
     processor_.requestUserReset();
   } else if (type == "triggerEvent") {
@@ -526,6 +568,10 @@ void Editor::handleCommand(const juce::var &command) {
     const auto name = input->getProperty("name").toString().toStdString();
     if (hasBuffer(processor_.workerStatus(), name))
       processor_.clearBuffer(name);
+  } else if (type == "endParamGesture") {
+    if (const auto index =
+            slotIndex(input->getProperty("name").toString().toStdString()))
+      endParameterGesture(*index);
   } else if (type == "setParam") {
     const auto index =
         slotIndex(input->getProperty("name").toString().toStdString());
@@ -537,10 +583,8 @@ void Editor::handleCommand(const juce::var &command) {
         activeGestures_[*index] = true;
       }
       processor_.setSlotValue(*index, static_cast<float>(*value));
-      if (commit && activeGestures_[*index]) {
-        processor_.endSlotGesture(*index);
-        activeGestures_[*index] = false;
-      }
+      if (commit)
+        endParameterGesture(*index);
     }
   }
 }

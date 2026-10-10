@@ -16,9 +16,15 @@ Use `build/Release/onda_processor_tests.exe` for a Windows multi-config build.
 | --- | --- |
 | `onda_example_tests` | Shipped examples compile and render finite, meaningful output. |
 | `onda_plugin_tests` | SDK ownership, DSP and MIDI behavior, buffer decoding, portable checkpoints, project export, worker replacement, file watching, and compiler serialization. |
-| `onda_processor_tests` | Host preparation, state persistence, defaults and automation, notifications, failure recovery, realtime callbacks, logs, scope/event adapters, editor lifecycle, and concurrent instances. |
+| `onda_processor_tests` | Host preparation, state persistence, defaults and automation, block-rate parameter smoothing, notifications, failure recovery, realtime callbacks, logs, scope/event adapters, editor lifecycle, and concurrent instances. |
 | `onda_vst3_smoke` | Built bundles expose the expected metadata and parameters, instantiate independently, and render through JUCE's VST3 host. Bundle lookup also exercises the Windows layout on other platforms. |
+| `onda_editor_bridge_tests` | The injected bridge ends cancelled parameter gestures without writing stale values, while retaining gestures across automation updates. Registered when Node.js is available. |
 | VST3 validators | Steinberg's interface/protocol checks for both products. These complement the behavior checked by the smoke host. |
+
+Run bridge tests directly with `node tests/EditorBridgeTests.mjs`. The
+`EditorGestureCancellation` processor case checks the native command against
+JUCE's actual value and gesture notifications, including cancellation after a
+newer host automation value.
 
 ## Scheduling
 

@@ -1,4 +1,6 @@
 #include "JucePath.h"
+#include "ParameterRamp.h"
+#include "StateFormat.h"
 #include "TemporaryDirectory.h"
 #include "TestNumeric.h"
 
@@ -52,11 +54,10 @@ struct ProductExpectation {
                  module.replaceWithText("test module"),
              "Could not create the Windows bundle lookup fixture"))
     return false;
-  return check(bundleForModule(module) == bundle &&
-                   bundleForModule(bundle) == bundle &&
-                   bundleForModule(root.getChildFile("missing.bin")) ==
-                       juce::File{},
-               "VST3 bundle lookup did not resolve the bundle directory");
+  return check(
+      bundleForModule(module) == bundle && bundleForModule(bundle) == bundle &&
+          bundleForModule(root.getChildFile("missing.bin")) == juce::File{},
+      "VST3 bundle lookup did not resolve the bundle directory");
 }
 
 [[nodiscard]] bool checkMetadata(const juce::File &bundle,
@@ -99,8 +100,8 @@ struct ProductExpectation {
   juce::MemoryBlock componentState;
   {
     juce::MemoryOutputStream stream(componentState, false);
-    stream.writeInt(0x41444e4f);
-    stream.writeInt(4);
+    stream.writeInt(static_cast<int>(onda::plugin::stateMagic));
+    stream.writeInt(onda::plugin::stateVersion);
     stream.writeString(source.getFullPathName());
     stream.writeString({});
     stream.writeInt(0);
@@ -111,6 +112,7 @@ struct ProductExpectation {
     stream.writeInt(720);
     stream.writeBool(false);
     stream.writeString({});
+    stream.writeDouble(onda::plugin::defaultParamSmoothingSeconds);
   }
   juce::XmlElement state("VST3PluginState");
   state.createNewChildElement("IComponent")

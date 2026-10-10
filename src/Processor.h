@@ -146,6 +146,8 @@ public:
   void setEditorSize(int width, int height);
   [[nodiscard]] ParamControlLayout paramControlLayout() const noexcept;
   void setParamControlLayout(ParamControlLayout layout);
+  [[nodiscard]] double paramSmoothingSeconds() const noexcept;
+  [[nodiscard]] bool setParamSmoothingSeconds(double seconds);
   [[nodiscard]] juce::String viewState() const;
   void setViewState(const juce::var &state);
   [[nodiscard]] std::uint64_t viewStateRestoreRevision() const noexcept {
@@ -190,6 +192,7 @@ private:
   SpscSlot<PreparedEngine *> retirements_;
   std::atomic<bool> deactivateRequested_{};
   std::atomic<bool> resetRequested_{};
+  std::atomic<bool> parameterSettleRequested_{};
   std::atomic<bool> runtimeFaulted_{};
   std::atomic<bool> runtimeRecoveryRequested_{};
   std::atomic<double> expectedSampleRate_{};
@@ -237,6 +240,7 @@ private:
   std::atomic<int> editorHeight_{720};
   std::atomic<ParamControlLayout> paramControlLayout_{
       ParamControlLayout::sliders};
+  std::atomic<double> paramSmoothingSeconds_{defaultParamSmoothingSeconds};
   std::atomic<std::uint64_t> viewStateRestoreRevision_{};
   std::mutex preparationMutex_;
   mutable std::mutex stateMutex_;

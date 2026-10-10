@@ -605,7 +605,9 @@ PreparedEngine::PreparedEngine(
       outputChannels_(outputChannels), inputSlab_(std::move(inputSlab)),
       outputSlab_(std::move(outputSlab)),
       bufferStorage_(std::move(bufferStorage)), instance_(std::move(instance)),
-      bufferMappings_(std::move(bufferMappings)) {}
+      bufferMappings_(std::move(bufferMappings)) {
+  smoothedParameterTypes_.fill(-1);
+}
 
 bool PreparedEngine::prepareRuntimeOutput(Diagnostic &diagnostic) {
   const auto delegateCount = onda_delegate_count(program_.get());
@@ -1144,8 +1146,12 @@ PreparedEngine::build(CompileResult compiled, const Product product,
     auto mapping = parameterMapping(engine->program_.get(), index);
     if (!mapping)
       continue;
-    engine->parameterMappings_[engine->parameterMappingCount_++] =
-        std::move(*mapping);
+    const auto slot = engine->parameterMappingCount_++;
+    const auto primitive = onda_param_elem_type(engine->program_.get(), index);
+    if (!mapping->stepCount &&
+        (primitive == ONDA_PRIMITIVE_F32 || primitive == ONDA_PRIMITIVE_F64))
+      engine->smoothedParameterTypes_[slot] = primitive;
+    engine->parameterMappings_[slot] = std::move(*mapping);
   }
 
   if (initialParameters) {
@@ -1211,7 +1217,14 @@ void PreparedEngine::applyParameter(const std::size_t slot,
   static_cast<void>(onda_set_param_normalized(
       instance_.get(), parameterMappings_[slot].parameterIndex,
       static_cast<double>(normalized)));
-  appliedParameters_[slot] = normalized;
+  parameterTargets_[slot] = normalized;
+  if (smoothedParameterTypes_[slot] >= 0) {
+    auto plain = onda_param_normalized_to_plain(
+        program_.get(), parameterMappings_[slot].parameterIndex, normalized);
+    if (smoothedParameterTypes_[slot] == ONDA_PRIMITIVE_F32)
+      plain = static_cast<double>(static_cast<float>(plain));
+    parameterRamps_[slot].reset(plain);
+  }
 }
 
 float PreparedEngine::parameterValue(
@@ -1234,16 +1247,19 @@ void PreparedEngine::applyParameters(
 }
 
 bool PreparedEngine::beginHostCallback(
-    const std::array<std::atomic<float> *, slotCount> &slots) noexcept {
+    const std::array<std::atomic<float> *, slotCount> &slots,
+    const int frames) noexcept {
+  hostCallbackFrames_ = frames < 0 ? blockSize_ : frames;
   if (!blockStarted_)
     return true;
 
   const auto useDefaults = parameterSeed_ && !parameterSeed_->applied.load(
                                                  std::memory_order_acquire);
-  bool changed = false;
+  bool changed = parameterBoundaryRequested_;
   for (std::size_t index = 0; index < parameterMappingCount_; ++index)
-    changed |= parameterValue(index, slots, useDefaults) !=
-               appliedParameters_[index];
+    changed |=
+        parameterValue(index, slots, useDefaults) != parameterTargets_[index] ||
+        parameterRamps_[index].active();
   if (!changed)
     return true;
 
@@ -1252,11 +1268,11 @@ bool PreparedEngine::beginHostCallback(
     return true;
   }
 
-  // Parameters in sample work are captured by BEGIN_BLOCK. Complete the
-  // current short block so this callback can begin with the new values.
-  const auto status = onda_process_unchecked_segment(
-      instance_.get(), logicalFrame_, 0, ONDA_PROCESS_END_BLOCK,
-      &executionOutput_);
+  // Parameters in sample work are captured by BEGIN_BLOCK. Finish a short
+  // block before changing its values or advancing an active ramp.
+  const auto status =
+      onda_process_unchecked_segment(instance_.get(), logicalFrame_, 0,
+                                     ONDA_PROCESS_END_BLOCK, &executionOutput_);
   collectExecutionOutput();
   if (status != 0)
     return false;
@@ -1265,11 +1281,75 @@ bool PreparedEngine::beginHostCallback(
   return true;
 }
 
+bool PreparedEngine::setParameterSmoothingSeconds(
+    const double seconds) noexcept {
+  const auto count = parameterSmoothingSamples(seconds, sampleRate_);
+  if (!count)
+    return false;
+  const auto samples =
+      *count > static_cast<std::uint64_t>(blockSize_) ? *count : 0U;
+  if (samples != smoothingSamples_) {
+    smoothingSamples_ = samples;
+    parameterBoundaryRequested_ = true;
+    for (auto &ramp : parameterRamps_)
+      ramp.setDuration(samples);
+  }
+  return true;
+}
+
+void PreparedEngine::settleParameters() noexcept {
+  parametersStarted_ = false;
+  parameterBoundaryRequested_ = true;
+}
+
+void PreparedEngine::updateParameters(
+    const std::array<std::atomic<float> *, slotCount> &slots,
+    const int frames) noexcept {
+  const auto useDefaults = parameterSeed_ && !parameterSeed_->applied.load(
+                                                 std::memory_order_acquire);
+  for (std::size_t slot = 0; slot < parameterMappingCount_; ++slot) {
+    const auto normalized = parameterValue(slot, slots, useDefaults);
+    const auto type = smoothedParameterTypes_[slot];
+    if (!parametersStarted_ || smoothingSamples_ == 0U || type < 0) {
+      applyParameter(slot, normalized);
+      continue;
+    }
+    const auto index = parameterMappings_[slot].parameterIndex;
+    auto &ramp = parameterRamps_[slot];
+    if (normalized != parameterTargets_[slot]) {
+      auto target =
+          onda_param_normalized_to_plain(program_.get(), index, normalized);
+      if (type == ONDA_PRIMITIVE_F32)
+        target = static_cast<double>(static_cast<float>(target));
+      ramp.setTarget(target);
+      parameterTargets_[slot] = normalized;
+    }
+    const auto value = ramp.advance(static_cast<std::uint64_t>(frames),
+                                    type == ONDA_PRIMITIVE_F32);
+    if (type == ONDA_PRIMITIVE_F32) {
+      const auto scalar = static_cast<float>(value);
+      static_cast<void>(onda_set_param_by_index(instance_.get(), index, &scalar,
+                                                sizeof(scalar)));
+    } else {
+      static_cast<void>(onda_set_param_by_index(instance_.get(), index, &value,
+                                                sizeof(value)));
+    }
+  }
+  if (frames > 0)
+    parametersStarted_ = true;
+  parameterBoundaryRequested_ = false;
+}
+
 bool PreparedEngine::ensureBlockStarted(
     const std::array<std::atomic<float> *, slotCount> &slots,
     const HostContext &hostContext, const int hostCallbackOffset) noexcept {
   if (logicalFrame_ == 0 && !blockStarted_) {
-    applyParameters(slots);
+    const auto frames =
+        hostCallbackFrames_ >= 0
+            ? std::clamp(hostCallbackFrames_ - hostCallbackOffset, 0,
+                         blockSize_)
+            : blockSize_;
+    updateParameters(slots, frames);
     if (!dispatchHostContext(hostContext, hostCallbackOffset))
       return false;
     blockStarted_ = true;
@@ -1540,6 +1620,7 @@ EventTriggerResult PreparedEngine::triggerEvent(
 bool PreparedEngine::reset(
     const std::array<std::atomic<float> *, slotCount> &slots) noexcept {
   applyParameters(slots);
+  parametersStarted_ = false;
   logicalFrame_ = 0;
   blockStarted_ = false;
   const auto status = onda_init_unchecked(

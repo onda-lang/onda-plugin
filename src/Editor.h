@@ -22,10 +22,12 @@ public:
   void resized() override;
 
 private:
+  friend struct EditorTestAccess;
   class Browser;
 
   void timerCallback() override;
   void handleCommand(const juce::var &command);
+  void endParameterGesture(std::size_t index);
   void publishState(bool force);
   void publishMidiActivity(bool force = false);
   void publishScope(bool force = false);
@@ -43,6 +45,7 @@ private:
   ScopeRevision publishedScopeRevision_{};
   std::array<float, 32U> publishedSlots_{};
   bool publishedKnobLayout_{};
+  double publishedSmoothingSeconds_{};
   bool hasPublished_{};
   bool hasPublishedMidi_{};
   bool hasPublishedScope_{};

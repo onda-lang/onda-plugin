@@ -2,10 +2,12 @@
 #include "TestNumeric.h"
 
 #include "AudioFile.h"
+#include "EditorTestSupport.h"
 #include "JucePath.h"
 #include "Processor.h"
 #include "ProcessorTestSupport.h"
 #include "RunViewHost.h"
+#include "StateFormat.h"
 #include "TestAudioFile.h"
 
 #include <juce_gui_basics/juce_gui_basics.h>
@@ -30,6 +32,7 @@
 #include <string_view>
 #include <thread>
 #include <utility>
+#include <vector>
 
 #if defined(__linux__)
 #include <pthread.h>
@@ -416,7 +419,7 @@ init {
   held = 0.25
 }
 event note_on(id: i32, channel: i32, key: i32, velocity: f32) {
-  held = f32(i32(1) / i32(0))
+  held = f32(i32(1) / (key - i32(60)))
 }
 event note_off(id: i32, channel: i32, key: i32, velocity: f32) {}
 sample {
@@ -560,8 +563,8 @@ sample {
 }
 )";
 
-constexpr std::uint32_t stateMagic = 0x41444e4fU;
-constexpr int stateVersion = 4;
+using onda::plugin::stateMagic;
+using onda::plugin::stateVersion;
 
 bool waitForOutput(onda::plugin::Processor &processor, const float expected,
                    const int frames = 64) {
@@ -672,6 +675,7 @@ makeState(const juce::String &path, const juce::String &browseDirectory,
   stream.writeInt(height);
   stream.writeBool(layout == onda::plugin::ParamControlLayout::knobs);
   stream.writeString(viewState);
+  stream.writeDouble(onda::plugin::defaultParamSmoothingSeconds);
   return state;
 }
 
@@ -717,10 +721,13 @@ bool exerciseRunViewAdapter() {
   const auto root = onda::plugin::runViewResource("/");
   const auto index = onda::plugin::runViewResource("/index.html?cache=1");
   const auto script = onda::plugin::runViewResource("/param-control.js?v=2");
-  if (!root || !index || !script || root->data.size() <= 3U ||
+  const auto numberScript =
+      onda::plugin::runViewResource("/number-input.js?v=2");
+  if (!root || !index || !script || !numberScript || root->data.size() <= 3U ||
       index->data != root->data ||
       root->mimeType != "text/html; charset=utf-8" ||
       script->mimeType != "text/javascript; charset=utf-8" ||
+      numberScript->mimeType != "text/javascript; charset=utf-8" ||
       root->data[0] != std::byte{0xef} || root->data[1] != std::byte{0xbb} ||
       root->data[2] != std::byte{0xbf} ||
       onda::plugin::runViewResource("/missing.txt")) {
@@ -741,10 +748,10 @@ bool exerciseRunViewAdapter() {
     std::cerr << "embedded run view is missing required host capabilities\n";
     return false;
   }
-  if (html.find("const scrollNode = document.scrollingElement") ==
-      std::string_view::npos) {
-    std::cerr << "pinned Onda run view lacks document scrolling; update "
-                 "onda-version to a release with the fix\n";
+  if (html.find("scrollY: scrollNode.scrollTop") == std::string_view::npos ||
+      html.find("scrollNode.scrollTop = snapshot.scrollY") ==
+          std::string_view::npos) {
+    std::cerr << "embedded run view lacks scroll-position persistence\n";
     return false;
   }
 
@@ -768,6 +775,13 @@ bool exerciseRunViewAdapter() {
       static_cast<bool>(state->getProperty("supportsDeviceSelection")) ||
       static_cast<bool>(state->getProperty("supportsRunSettings")) ||
       !static_cast<bool>(state->getProperty("supportsReset")) ||
+      !static_cast<bool>(state->getProperty("supportsParamSmoothing")) ||
+      state->getProperty("ondaVersion").toString() != onda_version() ||
+      state->getProperty("ondaVersion").toString().isEmpty() ||
+      !std::is_eq(static_cast<double>(
+                      state->getProperty("paramSmoothingMs")) <=> 30.0) ||
+      !std::is_eq(static_cast<double>(state->getProperty(
+                      "paramSmoothingDefaultMs")) <=> 30.0) ||
       !static_cast<bool>(state->getProperty("supportsScope")) ||
       static_cast<bool>(state->getProperty("midiKeyboardInteractive")) ||
       state->getProperty("paramLayout").toString() != "sliders" ||
@@ -1825,6 +1839,61 @@ bool exerciseStateRestore() {
   return true;
 }
 
+bool exerciseEditorGestureCancellation() {
+  using namespace onda::plugin;
+  Processor processor(Product::effect);
+  auto *const parameter = processor.getParameters()[0];
+  struct Listener final : juce::AudioProcessorParameter::Listener {
+    explicit Listener(juce::AudioProcessorParameter &owner) : parameter(owner) {
+      parameter.addListener(this);
+    }
+    ~Listener() override { parameter.removeListener(this); }
+    void parameterValueChanged(int, float) override { ++valueChanges; }
+    void parameterGestureChanged(int, const bool starting) override {
+      gestures.push_back(starting);
+    }
+    int valueChanges{};
+    std::vector<bool> gestures;
+    juce::AudioProcessorParameter &parameter;
+  } listener{*parameter};
+  auto editor = std::make_unique<Editor>(processor);
+  const auto send = [&](const char *type, const double value = 0.25,
+                        const bool commit = false) {
+    juce::var command{new juce::DynamicObject};
+    command.getDynamicObject()->setProperty("type", type);
+    command.getDynamicObject()->setProperty("name", "Slot 1 -> level");
+    command.getDynamicObject()->setProperty("value", value);
+    command.getDynamicObject()->setProperty("commit", commit);
+    EditorTestAccess::command(*editor, command);
+  };
+  send("setParam");
+  send("setParam", 0.35);
+  if (listener.gestures != std::vector<bool>{true})
+    return false;
+  // Cancellation releases touch automation without overwriting a newer host
+  // value.
+  parameter->setValueNotifyingHost(0.8F);
+  const auto changes = listener.valueChanges;
+  send("endParamGesture");
+  if (listener.gestures != std::vector<bool>{true, false} ||
+      listener.valueChanges != changes ||
+      !test::withinTolerance(processor.slotValue(0) - 0.8F, 1.0e-6F)) {
+    std::cerr
+        << "cancelled editor gesture remained open or wrote a stale value\n";
+    return false;
+  }
+  send("endParamGesture");
+  send("setParam", 0.4);
+  send("setParam", 0.45, true);
+  send("endParamGesture");
+  if (listener.gestures != std::vector<bool>{true, false, true, false})
+    return false;
+  send("setParam");
+  editor.reset();
+  return listener.gestures ==
+         std::vector<bool>{true, false, true, false, true, false};
+}
+
 bool exerciseEditorLifecycle() {
   TemporarySource source;
   if (!source.write(parameterEffectSource))
@@ -2518,6 +2587,178 @@ bool exerciseExtendedMidi() {
   return true;
 }
 
+bool exerciseParameterSmoothing() {
+  TemporarySource source;
+  if (!source.write(R"(
+outs { out1, out2 }
+params { level = 0.0 {0.0, 1.0} }
+event note_on(id: i32, channel: i32, key: i32, velocity: f32) {}
+block {
+  cached = level
+  sample { out1 = cached; out2 = level }
+}
+)"))
+    return false;
+
+  onda::plugin::Processor processor(onda::plugin::Product::effect);
+  processor.prepareToPlay(1000.0, 8);
+  processor.loadFile(juce::File(onda::plugin::pathToJuce(source.path())));
+  if (!waitForOutput(processor, 0.0F, 8))
+    return false;
+  const auto generation = processor.workerStatus().engineGeneration;
+  const auto render = [&](const int frames, const float expected) {
+    juce::AudioBuffer<float> audio(2, frames);
+    juce::MidiBuffer midi;
+    // MIDI segmentation must not advance a ramp more than once per block.
+    midi.addEvent(juce::MidiMessage::noteOn(1, 60, 1.0F), 0);
+    midi.addEvent(juce::MidiMessage::noteOn(1, 61, 1.0F), frames / 2);
+    allocation_audit::count.store(0, std::memory_order_relaxed);
+    lock_audit::count.store(0, std::memory_order_relaxed);
+    allocation_audit::enabled = lock_audit::enabled = true;
+    processor.processBlock(audio, midi);
+    allocation_audit::enabled = lock_audit::enabled = false;
+    if (allocation_audit::count.load(std::memory_order_relaxed) != 0 ||
+        lock_audit::count.load(std::memory_order_relaxed) != 0) {
+      std::cerr
+          << "parameter smoothing allocated or locked on the audio thread\n";
+      return false;
+    }
+    for (int channel = 0; channel < 2; ++channel) {
+      for (int frame = 0; frame < frames; ++frame) {
+        if (!test::withinTolerance(
+                audio.getSample(channel, frame) - expected,
+                std::max(1.0e-6F, std::abs(expected) * 1.0e-6F))) {
+          std::cerr << "smoothing output " << audio.getSample(channel, frame)
+                    << ", expected " << expected << " for " << frames
+                    << " frames\n";
+          return false;
+        }
+      }
+    }
+    return true;
+  };
+  auto *const parameter = processor.getParameters()[0];
+  parameter->setValueNotifyingHost(1.0F);
+  if (!render(8, 8.0F / 30.0F) || !render(4, 12.0F / 30.0F))
+    return false;
+  // Retarget from the last f32 value actually published to DSP.
+  processor.setSlotValue(0, 0.0F);
+  const auto retargeted = 0.4F * (1.0F - 8.0F / 30.0F);
+  if (!render(8, retargeted) || !processor.setParamSmoothingSeconds(0.02) ||
+      !render(4, retargeted * 0.8F) ||
+      !processor.setParamSmoothingSeconds(0.0) || !render(2, 0.0F))
+    return false;
+  parameter->setValueNotifyingHost(1.0F);
+  if (!render(2, 1.0F))
+    return false;
+  // Durations no longer than the configured Onda block also update directly.
+  if (!processor.setParamSmoothingSeconds(0.008))
+    return false;
+  parameter->setValueNotifyingHost(0.0F);
+  if (!render(8, 0.0F) || !processor.setParamSmoothingSeconds(0.03))
+    return false;
+  parameter->setValueNotifyingHost(1.0F);
+  for (const auto expected :
+       {8.0F / 30.0F, 16.0F / 30.0F, 24.0F / 30.0F, 1.0F}) {
+    // Repeated writes of the same target must not restart the ramp.
+    parameter->setValueNotifyingHost(1.0F);
+    if (!render(8, expected))
+      return false;
+  }
+  parameter->setValueNotifyingHost(0.0F);
+  if (!render(8, 22.0F / 30.0F))
+    return false;
+  processor.reset();
+  if (!render(8, 0.0F))
+    return false;
+  parameter->setValueNotifyingHost(1.0F);
+  if (!render(8, 8.0F / 30.0F))
+    return false;
+  processor.resetParametersToDefaults();
+  if (!render(8, 0.0F) ||
+      processor.workerStatus().engineGeneration != generation)
+    return false;
+
+  StateChangeListener listener{processor};
+  if (!processor.setParamSmoothingSeconds(0.0155) ||
+      !processor.setParamSmoothingSeconds(0.0155) ||
+      listener.nonParameterChanges != 1)
+    return false;
+  for (const auto invalid : {-1.0, std::numeric_limits<double>::infinity(),
+                             std::numeric_limits<double>::quiet_NaN(),
+                             std::numeric_limits<double>::max()}) {
+    if (processor.setParamSmoothingSeconds(invalid) ||
+        !std::is_eq(processor.paramSmoothingSeconds() <=> 0.0155) ||
+        listener.nonParameterChanges != 1)
+      return false;
+  }
+  // Preserve fractional and disabled preferences, without dirtying state on
+  // restore.
+  for (const auto duration : {0.0155, 0.0}) {
+    if (!processor.setParamSmoothingSeconds(duration))
+      return false;
+    juce::MemoryBlock state;
+    processor.getStateInformation(state);
+    onda::plugin::Processor restored(onda::plugin::Product::effect);
+    StateChangeListener restoreListener{restored};
+    restored.setStateInformation(state.getData(),
+                                 static_cast<int>(state.getSize()));
+    if (!std::is_eq(restored.paramSmoothingSeconds() <=> duration) ||
+        restoreListener.nonParameterChanges != 0)
+      return false;
+    restored.prepareToPlay(1000.0, 8);
+    if (!waitForOutput(restored, 0.0F, 8))
+      return false;
+    const auto revision = processor.workerStatus().revision;
+    processor.requestReload();
+    if (!waitForActiveRevision(processor, revision) ||
+        !waitForOutput(processor, 0.0F, 8) ||
+        !std::is_eq(processor.paramSmoothingSeconds() <=> duration))
+      return false;
+  }
+
+  // f64 targets follow a linear ramp in plain units, even with a log domain.
+  if (!source.write(R"(
+outs { out1, out2 }
+params { level: f64 = 1.0 {1.0, 10000.0, log} }
+sample { out1 = f32(level); out2 = f32(level) }
+)"))
+    return false;
+  processor.loadFile(juce::File(onda::plugin::pathToJuce(source.path())));
+  if (!waitForOutput(processor, 1.0F, 8) ||
+      !processor.setParamSmoothingSeconds(0.016))
+    return false;
+  processor.getParameters()[0]->setValueNotifyingHost(1.0F);
+  if (!render(8, 5000.5F) || !render(8, 10000.0F))
+    return false;
+
+  if (!source.write(R"(
+outs { out1, out2 }
+params {
+  stepped = 0.0 {0.0, 10.0, step = 2.0}
+  integer: i32 = 0 {0, 10}
+  enabled: bool = false
+}
+sample {
+  value = stepped + f32(integer)
+  if enabled { value += 1.0 }
+  out1 = value
+  out2 = value
+}
+)"))
+    return false;
+  processor.loadFile(juce::File(onda::plugin::pathToJuce(source.path())));
+  if (!waitForOutput(processor, 0.0F, 8))
+    return false;
+  for (std::size_t slot = 0; slot < 3U; ++slot)
+    processor.getParameters()[static_cast<int>(slot)]->setValueNotifyingHost(
+        1.0F);
+  if (!render(8, 21.0F))
+    return false;
+  processor.unload();
+  return std::is_eq(processor.paramSmoothingSeconds() <=> 0.016);
+}
+
 bool exerciseHostAutomationBeforeMidi() {
   TemporarySource source;
   if (!source.write(R"(
@@ -2535,6 +2776,8 @@ sample { out1 = held * level; out2 = held * level }
     return false;
 
   onda::plugin::Processor processor(onda::plugin::Product::instrument);
+  if (!processor.setParamSmoothingSeconds(0.0))
+    return false;
   processor.prepareToPlay(48'000.0, 8);
   processor.loadFile(juce::File(onda::plugin::pathToJuce(source.path())),
                      false);
@@ -3364,7 +3607,10 @@ bool exerciseReplacementDuringSeeding() {
   }
   // Finishing the inherited seed must let subsequent automation reach DSP.
   processor.setSlotValue(0, 0.5F);
-  return processWithoutAllocation(processor, 2.25F);
+  const auto firstBlock = 2.0F + 0.25F * (64.0F / 1440.0F);
+  return processWithoutAllocation(processor, firstBlock) &&
+         waitForOutput(processor, 2.25F) &&
+         processWithoutAllocation(processor, 2.25F);
 }
 
 // No dispatch-loop pumping: host preparation and offline processing must be
@@ -4085,6 +4331,7 @@ int main(const int argc, const char *const *argv) {
        +[] { return exercise(onda::plugin::Product::instrument); }},
       {"StateRestore", exerciseStateRestore},
       {"EditorLifecycle", exerciseEditorLifecycle},
+      {"EditorGestureCancellation", exerciseEditorGestureCancellation},
       {"AudioFileBuffers", exerciseAudioFileBuffers},
       {"ProjectBufferOverrideRestore", exerciseProjectBufferOverrideRestore},
       {"IncompleteBufferStateRestore", exerciseIncompleteBufferStateRestore},
@@ -4093,6 +4340,7 @@ int main(const int argc, const char *const *argv) {
       {"ProjectExportRelinksAuthority", exerciseProjectExportRelinksAuthority},
       {"ExtendedMidi", exerciseExtendedMidi},
       {"HostAutomationBeforeMidi", exerciseHostAutomationBeforeMidi},
+      {"ParameterSmoothing", exerciseParameterSmoothing},
       {"MidiKeyboardMonitor", exerciseMidiKeyboardMonitor},
       {"ClickableMidiKeyboard", exerciseClickableMidiKeyboard},
       {"EventMetadataGating", exerciseEventMetadataGating},

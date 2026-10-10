@@ -424,6 +424,7 @@ juce_add_binary_data(onda_run_resources
     HEADER_NAME OndaRunResources.h
     SOURCES
         "${ONDA_RELEASE_SOURCE_DIR}/ui/run/run.html"
+        "${ONDA_RELEASE_SOURCE_DIR}/ui/number-input.js"
         "${ONDA_RELEASE_SOURCE_DIR}/packages/onda_processor_abi/src/param-control.js"
 )
 
@@ -439,6 +440,7 @@ add_library(onda_plugin_engine STATIC
     src/OndaSdk.cpp
     src/OndaSdk.h
     src/Primitive.h
+    src/ParameterRamp.h
     src/ProjectExport.cpp
     src/ProjectExport.h
     src/Product.h
@@ -503,6 +505,7 @@ function(add_onda_plugin target product_name plugin_code is_synth)
         src/RunViewHost.cpp
         src/RunViewHost.h
         src/ScopeCapture.h
+        src/StateFormat.h
         src/SpscQueue.h
     )
     target_link_libraries(${target} PRIVATE
@@ -544,6 +547,13 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
 endif()
 
 if(BUILD_TESTING AND ONDA_PLUGIN_BUILD_TESTS)
+    find_program(ONDA_NODE_EXECUTABLE NAMES node nodejs)
+    if(ONDA_NODE_EXECUTABLE)
+        add_test(NAME onda_editor_bridge_tests
+            COMMAND "${ONDA_NODE_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tests/EditorBridgeTests.mjs")
+    endif()
+
     add_executable(onda_example_tests tests/ExampleTests.cpp)
     target_compile_features(onda_example_tests PRIVATE cxx_std_20)
     target_compile_definitions(onda_example_tests PRIVATE

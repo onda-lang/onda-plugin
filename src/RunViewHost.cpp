@@ -95,6 +95,11 @@ std::optional<Resource> runViewResource(const juce::String &request) {
                         OndaRunResources::paramcontrol_jsSize,
                         "text/javascript; charset=utf-8");
   }
+  if (path == "/number-input.js") {
+    return utf8Resource(OndaRunResources::numberinput_js,
+                        OndaRunResources::numberinput_jsSize,
+                        "text/javascript; charset=utf-8");
+  }
   return std::nullopt;
 }
 
@@ -128,6 +133,10 @@ juce::var makeRunViewState(Processor &processor, const WorkerStatus &status,
   set(state, "supportsDeviceSelection", false);
   set(state, "supportsRunSettings", false);
   set(state, "supportsReset", true);
+  set(state, "ondaVersion", juce::String::fromUTF8(onda_version()));
+  set(state, "supportsParamSmoothing", true);
+  set(state, "paramSmoothingMs", processor.paramSmoothingSeconds() * 1000.0);
+  set(state, "paramSmoothingDefaultMs", defaultParamSmoothingSeconds * 1000.0);
   set(state, "supportsViewState", true);
   set(state, "supportsScope", true);
   auto midi = object();

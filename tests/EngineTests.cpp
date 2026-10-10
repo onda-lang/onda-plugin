@@ -152,7 +152,7 @@ init {
   held = i32(0)
 }
 event note_on(id: i32, channel: i32, key: i32, velocity: f32) {
-  held = i32(1) / i32(0)
+  held = i32(1) / (key - i32(60))
 }
 event note_off(id: i32, channel: i32, key: i32, velocity: f32) {}
 sample {

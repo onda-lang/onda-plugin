@@ -81,6 +81,10 @@ into the shared view's host-message schema. `Editor` owns the native browser
 lifetime, periodic publication, and command routing. Processor tests
 exercise the editor lifecycle through JUCE's real browser component; resource
 bytes and capability state are tested directly through `RunViewHost`.
+The browser bridge ends DAW parameter gestures when a control is removed,
+its metadata changes, or another program is selected. Cancellation sends an
+`endParamGesture` command without writing a value; ordinary host automation
+updates retain ongoing gestures.
 Windows explicitly uses WebView2 with a writable per-user data folder, and its
 editor lifecycle test requires the native browser's ready handshake.
 The editor publishes its initial state on `webviewReady` and keeps the loading
@@ -171,8 +175,9 @@ the queue releases its held notes. MIDI device selection remains host-owned.
 
 The callback captures aliased host input before clearing output. Logical blocks
 continue across host callbacks without added latency unless host automation
-changes; then the unfinished block ends before the next callback's events and
-audio. JUCE playhead state is captured once at callback entry. At each new
+changes or parameter ramps are active; then the unfinished block ends before
+the next callback's events and audio. JUCE playhead state is captured once at
+callback entry. At each new
 logical block, parameters are snapshotted first, available host-context fields
 are dispatched in canonical order, then same-boundary MIDI is dispatched before
 audio processing. Missing JUCE fields produce no context event; `render_mode`
@@ -181,6 +186,17 @@ metadata gates capture and
 dispatch: undeclared MIDI does not split processing, undeclared context fields
 do not perform projection or payload work, and an engine without position
 events does not query the JUCE playhead.
+
+`ParameterRamp` owns the plain-unit linear transition for each continuous float
+slot. `PreparedEngine` converts normalized host targets through Onda's ABI and
+publishes one value before block events and audio, advancing by the actual
+callback frames rather than MIDI segment lengths. Retargeting starts from the
+last value written to DSP, including f32 rounding. Discrete controls bypass the
+ramps. `Processor` retains the smoothing duration atomically, defaults to 30 ms,
+and serializes it in plugin state; the shared view edits it without recompiling
+or resetting DSP. Zero or a duration at most one configured block settles
+targets directly. Initialization, replacement, and reset also settle immediately.
+
 Position projection also captures whether the timeline is playing, independently
 of whether a transport event is declared. Stopped sample, time, and musical
 positions remain unchanged at interior logical-block boundaries.

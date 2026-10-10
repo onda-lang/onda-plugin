@@ -4,6 +4,7 @@
 #include "JucePath.h"
 #include "ProjectExport.h"
 #include "ProjectPath.h"
+#include "StateFormat.h"
 
 #include <onda_processor_abi.h>
 
@@ -18,8 +19,6 @@
 namespace onda::plugin {
 namespace {
 
-constexpr std::uint32_t stateMagic = 0x41444e4fU; // ONDA, little-endian.
-constexpr int stateVersion = 4;
 constexpr int maximumPathBytes = 16 * 1024;
 constexpr int maximumBufferNameBytes = 1024;
 constexpr int maximumBufferBindings = 1024;
@@ -705,7 +704,10 @@ void Processor::processBlock(juce::AudioBuffer<float> &audio,
     return;
   }
 
-  if (!active_->beginHostCallback(slotAtomics_)) {
+  if (parameterSettleRequested_.exchange(false, std::memory_order_acq_rel))
+    active_->settleParameters();
+  if (!active_->setParameterSmoothingSeconds(paramSmoothingSeconds()) ||
+      !active_->beginHostCallback(slotAtomics_, frames)) {
     faultActive();
     fallback(audio);
     return;
@@ -964,6 +966,7 @@ void Processor::unload(const bool notifyHost) {
   runtimeFaulted_.store(false, std::memory_order_release);
   runtimeRecoveryRequested_.store(false, std::memory_order_release);
   resetRequested_.store(false, std::memory_order_release);
+  parameterSettleRequested_.store(false, std::memory_order_release);
   activeLogGeneration_.store(0U, std::memory_order_release);
   clearMidiActivity();
   clearRuntimeLog();
@@ -984,6 +987,7 @@ void Processor::resetParametersToDefaults() {
     setSlotValue(index, value);
     endSlotGesture(index);
   }
+  parameterSettleRequested_.store(true, std::memory_order_release);
 }
 
 void Processor::requestUserReset() {
@@ -1172,6 +1176,20 @@ void Processor::setParamControlLayout(const ParamControlLayout layout) {
     updateHostDisplay(juce::AudioProcessorListener::ChangeDetails{}
                           .withNonParameterStateChanged(true));
   }
+}
+
+double Processor::paramSmoothingSeconds() const noexcept {
+  return paramSmoothingSeconds_.load(std::memory_order_relaxed);
+}
+
+bool Processor::setParamSmoothingSeconds(const double seconds) {
+  if (!parameterSmoothingSamples(seconds, std::max(1.0, hostSampleRate())))
+    return false;
+  if (!std::is_eq(paramSmoothingSeconds_.exchange(
+                      seconds, std::memory_order_relaxed) <=> seconds))
+    updateHostDisplay(juce::AudioProcessorListener::ChangeDetails{}
+                          .withNonParameterStateChanged(true));
+  return true;
 }
 
 juce::String Processor::viewState() const {
@@ -1430,6 +1448,7 @@ void Processor::getStateInformation(juce::MemoryBlock &destination) {
   stream.writeInt(editorHeight_.load(std::memory_order_relaxed));
   stream.writeBool(paramControlLayout() == ParamControlLayout::knobs);
   stream.writeString(viewState());
+  stream.writeDouble(paramSmoothingSeconds());
 }
 
 void Processor::setStateInformation(const void *data, const int byteCount) {
@@ -1487,6 +1506,13 @@ void Processor::setStateInformation(const void *data, const int byteCount) {
         (viewState->isNotEmpty() &&
          juce::JSON::parse(*viewState).getDynamicObject() == nullptr))
       return;
+    if (stream.getNumBytesRemaining() <
+        static_cast<juce::int64>(sizeof(double)))
+      return;
+    const auto smoothingSeconds = stream.readDouble();
+    if (!parameterSmoothingSamples(smoothingSeconds,
+                                   std::max(1.0, hostSampleRate())))
+      return;
 
     std::unique_lock preparationLock(preparationMutex_);
     deactivateRequested_.store(true, std::memory_order_release);
@@ -1502,6 +1528,7 @@ void Processor::setStateInformation(const void *data, const int byteCount) {
     editorHeight_.store(std::clamp(height, 480, 1400),
                         std::memory_order_relaxed);
     paramControlLayout_.store(layout, std::memory_order_relaxed);
+    paramSmoothingSeconds_.store(smoothingSeconds, std::memory_order_relaxed);
     {
       std::lock_guard lock(stateMutex_);
       lastBrowseDirectory_ = pathFromJuce(*browseDirectory);

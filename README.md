@@ -74,6 +74,14 @@ defaults, boolean/discrete step counts, and normalized-to-plain text conversion
 to the host. Logarithmic scaling, curves, and step snapping use Onda's processor
 ABI. 
 
+Continuous `f32` and `f64` parameters use host-owned, block-rate linear smoothing
+in plain units for both editor changes and DAW automation. The **Smooth** control
+in the Params header defaults to 30 ms and is saved per plugin instance with
+the DAW project. Set it to 0 for direct updates; disabling smoothing settles
+active targets at the next callback. Integer, boolean, and stepped parameters,
+and durations no longer than one configured block, update directly. Startup,
+reload, and reset apply current values immediately.
+
 ## Audio buffers
 
 An `.ondaproject` input uses the immutable buffer defaults retained by Onda's
@@ -142,8 +150,8 @@ identity. `-DONDA_PLUGIN_VERSION=x.y.z` overrides it explicitly; otherwise the
 `ONDA_PLUGIN_VERSION` environment variable takes precedence over the file.
 
 Independently, `onda-version` selects the Onda SDK and the Onda source revision
-used for embedded run-view resources. The embedded-resource test requires the
-pinned Onda run view to use document scrolling. `-DONDA_VERSION=x.y.z` overrides
+used for embedded run-view resources. The embedded-resource test checks that
+the pinned run view supports scroll-position persistence. `-DONDA_VERSION=x.y.z` overrides
 that pin; otherwise the `ONDA_VERSION` environment variable takes precedence
 over the file. This separation allows plug-in-only fixes to ship without
 changing the Onda SDK dependency.

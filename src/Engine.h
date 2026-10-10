@@ -2,6 +2,7 @@
 
 #include "EventPayload.h"
 #include "OndaSdk.h"
+#include "ParameterRamp.h"
 #include "Product.h"
 #include "RuntimeLog.h"
 
@@ -210,8 +211,11 @@ public:
           const HostContext &hostContext = {},
           int hostCallbackOffset = 0) noexcept;
 
-  [[nodiscard]] bool beginHostCallback(
-      const std::array<std::atomic<float> *, slotCount> &slots) noexcept;
+  [[nodiscard]] bool
+  beginHostCallback(const std::array<std::atomic<float> *, slotCount> &slots,
+                    int frames = -1) noexcept;
+  [[nodiscard]] bool setParameterSmoothingSeconds(double seconds) noexcept;
+  void settleParameters() noexcept;
 
   [[nodiscard]] bool
   reset(const std::array<std::atomic<float> *, slotCount> &slots) noexcept;
@@ -303,10 +307,13 @@ private:
   void applyParameter(std::size_t slot, float value) noexcept;
   void applyParameters(
       const std::array<std::atomic<float> *, slotCount> &slots) noexcept;
-  [[nodiscard]] float parameterValue(
-      std::size_t slot,
-      const std::array<std::atomic<float> *, slotCount> &slots,
-      bool useDefaults) const noexcept;
+  void
+  updateParameters(const std::array<std::atomic<float> *, slotCount> &slots,
+                   int frames) noexcept;
+  [[nodiscard]] float
+  parameterValue(std::size_t slot,
+                 const std::array<std::atomic<float> *, slotCount> &slots,
+                 bool useDefaults) const noexcept;
 
   std::uint64_t buildGeneration_{};
   // Worker metadata lives until this engine is retired. Audio never accesses
@@ -339,7 +346,14 @@ private:
   RuntimeLogCounters pendingLogCounters_{};
   int logicalFrame_{};
   bool blockStarted_{};
-  std::array<float, slotCount> appliedParameters_{};
+  int hostCallbackFrames_{-1};
+  bool parametersStarted_{};
+  bool parameterBoundaryRequested_{};
+  std::uint64_t smoothingSamples_{};
+  std::array<float, slotCount> parameterTargets_{};
+  std::array<ParameterRamp, slotCount> parameterRamps_{};
+  // Only continuous float mappings participate in host smoothing.
+  std::array<int, slotCount> smoothedParameterTypes_{};
   std::array<ParameterMapping, slotCount> parameterMappings_{};
   std::size_t parameterMappingCount_{};
   std::array<EventBinding, static_cast<std::size_t>(MidiKind::count)>
