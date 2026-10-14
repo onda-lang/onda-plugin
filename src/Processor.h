@@ -1,6 +1,7 @@
 #pragma once
 
 #include "Engine.h"
+#include "HostAutomation.h"
 #include "Product.h"
 #include "ScopeCapture.h"
 #include "SpscQueue.h"
@@ -42,6 +43,7 @@ struct MidiActivitySnapshot {
 };
 
 inline constexpr std::size_t userEventPayloadCapacity = 16U * 1024U;
+inline constexpr std::size_t userEventQueueCapacity = 8U;
 
 struct UserEventCommand {
   std::uint64_t generation{};
@@ -60,6 +62,8 @@ struct UserEventCommand {
     return *this;
   }
 };
+
+class HostParameter;
 
 class Processor final : public juce::AudioProcessor,
                         private juce::Timer,
@@ -81,6 +85,10 @@ public:
                     juce::MidiBuffer &midi) override;
   void processBlock(juce::AudioBuffer<double> &audio,
                     juce::MidiBuffer &midi) override;
+  void processBlockBypassed(juce::AudioBuffer<float> &audio,
+                            juce::MidiBuffer &midi) override;
+  void processBlockBypassed(juce::AudioBuffer<double> &audio,
+                            juce::MidiBuffer &midi) override;
 
   [[nodiscard]] const juce::String getName() const override;
   [[nodiscard]] bool acceptsMidi() const override { return true; }
@@ -112,9 +120,10 @@ public:
   void clearBuffer(std::string_view name);
   void unload(bool notifyHost = true);
   void requestReload();
-  void resetParametersToDefaults();
+  void resetParametersToDefaults(ParameterReset bank = ParameterReset::all);
   void requestUserReset();
-  [[nodiscard]] std::string triggerEvent(std::string_view name,
+  [[nodiscard]] std::string triggerEvent(std::uint64_t generation,
+                                         std::string_view name,
                                          const juce::var &values);
   [[nodiscard]] WorkerStatus workerStatus() const;
   [[nodiscard]] std::uint64_t workerStatusRevision() const;
@@ -130,9 +139,31 @@ public:
   [[nodiscard]] ScopeSnapshot scopeSnapshot() const;
   [[nodiscard]] juce::File lastBrowseDirectory() const;
   [[nodiscard]] float slotValue(std::size_t index) const noexcept;
+  [[nodiscard]] std::uint64_t slotStamp(std::size_t index) const noexcept;
+  [[nodiscard]] HostParameterValues hostParameterValues() const;
   void beginSlotGesture(std::size_t index);
   void setSlotValue(std::size_t index, float normalized);
   void endSlotGesture(std::size_t index);
+  [[nodiscard]] float inputControlValue(std::size_t index) const noexcept;
+  [[nodiscard]] std::uint64_t
+  inputControlStamp(std::size_t index) const noexcept;
+  void beginInputControlGesture(std::size_t index);
+  void setInputControlValue(std::size_t index, float normalized);
+  void endInputControlGesture(std::size_t index);
+  // Wrapper only: borrowed queues never escape the processing call.
+  void captureHostAutomation(std::uint32_t id, AutomationQueue queue,
+                             int frames) noexcept;
+  [[nodiscard]] bool ownsHostParameter(std::uint32_t id) const noexcept;
+  void publishHostAutomationTargets() noexcept;
+  void clearHostAutomation() noexcept;
+  [[nodiscard]] juce::String controlInputName(std::size_t index) const;
+
+  [[nodiscard]] int preferredBlockSize() const noexcept {
+    return preferredBlockSize_.load(std::memory_order_acquire);
+  }
+  [[nodiscard]] int ondaBlockSize() const noexcept;
+  [[nodiscard]] bool canSetBlockSize() const;
+  [[nodiscard]] bool setPreferredBlockSize(int samples);
 
   [[nodiscard]] double hostSampleRate() const noexcept {
     return expectedSampleRate_.load(std::memory_order_acquire);
@@ -148,6 +179,10 @@ public:
   void setParamControlLayout(ParamControlLayout layout);
   [[nodiscard]] double paramSmoothingSeconds() const noexcept;
   [[nodiscard]] bool setParamSmoothingSeconds(double seconds);
+  [[nodiscard]] ParamControlLayout inputControlLayout() const noexcept;
+  void setInputControlLayout(ParamControlLayout layout);
+  [[nodiscard]] double inputControlSmoothingSeconds() const noexcept;
+  [[nodiscard]] bool setInputControlSmoothingSeconds(double seconds);
   [[nodiscard]] juce::String viewState() const;
   void setViewState(const juce::var &state);
   [[nodiscard]] std::uint64_t viewStateRestoreRevision() const noexcept {
@@ -156,18 +191,19 @@ public:
 
 private:
   friend struct ProcessorTestAccess;
-  class SlotParameter;
   static BusesProperties buses();
-  static juce::AudioProcessorValueTreeState::ParameterLayout parameters();
   void timerCallback() override;
   void handleAsyncUpdate() override;
-  [[nodiscard]] bool refreshSlotParameterInfo();
+  [[nodiscard]] bool refreshHostParameterInfo();
   void acquireEngine() noexcept;
+  void acquireDryScratch() noexcept;
+  [[nodiscard]] const PreparedEngine *automationEngine() const noexcept;
+  void reconcileHostAutomation(const PreparedEngine *engine,
+                               bool useDefaults) noexcept;
   // Caller holds preparationMutex_; host audio is suspended or offline.
-  [[nodiscard]] std::size_t synchronizeEngine();
-  [[nodiscard]] std::size_t applySeedValues();
-  void commitSlotValue(std::size_t index, float value);
-  void notifySlotValues(std::size_t count);
+  void synchronizeEngine();
+  void applySeedValues();
+  void notifyDeferredAutomation();
   [[nodiscard]] std::string
   saveProjectSnapshot(const ProjectExportSnapshot &snapshot,
                       const juce::File &directory);
@@ -176,17 +212,41 @@ private:
   void drainRuntimeLogs();
   void observeMidiActivity(const juce::MidiMessage &message) noexcept;
   void clearMidiActivity() noexcept;
+  void clearRuntimeState();
   [[nodiscard]] static std::optional<MidiEvent>
   convertMidi(const juce::MidiMessage &message, int samplePosition,
               const PreparedEngine &engine, int minimumOffset,
               int frames) noexcept;
   void fallback(juce::AudioBuffer<float> &audio) noexcept;
+  void restoreDry(float *const *outputs, int offset, int frames) noexcept;
+  void applyBypass(float *const *outputs, int frames, bool bypassed) noexcept;
+  void processAudio(juce::AudioBuffer<float> &audio, juce::MidiBuffer &midi,
+                    bool bypassed);
 
   Product product_;
-  juce::AudioProcessorValueTreeState parameterState_;
-  std::array<std::atomic<float> *, slotCount> slotAtomics_{};
-  std::array<juce::RangedAudioParameter *, slotCount> slotParameters_{};
-  std::array<SlotParameter *, slotCount> presentedSlotParameters_{};
+  ParameterState slotState_;
+  ControlState controlState_;
+  struct HostParameterId {
+    std::uint32_t id{};
+    std::size_t index{};
+    bool control{};
+  };
+  std::array<HostParameterId, slotCount + controlCount> hostParameterIds_{};
+  HostAutomation<slotCount> hostAutomation_{slotState_};
+  HostAutomation<controlCount> controlAutomation_{controlState_};
+  std::atomic<bool> defaultValuesChanged_{};
+  struct AutomationPublication {
+    std::uint64_t seed{};
+    bool useDefaults{};
+    bool acknowledged{};
+    bool operator==(const AutomationPublication &) const = default;
+  };
+  std::optional<AutomationPublication> automationPublication_;
+  bool automationCaptured_{};
+  bool automationCapturedDefaults_{};
+  std::uint64_t automationCapturedSeed_{};
+  std::array<HostParameter *, controlCount> controlParameters_{};
+  std::array<HostParameter *, slotCount> slotParameters_{};
 
   SpscSlot<PreparedEngine *> replacements_;
   SpscSlot<PreparedEngine *> retirements_;
@@ -198,6 +258,8 @@ private:
   std::atomic<double> expectedSampleRate_{};
   std::atomic<int> expectedBlockSize_{};
   std::atomic<int> configuredBlockSize_{};
+  // Zero follows the host; a fixed preference is capped by the host capacity.
+  std::atomic<int> preferredBlockSize_{};
   std::unique_ptr<Worker> worker_;
   juce::ThreadPool exportPool_{1};
   std::atomic<bool> exportPending_{};
@@ -207,7 +269,7 @@ private:
   std::uint64_t offlinePreparedGeneration_{};
   RuntimeLogSink runtimeLogSink_;
   ScopeCapture scopeCapture_;
-  SpscQueue<UserEventCommand, 8U> userEvents_;
+  SpscQueue<UserEventCommand, userEventQueueCapacity> userEvents_;
   UserEventCommand userEventScratch_;
   std::atomic<std::uint64_t> activeLogGeneration_{};
   std::uint64_t consumedLogGeneration_{};
@@ -233,14 +295,33 @@ private:
   std::array<bool, midiNoteCount> keyboardHeldNotes_{};
   std::uint64_t keyboardGeneration_{};
 
-  std::array<std::vector<float>,
-             static_cast<std::size_t>(pluginPassthroughChannels)>
-      dryScratch_;
-  std::atomic<int> editorWidth_{480};
-  std::atomic<int> editorHeight_{720};
+  struct DryScratch {
+    explicit DryScratch(const int frames)
+        : capacity(frames),
+          samples(static_cast<std::size_t>(pluginPassthroughChannels) *
+                  static_cast<std::size_t>(frames)) {}
+
+    float *channel(const std::size_t index) noexcept {
+      return samples.data() + index * static_cast<std::size_t>(capacity);
+    }
+    int capacity;
+    std::vector<float> samples;
+  };
+  // Preparation publishes replacements; only audio exchanges active storage.
+  SpscSlot<DryScratch *> scratchReplacements_;
+  SpscSlot<DryScratch *> scratchRetirements_;
+  DryScratch *dryScratch_{};
+  juce::SmoothedValue<double> bypassMix_{1.0};
+  bool bypassStarted_{};
+  std::atomic<int> editorWidth_{720};
+  std::atomic<int> editorHeight_{840};
   std::atomic<ParamControlLayout> paramControlLayout_{
       ParamControlLayout::sliders};
   std::atomic<double> paramSmoothingSeconds_{defaultParamSmoothingSeconds};
+  std::atomic<ParamControlLayout> inputControlLayout_{
+      ParamControlLayout::knobs};
+  std::atomic<double> inputControlSmoothingSeconds_{
+      defaultParamSmoothingSeconds};
   std::atomic<std::uint64_t> viewStateRestoreRevision_{};
   std::mutex preparationMutex_;
   mutable std::mutex stateMutex_;

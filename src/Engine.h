@@ -1,14 +1,17 @@
 #pragma once
 
+#include "ControlState.h"
 #include "EventPayload.h"
 #include "OndaSdk.h"
+#include "ParameterAutomation.h"
+#include "ParameterMapping.h"
 #include "ParameterRamp.h"
+#include "ParameterState.h"
 #include "Product.h"
 #include "RuntimeLog.h"
 
 #include <array>
 #include <atomic>
-#include <compare>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -20,15 +23,18 @@
 
 namespace onda::plugin {
 
-inline constexpr std::size_t slotCount = 32U;
-using ParameterValues = std::array<float, slotCount>;
-
 // Published with an engine. Audio uses these values until host seeding
 // finishes.
 struct SeedValues {
+  // Identifies the patch selection, independent of subsequent rebuilds.
   std::uint64_t revision{};
   ParameterValues values{};
   std::size_t count{};
+  ControlValues controls{};
+  std::size_t controlCount{};
+  ParameterSeedStamps<slotCount> parameterStamps;
+  ParameterSeedStamps<onda::plugin::controlCount> controlStamps;
+  std::atomic<bool> started{};
   std::atomic<bool> applied{};
   // Accessed only under the worker mutex.
   bool claimed{};
@@ -95,44 +101,6 @@ struct HostContext {
   bool realtime{true};
 };
 
-struct ParameterMapping {
-  int parameterIndex{-1};
-  std::string name;
-  std::string type;
-  std::string unit;
-  double defaultNormalized{0.5};
-  double defaultPlain{};
-  double rangeMin{};
-  double rangeMax{};
-  std::string scale{"linear"};
-  std::optional<double> curve;
-  std::optional<double> step;
-  std::optional<std::int64_t> stepCount;
-
-  friend bool operator==(const ParameterMapping &left,
-                         const ParameterMapping &right) noexcept {
-    const auto equalDouble = [](const double a, const double b) noexcept {
-      return std::is_eq(a <=> b);
-    };
-    const auto equalOptionalDouble =
-        [&equalDouble](const std::optional<double> &a,
-                       const std::optional<double> &b) noexcept {
-          return a.has_value() == b.has_value() && (!a || equalDouble(*a, *b));
-        };
-    return left.parameterIndex == right.parameterIndex &&
-           left.name == right.name && left.type == right.type &&
-           left.unit == right.unit &&
-           equalDouble(left.defaultNormalized, right.defaultNormalized) &&
-           equalDouble(left.defaultPlain, right.defaultPlain) &&
-           equalDouble(left.rangeMin, right.rangeMin) &&
-           equalDouble(left.rangeMax, right.rangeMax) &&
-           left.scale == right.scale &&
-           equalOptionalDouble(left.curve, right.curve) &&
-           equalOptionalDouble(left.step, right.step) &&
-           left.stepCount == right.stepCount;
-  }
-};
-
 struct EventParameterMapping {
   std::string name;
   std::string type;
@@ -173,6 +141,7 @@ struct BufferMapping {
   std::string type;
   BufferChannelKind channelKind{};
   int fixedChannels{};
+  bool hasProjectDefault{};
   std::filesystem::path loadedPath;
   int loadedFrames{};
   int loadedChannels{};
@@ -204,30 +173,63 @@ public:
         int blockSize,
         const std::optional<ParameterValues> &initialParameters = std::nullopt);
 
-  [[nodiscard]] bool
-  process(float *const *hostInputs, float *const *hostOutputs, int frames,
-          std::span<const MidiEvent> midi,
-          const std::array<std::atomic<float> *, slotCount> &slots,
-          const HostContext &hostContext = {},
-          int hostCallbackOffset = 0) noexcept;
+  [[nodiscard]] bool process(float *const *hostInputs,
+                             float *const *hostOutputs, int frames,
+                             std::span<const MidiEvent> midi,
+                             const ParameterState &slots,
+                             const HostContext &hostContext = {},
+                             int hostCallbackOffset = 0) noexcept;
 
-  [[nodiscard]] bool
-  beginHostCallback(const std::array<std::atomic<float> *, slotCount> &slots,
-                    int frames = -1) noexcept;
+  // Render this callback in chunks of at most blockSize(), closing its final
+  // chunk at frames. process() ranges and MIDI splits share that boundary.
+  void beginHostCallback(int frames, ParameterAutomation *automation = nullptr,
+                         const ControlState *controls = nullptr,
+                         ControlAutomation *controlAutomation = nullptr,
+                         bool useDefaults = false) noexcept;
+  [[nodiscard]] bool parameterDefaultsPending() const noexcept {
+    return parameterSeed_ &&
+           !parameterSeed_->applied.load(std::memory_order_acquire);
+  }
+  [[nodiscard]] std::uint64_t parameterSeedRevision() const noexcept {
+    return parameterSeed_ ? parameterSeed_->revision : 0U;
+  }
+  [[nodiscard]] SeedValues *parameterSeed() const noexcept {
+    return parameterSeed_.get();
+  }
+  [[nodiscard]] std::uint64_t
+  initializeControlDefaults(ControlState &controls,
+                            std::uint64_t retainedLanes) noexcept;
+  [[nodiscard]] bool hostCallbackUsesParameterDefaults() const noexcept {
+    return hostCallbackUsesDefaults_;
+  }
   [[nodiscard]] bool setParameterSmoothingSeconds(double seconds) noexcept;
+  [[nodiscard]] bool setInputControlSmoothingSeconds(double seconds) noexcept;
+  [[nodiscard]] bool inputControlRampPending(std::size_t control,
+                                             double normalized,
+                                             double seconds) const noexcept;
+  [[nodiscard]] bool editorRampPending(std::size_t slot, double normalized,
+                                       double seconds) const noexcept;
+  [[nodiscard]] ParameterValue::Target
+  controlTarget(std::size_t control, const ControlState &values) const noexcept;
+  [[nodiscard]] ParameterValue::Target
+  parameterTarget(std::size_t slot,
+                  const ParameterState &values) const noexcept;
   void settleParameters() noexcept;
 
-  [[nodiscard]] bool
-  reset(const std::array<std::atomic<float> *, slotCount> &slots) noexcept;
+  [[nodiscard]] bool reset(const ParameterState &slots) noexcept;
   void attachLogSink(RuntimeLogSink &sink) noexcept;
 
   [[nodiscard]] double sampleRate() const noexcept { return sampleRate_; }
   [[nodiscard]] int blockSize() const noexcept { return blockSize_; }
+  [[nodiscard]] int inputChannels() const noexcept { return inputChannels_; }
   [[nodiscard]] std::uint64_t buildGeneration() const noexcept {
     return buildGeneration_;
   }
   [[nodiscard]] std::span<const ParameterMapping> parameterMappings() const {
     return {parameterMappings_.data(), parameterMappingCount_};
+  }
+  [[nodiscard]] std::span<const ParameterMapping> controlMappings() const {
+    return controlMappings_;
   }
   [[nodiscard]] std::span<const BufferMapping> bufferMappings() const {
     return bufferMappings_;
@@ -237,7 +239,7 @@ public:
   }
   [[nodiscard]] EventTriggerResult
   triggerEvent(int index, std::span<const std::byte> payload,
-               const std::array<std::atomic<float> *, slotCount> &slots,
+               const ParameterState &slots,
                const HostContext &hostContext = {}) noexcept;
   [[nodiscard]] bool handlesMidi(MidiKind kind) const noexcept;
   [[nodiscard]] bool handlesHostContext(HostContextKind kind) const noexcept;
@@ -246,6 +248,13 @@ public:
   }
 
 private:
+  enum class ValueBank : std::uint8_t { parameters, controls };
+
+  struct ResetDefault {
+    std::uint64_t stamp{};
+    ScalarValue value;
+  };
+
   struct BufferStorage {
     std::vector<float> samples;
     int frames{};
@@ -276,6 +285,7 @@ private:
         const std::optional<ParameterValues> &initialParameters);
 
   [[nodiscard]] bool prepareRuntimeOutput(Diagnostic &diagnostic);
+  [[nodiscard]] bool prepareInputDefaults(Diagnostic &diagnostic);
   [[nodiscard]] bool initialize() noexcept;
   void collectExecutionOutput() noexcept;
   void flushPendingLogs() noexcept;
@@ -293,32 +303,50 @@ private:
   [[nodiscard]] bool trigger(const EventBinding &binding,
                              Values... values) noexcept;
 
-  [[nodiscard]] bool processSegment(
-      float *const *hostInputs, float *const *hostOutputs, int callbackOffset,
-      int frames, const std::array<std::atomic<float> *, slotCount> &slots,
-      const HostContext &hostContext, int hostCallbackOffset) noexcept;
+  [[nodiscard]] bool processSegment(float *const *hostInputs,
+                                    float *const *hostOutputs,
+                                    int callbackOffset, int frames,
+                                    const ParameterState &slots,
+                                    const HostContext &hostContext,
+                                    int hostCallbackOffset) noexcept;
+  void prepareControlInputs(float *const *hostInputs) noexcept;
+  void updateControlTarget(std::size_t control, ParameterValue::Target target,
+                           const ControlValue &value,
+                           bool useDefaults) noexcept;
+  [[nodiscard]] ControlValue
+  controlValue(std::size_t control, ParameterValue::Target target,
+               const ControlState *values) const noexcept;
   [[nodiscard]] bool dispatch(const MidiEvent &event) noexcept;
-  [[nodiscard]] bool
-  ensureBlockStarted(const std::array<std::atomic<float> *, slotCount> &slots,
-                     const HostContext &hostContext,
-                     int hostCallbackOffset) noexcept;
+  [[nodiscard]] bool ensureBlockStarted(const ParameterState &slots,
+                                        const HostContext &hostContext,
+                                        int hostCallbackOffset) noexcept;
   [[nodiscard]] bool dispatchHostContext(const HostContext &hostContext,
                                          int hostCallbackOffset) noexcept;
-  void applyParameter(std::size_t slot, float value) noexcept;
-  void applyParameters(
-      const std::array<std::atomic<float> *, slotCount> &slots) noexcept;
-  void
-  updateParameters(const std::array<std::atomic<float> *, slotCount> &slots,
-                   int frames) noexcept;
-  [[nodiscard]] float
-  parameterValue(std::size_t slot,
-                 const std::array<std::atomic<float> *, slotCount> &slots,
-                 bool useDefaults) const noexcept;
+  void applyParameter(std::size_t slot, const ScalarValue &value) noexcept;
+  [[nodiscard]] double writeParameterPlain(std::size_t slot,
+                                           const ScalarPlain &value) noexcept;
+  void applyParameters(const ParameterState &slots) noexcept;
+  void updateParameters(const ParameterState &slots, int frames,
+                        int offset) noexcept;
+  [[nodiscard]] ScalarValue
+  parameterValue(std::size_t slot, ParameterValue::Target target,
+                 const ParameterState &slots) const noexcept;
+  template <ValueBank Bank, std::size_t Count>
+  [[nodiscard]] ScalarValue
+  resolveValue(std::size_t index, ParameterValue::Target target,
+               const ParameterBank<Count> *values) const noexcept;
+  template <ValueBank Bank, std::size_t Count>
+  [[nodiscard]] ParameterValue::Target
+  resolveTarget(std::size_t index,
+                const ParameterBank<Count> &values) const noexcept;
 
   std::uint64_t buildGeneration_{};
-  // Worker metadata lives until this engine is retired. Audio never accesses
-  // or copies it; destruction happens on the worker or during host preparation.
+  // The publication owns the immutable control baseline borrowed by audio.
+  // Cold metadata is read only off-thread; destruction happens on the worker
+  // or during host preparation.
   std::shared_ptr<const EnginePublication> publication_;
+  const HostParameterValues *checkpointValues_{}; // Owned by publication_.
+  ControlDefaultStamps *initialControlStamps_{};  // Owned by publication_.
   std::shared_ptr<SeedValues> parameterSeed_;
   double sampleRate_{};
   int blockSize_{};
@@ -326,6 +354,8 @@ private:
   int inputChannels_{};
   int outputChannels_{};
   std::vector<float> inputSlab_;
+  std::array<float, static_cast<std::size_t>(pluginTotalInputChannels)>
+      inputDefaults_{};
   std::vector<float> outputSlab_;
   std::vector<BufferStorage> bufferStorage_;
   // Onda instances retain the bound slab and buffer pointers. Declaring the
@@ -347,20 +377,43 @@ private:
   int logicalFrame_{};
   bool blockStarted_{};
   int hostCallbackFrames_{-1};
+  ParameterAutomation *hostAutomation_{};
+  const ControlState *controlState_{};
+  ControlAutomation *controlAutomation_{};
+  bool controlInputsPrepared_{};
+  std::array<double, controlCount> controlNormalizedTargets_{};
+  std::array<ParameterRamp, controlCount> controlRamps_{};
+  std::array<bool, controlCount> controlValuesStarted_{};
+  std::array<bool, controlCount> controlUsesDefault_{};
+  std::uint64_t controlSmoothingSamples_{};
+  // Audio-owned fallback for a Reset publication overlapping a snapshot read.
+  mutable ControlValues resolvedControlValues_{};
+  std::vector<ParameterMapping> controlMappings_;
+  std::array<double, controlCount> controlMinimum_{};
+  std::array<double, controlCount> controlMaximum_{};
+  bool hostCallbackUsesDefaults_{};
   bool parametersStarted_{};
-  bool parameterBoundaryRequested_{};
+  bool parametersSettleRequested_{};
   std::uint64_t smoothingSamples_{};
-  std::array<float, slotCount> parameterTargets_{};
+  std::array<double, slotCount> parameterTargets_{};
+  std::array<std::optional<ScalarPlain>, slotCount> parameterPlainDefaults_{};
+  mutable ParameterValues resolvedParameterValues_{};
   std::array<ParameterRamp, slotCount> parameterRamps_{};
-  // Only continuous float mappings participate in host smoothing.
+  // Only continuous float mappings participate in editor smoothing.
   std::array<int, slotCount> smoothedParameterTypes_{};
   std::array<ParameterMapping, slotCount> parameterMappings_{};
+  std::array<ScalarDomain, slotCount> parameterDomains_{};
+  std::array<onda_processor_param_domain, slotCount> parameterHostDomains_{};
   std::size_t parameterMappingCount_{};
   std::array<EventBinding, static_cast<std::size_t>(MidiKind::count)>
       midiEvents_{};
   std::array<EventBinding, static_cast<std::size_t>(HostContextKind::count)>
       hostContextEvents_{};
   bool needsPositionInfo_{};
+
+  // Keep Reset-only snapshots separate from the ordinary processing state.
+  mutable std::array<ResetDefault, controlCount> controlResetDefaults_{};
+  mutable std::array<ResetDefault, slotCount> parameterResetDefaults_{};
 
   friend struct BuildResult;
   friend class Worker;

@@ -31,10 +31,13 @@ struct WorkerStatus {
   std::filesystem::path path;
   std::string message{"No Onda file loaded"};
   bool compiling{};
+  // A load error can coexist with a retained, active engine.
+  bool hasError{};
   bool active{};
   bool usingProjectImage{};
   std::uint64_t engineGeneration{};
   std::vector<ParameterMapping> mappings;
+  std::vector<ParameterMapping> controls;
   std::vector<BufferMapping> buffers;
   // Binding choices for a failed replacement; active metadata stays intact.
   std::optional<std::vector<BufferMapping>> pendingBuffers;
@@ -55,13 +58,17 @@ struct PersistedProjectState {
 
 struct PersistedStateSnapshot {
   PersistedProjectState project;
-  ParameterValues parameters;
+  HostParameterValues values;
 };
 
 struct EnginePublication {
   WorkerStatus status;
   PersistedProjectState project;
   std::shared_ptr<SeedValues> seed;
+  HostParameterValues values;
+  // Audio publishes conditional default commits; immutable values retain the
+  // exact scalar for DSP and saved-state snapshots.
+  mutable ControlDefaultStamps initialControlStamps{};
 };
 
 struct ProjectExportSnapshot {
@@ -83,7 +90,7 @@ public:
   using ProjectBuildFunction =
       std::function<BuildResult(const ProjectImage &, Product, double, int,
                                 const std::optional<ParameterValues> &)>;
-  using ParameterSource = std::function<ParameterValues()>;
+  using ParameterSource = std::function<HostParameterValues()>;
   using ParameterMappingsChanged = std::function<void()>;
   using RetirementObserver = void (*)(PreparedEngine *) noexcept;
 
@@ -110,10 +117,11 @@ public:
       std::filesystem::path path, std::vector<BufferFileBinding> bufferBindings,
       bool seedDefaults,
       ExistingEnginePolicy policy = ExistingEnginePolicy::retainUntilSuccess);
-  void restore(std::filesystem::path path, ProjectImage projectImage,
-               std::vector<BufferFileBinding> bufferBindings,
-               ExistingEnginePolicy policy =
-                   ExistingEnginePolicy::deactivateImmediately);
+  void restore(
+      std::filesystem::path path, ProjectImage projectImage,
+      std::vector<BufferFileBinding> bufferBindings,
+      ExistingEnginePolicy policy = ExistingEnginePolicy::deactivateImmediately,
+      std::optional<HostParameterValues> values = std::nullopt);
   void unload(bool notifyHost = true);
   void requestRebuild();
   void bindBufferFile(std::string name, std::filesystem::path path);
@@ -128,7 +136,6 @@ public:
 
   [[nodiscard]] WorkerStatus status() const;
   [[nodiscard]] std::uint64_t statusRevision() const;
-  [[nodiscard]] std::vector<ParameterMapping> parameterMappings() const;
   // Non-realtime caller wakes the worker after the audio thread retires an
   // engine.
   void requestRetirementCollection();
@@ -137,9 +144,15 @@ public:
     return hasPendingSeedValues_.load(std::memory_order_acquire);
   }
   void finishSeeding(const std::shared_ptr<SeedValues> &seed);
+  // Commit Reset targets and their exact defaults before notifying listeners.
+  // Serializes the metadata/value transaction with engine publication.
+  [[nodiscard]] std::size_t
+  resetParameters(ParameterState &slots, ControlState &controls,
+                  ParameterReset bank = ParameterReset::all);
   [[nodiscard]] PersistedProjectState persistedProjectState() const;
   // Caller serializes this with parameter seeding and host state restoration.
   [[nodiscard]] PersistedStateSnapshot persistedStateSnapshot() const;
+  [[nodiscard]] HostParameterValues hostParameterValues() const;
   [[nodiscard]] std::optional<ProjectExportSnapshot>
   projectExportSnapshot() const;
   [[nodiscard]] bool relinkExport(const ProjectExportSnapshot &snapshot,
@@ -158,7 +171,8 @@ private:
     double sampleRate{};
     int blockSize{};
     std::uint64_t generation{};
-    bool seedDefaults{};
+    // Nonzero until this selection's defaults are acknowledged by the host.
+    std::uint64_t defaultSeedRevision{};
     bool recoverCheckpoint{};
     bool notifyProjectChange{true};
     std::vector<BufferFileBinding> bufferBindings;
@@ -182,17 +196,21 @@ private:
   void loadLocked(std::filesystem::path path, bool seedDefaults,
                   ExistingEnginePolicy policy);
   void finishRequest(std::uint64_t generation);
-  void publishProjectState(PersistedProjectState state, bool notifyHost,
-                           std::shared_ptr<SeedValues> pendingDefaults = {});
+  void
+  publishProjectState(PersistedProjectState state, bool notifyHost,
+                      std::shared_ptr<SeedValues> pendingDefaults = {},
+                      std::optional<HostParameterValues> values = std::nullopt);
   // Caller holds mutex_; a complete checkpoint takes precedence over requests.
   void publishIncompleteProjectState();
   // Caller holds mutex_.
   void incrementStatusRevision() noexcept;
   // Caller holds mutex_; pending committed defaults override raw host slots.
-  [[nodiscard]] ParameterValues parameterValuesLocked() const;
+  [[nodiscard]] HostParameterValues parameterValuesLocked() const;
   void deactivateStatus() noexcept;
   // Caller holds mutex_. The callback only schedules message-thread work.
-  void setParameterMappings(std::vector<ParameterMapping> mappings) noexcept;
+  void
+  setParameterMappings(std::vector<ParameterMapping> mappings,
+                       std::vector<ParameterMapping> controls = {}) noexcept;
   void clearPublishedInterface() noexcept;
   void reportFailure(const char *message) noexcept;
   void collectRetired() noexcept;
@@ -203,7 +221,8 @@ private:
   activePublication() const;
   [[nodiscard]] bool updateStatus(const Request &request, std::string message,
                                   bool compiling,
-                                  std::vector<BufferMapping> buffers = {});
+                                  std::vector<BufferMapping> buffers = {},
+                                  bool hasError = false);
   [[nodiscard]] bool matchesDesiredLocked(const Request &request) const;
   [[nodiscard]] bool stillCurrent(const Request &request) const;
   [[nodiscard]] static std::vector<FileStamp>
@@ -222,7 +241,8 @@ private:
   void filesystemChanged(std::vector<std::filesystem::path> paths) noexcept;
   void refreshFilesystemWatcher();
   [[nodiscard]] bool
-  watchedFilesChanged(const std::vector<std::filesystem::path> &paths);
+  watchedFilesChanged(const std::vector<std::filesystem::path> &paths,
+                      bool allowMetadataShortcut = false);
 
   Product product_;
   SpscSlot<PreparedEngine *> &replacements_;
@@ -244,6 +264,8 @@ private:
   PersistedProjectState publishedProjectState_;
   // Belongs to the checkpoint, so survives superseding a pending request.
   std::shared_ptr<SeedValues> publishedSeedValues_;
+  HostParameterValues publishedValues_;
+  HostParameterValues editorDefaults_;
   bool stopping_{};
   bool forceRebuild_{};
   bool retirementCollectionRequested_{};

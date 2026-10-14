@@ -13,12 +13,22 @@ namespace onda::plugin {
 #error "ONDA_PLUGIN_OUTPUT_CHANNELS must be defined by the build system"
 #endif
 
+#ifndef ONDA_PLUGIN_CONTROL_INPUTS
+#error "ONDA_PLUGIN_CONTROL_INPUTS must be defined by the build system"
+#endif
+
 inline constexpr int pluginInputChannels = ONDA_PLUGIN_INPUT_CHANNELS;
+inline constexpr int pluginControlInputs = ONDA_PLUGIN_CONTROL_INPUTS;
+inline constexpr int pluginTotalInputChannels =
+    pluginInputChannels + pluginControlInputs;
+inline constexpr int pluginMainInputBuses = pluginInputChannels > 0 ? 1 : 0;
+inline constexpr int pluginInputBuses = pluginMainInputBuses + pluginControlInputs;
 inline constexpr int pluginOutputChannels = ONDA_PLUGIN_OUTPUT_CHANNELS;
 inline constexpr int pluginPassthroughChannels =
     pluginInputChannels < pluginOutputChannels ? pluginInputChannels
                                                : pluginOutputChannels;
 static_assert(pluginInputChannels >= 0 && pluginInputChannels <= 64);
+static_assert(pluginControlInputs >= 0 && pluginTotalInputChannels <= 64);
 static_assert(pluginOutputChannels >= 1 && pluginOutputChannels <= 64);
 
 enum class Product : std::uint8_t {

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "ControlValue.h"
 #include "ScopeCapture.h"
 
 #include <juce_audio_processors/juce_audio_processors.h>
@@ -12,6 +13,7 @@
 namespace onda::plugin {
 
 class Processor;
+enum class ParamControlLayout : std::uint8_t;
 
 class Editor final : public juce::AudioProcessorEditor, private juce::Timer {
 public:
@@ -43,15 +45,21 @@ private:
   std::uint64_t publishedViewStateRestoreRevision_{};
   int publishedReadyId_{};
   ScopeRevision publishedScopeRevision_{};
-  std::array<float, 32U> publishedSlots_{};
+  std::array<std::uint64_t, 32U> publishedSlotStamps_{};
+  std::array<std::uint64_t, controlCount> publishedControlStamps_{};
+  std::uint64_t publishedBuses_{};
+  ParamControlLayout publishedInputLayout_{};
+  double publishedInputSmoothing_{};
   bool publishedKnobLayout_{};
   double publishedSmoothingSeconds_{};
+  int publishedHostBlockSize_{};
+  int publishedBlockPreference_{};
   bool hasPublished_{};
   bool hasPublishedMidi_{};
   bool hasPublishedScope_{};
   bool scopeCaptureActive_{};
   bool browserReady_{};
-  std::array<bool, 32U> activeGestures_{};
+  std::array<bool, 32U + controlCount> activeGestures_{};
   std::string actionError_;
 
   JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(Editor)

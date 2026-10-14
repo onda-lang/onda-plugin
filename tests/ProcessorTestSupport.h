@@ -10,6 +10,14 @@ namespace onda::plugin {
 // Exercise the same message-thread work as the timer without relying on OS
 // scheduling. Timer delivery itself has a separate integration test.
 struct ProcessorTestAccess {
+  static const float *dryScratchData(const Processor &processor) {
+    if constexpr (pluginPassthroughChannels > 0)
+      return processor.dryScratch_ != nullptr
+                 ? processor.dryScratch_->channel(0)
+                 : nullptr;
+    return nullptr;
+  }
+
   static void service(Processor &processor) {
     if (!juce::MessageManager::getInstance()->isThisTheMessageThread())
       throw std::logic_error("Processor updates require the message thread");

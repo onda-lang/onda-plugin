@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <filesystem>
 #include <string_view>
 
@@ -15,8 +16,12 @@ inline bool isSafeRelativeProjectPath(const std::filesystem::path &path) {
 
 inline bool isOndaProjectPath(const std::filesystem::path &path) {
   const auto extension = path.extension().u8string();
-  return std::string_view(reinterpret_cast<const char *>(extension.data()),
-                          extension.size()) == ".ondaproject";
+  return std::ranges::equal(extension, std::u8string_view{u8".ondaproject"},
+                            [](const char8_t actual, const char8_t expected) {
+                              return (actual >= u8'A' && actual <= u8'Z'
+                                          ? actual + (u8'a' - u8'A')
+                                          : actual) == expected;
+                            });
 }
 
 } // namespace onda::plugin

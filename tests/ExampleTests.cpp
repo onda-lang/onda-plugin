@@ -20,15 +20,12 @@ using onda::plugin::Product;
 using onda::plugin::slotCount;
 
 struct Slots {
-  std::array<std::atomic<float>, slotCount> values{};
-  std::array<std::atomic<float> *, slotCount> pointers{};
+  onda::plugin::ParameterState values;
 
   explicit Slots(const PreparedEngine &engine) {
-    for (std::size_t index = 0; index < values.size(); ++index)
-      pointers[index] = &values[index];
     for (const auto &mapping : engine.parameterMappings())
-      values[static_cast<std::size_t>(mapping.parameterIndex)].store(
-          static_cast<float>(mapping.defaultNormalized));
+      values.set(static_cast<std::size_t>(mapping.parameterIndex),
+                  static_cast<float>(mapping.defaultNormalized));
   }
 };
 
@@ -65,7 +62,7 @@ bool exerciseInstrument(std::string_view relativePath,
   std::array<float, 64> left{};
   std::array<float, 64> right{};
   std::array<float *, 2> outputs{left.data(), right.data()};
-  return engine->process(nullptr, outputs.data(), 64, midi, slots.pointers) &&
+  return engine->process(nullptr, outputs.data(), 64, midi, slots.values) &&
          finite(left) && finite(right) && nonSilent(left) && nonSilent(right);
 }
 
@@ -80,11 +77,12 @@ bool exerciseEffect(std::string_view relativePath, bool expectsTempo) {
   std::array<float, 64> right{};
   left[0] = 0.75F;
   right[0] = -0.5F;
-  std::array<float *, 2> inputs{left.data(), right.data()};
+  std::array<float *, std::max(2, onda::plugin::pluginTotalInputChannels)>
+      inputs{left.data(), right.data()};
   std::array<float *, 2> outputs{left.data(), right.data()};
   HostContext context;
   context.tempo = 93.0;
-  return engine->process(inputs.data(), outputs.data(), 64, {}, slots.pointers,
+  return engine->process(inputs.data(), outputs.data(), 64, {}, slots.values,
                          context) &&
          finite(left) && finite(right) && nonSilent(left) && nonSilent(right);
 }
@@ -119,6 +117,9 @@ int main() {
   };
   for (const auto &effect : effects)
     if (!exerciseEffect(effect.path, effect.expectsTempo))
+      return 1;
+  if constexpr (onda::plugin::pluginControlInputs > 0)
+    if (!exerciseEffect("effects/external_control.onda", false))
       return 1;
 
   std::cout << "onda_example_tests: passed\n";

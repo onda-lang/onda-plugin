@@ -19,7 +19,7 @@
 namespace onda::plugin {
 namespace {
 
-const auto editorBackground = juce::Colour::fromRGB(8, 21, 34);
+const auto editorBackground = juce::Colour::fromRGB(13, 25, 41);
 const auto editorMutedText = juce::Colour::fromRGB(146, 168, 191);
 
 constexpr auto juceHostBridgeScript = R"JS(
@@ -27,7 +27,10 @@ constexpr auto juceHostBridgeScript = R"JS(
   let parameterDomains = new Map();
   let parameterPath = "";
   const activeParameterGestures = new Set();
+  let blockSettingsKey = "";
+  let hostBlockSamples = 0;
   let eventDefinitions = [];
+  let eventGeneration = "0";
 
   function parameterControlKey(parameter) {
     const { value, normalizedValue, ...control } = parameter;
@@ -35,6 +38,10 @@ constexpr auto juceHostBridgeScript = R"JS(
   }
 
   function createParameterDomain(parameter) {
+    if (parameter.rangeMin === parameter.rangeMax) return {
+      normalizedToPlain: () => parameter.rangeMin,
+      plainToNormalized: () => parameter.normalizedValue,
+    };
     return globalThis.__ONDA_PARAM_CONTROL_V2__.createParamDomain({
       name: parameter.name,
       scalar: parameter.type,
@@ -111,7 +118,13 @@ constexpr auto juceHostBridgeScript = R"JS(
         resetEventArguments();
         return;
       }
-      if (message?.type === "setParam") {
+      if (message?.type === "triggerEvent") {
+        message.engineGeneration = eventGeneration;
+      }
+      if (message?.type === "setRunSettings" && message.blockSamples === hostBlockSamples) {
+        message.blockSamples = 0;
+      }
+      if (message?.type === "setParam" || message?.type === "setInputControl") {
         const binding = parameterDomains.get(message.name);
         if (!binding) return;
         message.value = binding.domain.plainToNormalized(message.value);
@@ -122,36 +135,90 @@ constexpr auto juceHostBridgeScript = R"JS(
     },
   };
 
-  document.addEventListener("click", (event) => {
-    const button = event.target?.closest?.("[data-param-layout]");
-    const layout = button?.dataset?.paramLayout;
-    if (layout === "sliders" || layout === "knobs") {
-      window.__JUCE__.backend.emitEvent("ondaCommand", {
-        type: "setParamLayout",
-        layout,
-      });
+  document.addEventListener("DOMContentLoaded", () => {
+    const sampleRate = document.getElementById("run-sample-rate");
+    if (sampleRate) {
+      sampleRate.disabled = true;
+      sampleRate.closest(".param-setting").hidden = true;
     }
+    const runSettings = document.getElementById("file-picker-settings");
+    if (runSettings) runSettings.style.gridTemplateColumns = "minmax(0, 1fr)";
+    const blockLabel = document.querySelector('label[for="run-block-size"]');
+    if (blockLabel) blockLabel.textContent = "Onda Block Size";
+    const input = document.getElementById("param-smoothing-ms");
+    if (input) {
+      input.setAttribute("aria-label", "Editor parameter smoothing duration in milliseconds");
+      input.setAttribute("title", "Smooths editor changes. DAW automation updates at block boundaries. 0 disables smoothing.");
+    }
+    updateBlockSettings({ hostBlockSamples: 0, canSetBlockSize: false });
   });
+
+  function updateBlockSettings(state) {
+    if (!Number.isInteger(state.hostBlockSamples)) return;
+    const select = document.getElementById("run-block-size");
+    if (!select) return;
+    const maximum = state.hostBlockSamples;
+    hostBlockSamples = maximum;
+    const preference = state.preferredBlockSamples ?? 0;
+    const key = `${maximum}:${preference}:${state.canSetBlockSize}`;
+    if (key !== blockSettingsKey) {
+      const options = [];
+      const add = (value, text) => {
+        const option = document.createElement("option");
+        option.value = String(value);
+        option.textContent = text;
+        options.push(option);
+        return option;
+      };
+      add(maximum, maximum > 0 ? `Host (${maximum} samples)` : "Host (waiting)");
+      const sizes = new Set([maximum]);
+      for (const divisor of [2, 4, 8]) {
+        const size = Math.floor(maximum / divisor);
+        if (size > 0 && !sizes.has(size)) {
+          sizes.add(size);
+          add(size, `${size} samples`);
+        }
+      }
+      // Host capacity changes can leave the active fixed size outside these
+      // choices. Display it without offering it as another menu choice.
+      if (preference > 0 && !sizes.has(preference)) {
+        const option = add(preference, preference > maximum
+          ? `${preference} (using ${maximum})` : `${preference} samples`);
+        option.hidden = option.disabled = true;
+      }
+      select.replaceChildren(...options);
+      blockSettingsKey = key;
+    }
+    select.value = String(preference || maximum);
+    select.disabled = state.canSetBlockSize !== true || maximum <= 0;
+    select.title = "Choose before loading a program. Smaller Onda blocks update automation more often and use more CPU.";
+  }
 
   window.__JUCE__.backend.addEventListener("ondaState", (message) => {
     if (message?.type === "state" && Array.isArray(message.state?.events)) {
       eventDefinitions = message.state.events;
+      eventGeneration = message.state.engineGeneration;
     }
-    if (message?.type === "state" && Array.isArray(message.state?.params)) {
-      const nextDomains = new Map();
+    if (message?.type === "state" && (Array.isArray(message.state?.params) || Array.isArray(message.state?.inputControls))) {
       const nextPath = message.state.path ?? parameterPath;
-      for (const parameter of message.state.params) {
-        if (parameter.hostValueDomain !== "normalized") {
-          continue;
-        }
-        try {
-          const domain = createParameterDomain(parameter);
-          nextDomains.set(parameter.name, {
-            domain, controlKey: parameterControlKey(parameter),
-          });
-          parameter.value = domain.normalizedToPlain(parameter.normalizedValue);
-        } catch {
-          // The shared view will surface malformed parameter metadata.
+      const nextDomains = new Map([...parameterDomains].filter(([, binding]) =>
+        nextPath === parameterPath && !Array.isArray(message.state[binding.bank])));
+      for (const [bank, endCommand] of [["params", "endParamGesture"], ["inputControls", "endInputControlGesture"]]) {
+        for (const parameter of message.state[bank] || []) {
+          if (parameter.hostValueDomain !== "normalized") {
+            continue;
+          }
+          try {
+            const domain = createParameterDomain(parameter);
+            nextDomains.set(parameter.name, {
+              domain, controlKey: parameterControlKey(parameter), endCommand, bank,
+            });
+            if (typeof parameter.value !== "number"
+                && !(parameter.type === "i64" && typeof parameter.value === "string"))
+              parameter.value = domain.normalizedToPlain(parameter.normalizedValue);
+          } catch {
+            // The shared view will surface malformed parameter metadata.
+          }
         }
       }
       // The shared view discards obsolete drags without committing their value.
@@ -161,26 +228,17 @@ constexpr auto juceHostBridgeScript = R"JS(
             || nextDomains.get(name).controlKey !== parameterDomains.get(name)?.controlKey) {
           activeParameterGestures.delete(name);
           window.__JUCE__.backend.emitEvent("ondaCommand", {
-            type: "endParamGesture", name,
+            type: parameterDomains.get(name)?.endCommand || "endParamGesture", name,
           });
         }
       }
       parameterDomains = nextDomains;
       parameterPath = nextPath;
     }
-    if (message?.type === "state") {
-      const layout = message.state?.paramLayout;
-      const button =
-        layout === "sliders" || layout === "knobs"
-          ? document.querySelector(`[data-param-layout="${layout}"]`)
-          : null;
-      if (button && button.getAttribute("aria-pressed") !== "true") {
-        button.click();
-      }
-    }
     if (typeof window._onHostMessage === "function") {
       window._onHostMessage(message);
     }
+    if (message?.type === "state") updateBlockSettings(message.state);
   });
 })();
 )JS";
@@ -195,22 +253,37 @@ std::optional<double> number(const juce::var &value) {
                                   : std::nullopt;
 }
 
-std::optional<std::size_t> slotIndex(std::string_view name) {
-  if (!name.starts_with("Slot "))
+std::optional<std::size_t> parameterIndex(std::string_view name,
+                                          const std::string_view prefix,
+                                          const std::size_t count) {
+  if (!name.starts_with(prefix))
     return std::nullopt;
-  const auto numberEnd = name.find_first_not_of("0123456789", 5U);
+  const auto numberEnd = name.find_first_not_of("0123456789", prefix.size());
   const auto numberText =
-      name.substr(5U, numberEnd == std::string_view::npos ? name.size() - 5U
-                                                          : numberEnd - 5U);
+      name.substr(prefix.size(), numberEnd == std::string_view::npos
+                                     ? name.size() - prefix.size()
+                                     : numberEnd - prefix.size());
   std::size_t value{};
   const auto parsed = std::from_chars(
       numberText.data(), numberText.data() + numberText.size(), value);
   if (parsed.ec != std::errc{} ||
       parsed.ptr != numberText.data() + numberText.size() || value == 0U ||
-      value > slotCount) {
+      value > count) {
     return std::nullopt;
   }
   return value - 1U;
+}
+
+std::optional<std::uint64_t> parseGeneration(const juce::var &value) {
+  if (!value.isString())
+    return std::nullopt;
+  const auto text = value.toString().toStdString();
+  std::uint64_t generation{};
+  const auto parsed =
+      std::from_chars(text.data(), text.data() + text.size(), generation);
+  if (parsed.ec != std::errc{} || parsed.ptr != text.data() + text.size())
+    return std::nullopt;
+  return generation;
 }
 
 bool hasBuffer(const WorkerStatus &status, const std::string_view name) {
@@ -321,7 +394,10 @@ void Editor::endParameterGesture(const std::size_t index) {
   if (!activeGestures_[index])
     return;
   activeGestures_[index] = false;
-  processor_.endSlotGesture(index);
+  if (index < slotCount)
+    processor_.endSlotGesture(index);
+  else
+    processor_.endInputControlGesture(index - slotCount);
 }
 
 void Editor::paint(juce::Graphics &graphics) {
@@ -375,16 +451,35 @@ void Editor::publishState(const bool force) {
   const auto revision = processor_.workerStatusRevision();
   const auto logRevision = processor_.runtimeLogRevision();
   const auto viewStateRestoreRevision = processor_.viewStateRestoreRevision();
-  std::array<float, slotCount> currentSlots{};
+  std::array<std::uint64_t, slotCount> currentSlots{};
   for (std::size_t index = 0; index < currentSlots.size(); ++index)
-    currentSlots[index] = processor_.slotValue(index);
+    currentSlots[index] = processor_.slotStamp(index);
+  std::array<std::uint64_t, controlCount> currentControls{};
+  std::uint64_t currentBuses{};
+  for (std::size_t index = 0; index < controlCount; ++index) {
+    currentControls[index] = processor_.inputControlStamp(index);
+    if (processor_.getChannelCountOfBus(true, pluginMainInputBuses +
+                                                  static_cast<int>(index)) != 0)
+      currentBuses |= std::uint64_t{1} << index;
+  }
+  const auto currentInputLayout = processor_.inputControlLayout();
+  const auto currentInputSmoothing = processor_.inputControlSmoothingSeconds();
   const auto currentKnobLayout =
       processor_.paramControlLayout() == ParamControlLayout::knobs;
   const auto currentSmoothingSeconds = processor_.paramSmoothingSeconds();
+  const auto currentHostBlockSize = processor_.hostBlockSize();
+  const auto currentBlockPreference = processor_.preferredBlockSize();
   if (!force && hasPublished_ && revision == publishedRevision_ &&
-      logRevision == publishedLogRevision_ && currentSlots == publishedSlots_ &&
+      logRevision == publishedLogRevision_ &&
+      currentSlots == publishedSlotStamps_ &&
+      currentControls == publishedControlStamps_ &&
+      currentBuses == publishedBuses_ &&
+      currentInputLayout == publishedInputLayout_ &&
+      std::is_eq(currentInputSmoothing <=> publishedInputSmoothing_) &&
       currentKnobLayout == publishedKnobLayout_ &&
       std::is_eq(currentSmoothingSeconds <=> publishedSmoothingSeconds_) &&
+      currentHostBlockSize == publishedHostBlockSize_ &&
+      currentBlockPreference == publishedBlockPreference_ &&
       viewStateRestoreRevision == publishedViewStateRestoreRevision_) {
     return;
   }
@@ -400,9 +495,15 @@ void Editor::publishState(const bool force) {
   publishedEngineGeneration_ = status.engineGeneration;
   publishedRevision_ = status.revision;
   publishedLogRevision_ = logRevision;
-  publishedSlots_ = currentSlots;
+  publishedSlotStamps_ = currentSlots;
+  publishedControlStamps_ = currentControls;
+  publishedBuses_ = currentBuses;
+  publishedInputLayout_ = currentInputLayout;
+  publishedInputSmoothing_ = currentInputSmoothing;
   publishedKnobLayout_ = currentKnobLayout;
   publishedSmoothingSeconds_ = currentSmoothingSeconds;
+  publishedHostBlockSize_ = currentHostBlockSize;
+  publishedBlockPreference_ = currentBlockPreference;
   publishedViewStateRestoreRevision_ = viewStateRestoreRevision;
   hasPublished_ = true;
   auto message =
@@ -520,7 +621,31 @@ void Editor::handleCommand(const juce::var &command) {
     actionError_.clear();
     processor_.unload();
   } else if (type == "resetParams") {
-    processor_.resetParametersToDefaults();
+    processor_.resetParametersToDefaults(ParameterReset::parameters);
+  } else if (type == "resetInputControls") {
+    processor_.resetParametersToDefaults(ParameterReset::controls);
+  } else if (type == "setInputControlSmoothing") {
+    const auto milliseconds = number(input->getProperty("milliseconds"));
+    actionError_ = milliseconds && processor_.setInputControlSmoothingSeconds(
+                                       *milliseconds / 1000.0)
+                       ? std::string{}
+                       : "Input control smoothing duration must be finite and "
+                         "non-negative";
+    publishState(true);
+  } else if (type == "setInputControlLayout") {
+    const auto layout = input->getProperty("layout").toString();
+    if (layout == "sliders" || layout == "knobs")
+      processor_.setInputControlLayout(layout == "knobs"
+                                           ? ParamControlLayout::knobs
+                                           : ParamControlLayout::sliders);
+  } else if (type == "setRunSettings") {
+    const auto samples = input->getProperty("blockSamples");
+    actionError_ = samples.isInt() && processor_.setPreferredBlockSize(
+                                          static_cast<int>(samples))
+                       ? std::string{}
+                       : "Unload the program before choosing an Onda block "
+                         "size within the host limit";
+    publishState(true);
   } else if (type == "setParamSmoothing") {
     const auto milliseconds = number(input->getProperty("milliseconds"));
     actionError_ = milliseconds && processor_.setParamSmoothingSeconds(
@@ -532,9 +657,14 @@ void Editor::handleCommand(const juce::var &command) {
   } else if (type == "reset") {
     processor_.requestUserReset();
   } else if (type == "triggerEvent") {
-    auto error = processor_.triggerEvent(
-        input->getProperty("name").toString().toStdString(),
-        input->getProperty("values"));
+    const auto generation =
+        parseGeneration(input->getProperty("engineGeneration"));
+    auto error = generation
+                     ? processor_.triggerEvent(
+                           *generation,
+                           input->getProperty("name").toString().toStdString(),
+                           input->getProperty("values"))
+                     : "Invalid Onda event generation";
     if (error != actionError_) {
       actionError_ = std::move(error);
       publishState(true);
@@ -568,24 +698,42 @@ void Editor::handleCommand(const juce::var &command) {
     const auto name = input->getProperty("name").toString().toStdString();
     if (hasBuffer(processor_.workerStatus(), name))
       processor_.clearBuffer(name);
-  } else if (type == "endParamGesture") {
-    if (const auto index =
-            slotIndex(input->getProperty("name").toString().toStdString()))
-      endParameterGesture(*index);
-  } else if (type == "setParam") {
-    const auto index =
-        slotIndex(input->getProperty("name").toString().toStdString());
-    const auto value = number(input->getProperty("value"));
-    if (index && value) {
-      const auto commit = static_cast<bool>(input->getProperty("commit"));
-      if (!activeGestures_[*index]) {
-        processor_.beginSlotGesture(*index);
-        activeGestures_[*index] = true;
-      }
-      processor_.setSlotValue(*index, static_cast<float>(*value));
-      if (commit)
-        endParameterGesture(*index);
+  } else if (type == "endParamGesture" || type == "endInputControlGesture" ||
+             type == "setParam" || type == "setInputControl") {
+    const auto controls =
+        type == "endInputControlGesture" || type == "setInputControl";
+    const auto lane = parameterIndex(
+        input->getProperty("name").toString().toStdString(),
+        controls ? "Input " : "Slot ", controls ? controlCount : slotCount);
+    if (!lane)
+      return;
+    const auto index = *lane + (controls ? slotCount : 0U);
+    if (type.startsWith("end")) {
+      endParameterGesture(index);
+      return;
     }
+    if (controls &&
+        processor_.getChannelCountOfBus(
+            true, pluginMainInputBuses + static_cast<int>(*lane)) != 0) {
+      endParameterGesture(index);
+      return;
+    }
+    const auto value = number(input->getProperty("value"));
+    if (!value)
+      return;
+    if (!activeGestures_[index]) {
+      if (controls)
+        processor_.beginInputControlGesture(*lane);
+      else
+        processor_.beginSlotGesture(*lane);
+      activeGestures_[index] = true;
+    }
+    if (controls)
+      processor_.setInputControlValue(*lane, static_cast<float>(*value));
+    else
+      processor_.setSlotValue(*lane, static_cast<float>(*value));
+    if (static_cast<bool>(input->getProperty("commit")))
+      endParameterGesture(index);
   }
 }
 

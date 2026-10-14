@@ -49,9 +49,9 @@ if(NOT JUCE_REVISION MATCHES "^[0-9a-f]+$" OR
     message(FATAL_ERROR "Invalid JUCE revision '${JUCE_REVISION}'")
 endif()
 
-# Apple Silicon first shipped with macOS 11.
+# The shared run view requires Safari 17, bundled with macOS 14.
 if(CMAKE_HOST_APPLE AND NOT DEFINED CMAKE_OSX_DEPLOYMENT_TARGET)
-    set(CMAKE_OSX_DEPLOYMENT_TARGET "11.0" CACHE STRING "Minimum macOS version")
+    set(CMAKE_OSX_DEPLOYMENT_TARGET "14.0" CACHE STRING "Minimum macOS version")
 endif()
 project(onda-plugin VERSION "${ONDA_PLUGIN_VERSION}" LANGUAGES C CXX)
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
@@ -59,8 +59,8 @@ set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/onda-version"
     "${CMAKE_CURRENT_SOURCE_DIR}/plugin-version")
 
-if(APPLE AND CMAKE_OSX_DEPLOYMENT_TARGET VERSION_LESS "11.0")
-    message(FATAL_ERROR "Apple Silicon requires macOS 11.0 or later")
+if(APPLE AND CMAKE_OSX_DEPLOYMENT_TARGET VERSION_LESS "14.0")
+    message(FATAL_ERROR "The Onda plugin editor requires macOS 14.0 or later")
 endif()
 
 if(MSVC)
@@ -73,7 +73,9 @@ include(CTest)
 
 option(ONDA_PLUGIN_BUILD_TESTS "Build the headless integration tests" ON)
 set(ONDA_PLUGIN_INPUT_CHANNELS "2" CACHE STRING
-    "Number of audio input channels exposed by each VST3")
+    "Number of main audio input channels exposed by each VST3")
+set(ONDA_PLUGIN_CONTROL_INPUTS "16" CACHE STRING
+    "Number of optional mono external control input buses")
 set(ONDA_PLUGIN_OUTPUT_CHANNELS "2" CACHE STRING
     "Number of audio output channels exposed by each VST3")
 
@@ -89,7 +91,13 @@ function(validate_channel_count variable minimum)
 endfunction()
 
 validate_channel_count(ONDA_PLUGIN_INPUT_CHANNELS 0)
+validate_channel_count(ONDA_PLUGIN_CONTROL_INPUTS 0)
 validate_channel_count(ONDA_PLUGIN_OUTPUT_CHANNELS 1)
+math(EXPR ONDA_PLUGIN_TOTAL_INPUT_CHANNELS
+    "${ONDA_PLUGIN_INPUT_CHANNELS} + ${ONDA_PLUGIN_CONTROL_INPUTS}")
+if(ONDA_PLUGIN_TOTAL_INPUT_CHANNELS GREATER 64)
+    message(FATAL_ERROR "Main audio and control inputs together must not exceed 64 channels")
+endif()
 
 set(ONDA_SDK_ARCHIVE "" CACHE FILEPATH
     "Optional pre-downloaded archive for the pinned Onda release SDK")
@@ -105,7 +113,8 @@ set(ONDA_VST3_VALIDATOR "" CACHE FILEPATH
 
 message(STATUS
     "Building Onda VST3 ${PROJECT_VERSION} with Onda SDK ${ONDA_VERSION} "
-    "(${ONDA_PLUGIN_INPUT_CHANNELS} inputs, ${ONDA_PLUGIN_OUTPUT_CHANNELS} outputs)")
+    "(${ONDA_PLUGIN_INPUT_CHANNELS} main inputs, ${ONDA_PLUGIN_CONTROL_INPUTS} control inputs, "
+    "${ONDA_PLUGIN_OUTPUT_CHANNELS} outputs)")
 
 if(WIN32 AND CMAKE_SIZEOF_VOID_P EQUAL 8)
     set(ONDA_SDK_PLATFORM "windows-x64")
@@ -317,6 +326,8 @@ if(NOT MSVC)
     set_property(SOURCE ${ONDA_JUCE_MODULE_SOURCES} APPEND PROPERTY
         COMPILE_OPTIONS -w)
 endif()
+
+include(cmake/OndaVst3Automation.cmake)
 if(MSVC)
     # MSVC /O2 and /Ox can break JUCE's WebView2 COM callbacks. Source options
     # follow target options, so only this JUCE compilation unit uses /O1 and
@@ -419,16 +430,25 @@ copy_onda_release_license(
     "${ONDA_JUCE_SOURCE_DIR}/modules/juce_graphics/unicode/sheenbidi/LICENSE"
     "SheenBidi-LICENSE.txt")
 
+include(cmake/OndaRunView.cmake)
 juce_add_binary_data(onda_run_resources
     NAMESPACE OndaRunResources
     HEADER_NAME OndaRunResources.h
     SOURCES
-        "${ONDA_RELEASE_SOURCE_DIR}/ui/run/run.html"
+        "${onda_run_view_html}"
         "${ONDA_RELEASE_SOURCE_DIR}/ui/number-input.js"
         "${ONDA_RELEASE_SOURCE_DIR}/packages/onda_processor_abi/src/param-control.js"
 )
 
 add_library(onda_plugin_engine STATIC
+    src/ParameterAutomation.cpp
+    src/ParameterAutomation.h
+    src/ParameterMapping.h
+    src/ParameterState.h
+    src/ScalarValue.h
+    src/ControlValue.h
+    src/ControlState.h
+    src/HostAutomation.h
     src/AudioFile.cpp
     src/AudioFile.h
     src/Engine.cpp
@@ -441,6 +461,7 @@ add_library(onda_plugin_engine STATIC
     src/OndaSdk.h
     src/Primitive.h
     src/ParameterRamp.h
+    src/LinearInterpolation.h
     src/ProjectExport.cpp
     src/ProjectExport.h
     src/Product.h
@@ -459,6 +480,7 @@ onda_treat_juce_headers_as_system(onda_plugin_engine)
 target_compile_definitions(onda_plugin_engine PUBLIC
     JUCE_USE_CURL=0
     ONDA_PLUGIN_INPUT_CHANNELS=${ONDA_PLUGIN_INPUT_CHANNELS}
+    ONDA_PLUGIN_CONTROL_INPUTS=${ONDA_PLUGIN_CONTROL_INPUTS}
     ONDA_PLUGIN_OUTPUT_CHANNELS=${ONDA_PLUGIN_OUTPUT_CHANNELS}
 )
 # Keep engine, codec, and embedded-resource symbols private to each module.
@@ -499,11 +521,14 @@ function(add_onda_plugin target product_name plugin_code is_synth)
         src/Editor.cpp
         src/Editor.h
         src/JucePath.h
+        src/HostParameter.h
         src/PluginEntry.cpp
         src/Processor.cpp
         src/Processor.h
         src/RunViewHost.cpp
         src/RunViewHost.h
+        src/Vst3Automation.cpp
+        src/Vst3Automation.h
         src/ScopeCapture.h
         src/StateFormat.h
         src/SpscQueue.h
@@ -552,6 +577,16 @@ if(BUILD_TESTING AND ONDA_PLUGIN_BUILD_TESTS)
         add_test(NAME onda_editor_bridge_tests
             COMMAND "${ONDA_NODE_EXECUTABLE}"
                 "${CMAKE_CURRENT_SOURCE_DIR}/tests/EditorBridgeTests.mjs")
+        find_program(ONDA_FIREFOX_EXECUTABLE NAMES firefox)
+        if(ONDA_FIREFOX_EXECUTABLE)
+            add_test(NAME onda_run_view_parameter_tests
+                COMMAND "${ONDA_NODE_EXECUTABLE}"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/tests/RunViewParameterTests.mjs"
+                    "${onda_run_view_html}"
+                    "${ONDA_RELEASE_SOURCE_DIR}/ui/number-input.js"
+                    "${ONDA_RELEASE_SOURCE_DIR}/packages/onda_processor_abi/src/param-control.js"
+                    "${ONDA_FIREFOX_EXECUTABLE}")
+        endif()
     endif()
 
     add_executable(onda_example_tests tests/ExampleTests.cpp)
@@ -590,13 +625,27 @@ if(BUILD_TESTING AND ONDA_PLUGIN_BUILD_TESTS)
 
     add_executable(onda_processor_tests
         tests/ProcessorTests.cpp
+        tests/BypassTests.cpp
+        tests/BlockProcessingTests.cpp
+        tests/AutomationSeedingTests.cpp
+        tests/ScratchHandoffTests.cpp
+        tests/ControlInputTests.cpp
+        tests/ControlAutomationTests.cpp
+        tests/ControlRenderingTests.cpp
+        tests/InputControlEditorTests.cpp
+        tests/UnrangedParameterTests.cpp
+        tests/ParameterLifecycleTests.cpp
+        tests/ParameterDefaultTests.cpp
         src/Editor.cpp
         src/Editor.h
         src/JucePath.h
+        src/HostParameter.h
         src/Processor.cpp
         src/Processor.h
         src/RunViewHost.cpp
         src/RunViewHost.h
+        src/Vst3Automation.cpp
+        src/Vst3Automation.h
         src/SpscQueue.h
     )
     target_compile_features(onda_processor_tests PRIVATE cxx_std_20)
@@ -644,9 +693,34 @@ if(BUILD_TESTING AND ONDA_PLUGIN_BUILD_TESTS)
     if(ONDA_PLUGIN_INPUT_CHANNELS EQUAL 2 AND
             ONDA_PLUGIN_OUTPUT_CHANNELS EQUAL 2)
         add_test(NAME onda_processor_tests COMMAND onda_processor_tests)
+    else()
+        add_test(NAME onda_bypass_transition_tests COMMAND onda_processor_tests BypassTransitions)
+        add_test(NAME onda_callback_processing_tests COMMAND onda_processor_tests CallbackProcessing)
+        add_test(NAME onda_callback_smoothing_tests COMMAND onda_processor_tests CallbackSmoothing)
+        add_test(NAME onda_control_input_tests COMMAND onda_processor_tests ControlInputs)
+        add_test(NAME onda_input_control_editor_tests COMMAND onda_processor_tests InputControlEditor)
+        add_test(NAME onda_unranged_parameter_tests COMMAND onda_processor_tests UnrangedParameters)
+        add_test(NAME onda_control_automation_tests COMMAND onda_processor_tests ControlAutomation)
+        add_test(NAME onda_control_rendering_tests COMMAND onda_processor_tests ControlRendering)
+        add_test(NAME onda_new_control_default_tests COMMAND onda_processor_tests NewControlDefaults)
+        add_test(NAME onda_parameter_endpoint_precision_tests COMMAND onda_processor_tests ParameterEndpointPrecision)
+        add_test(NAME onda_parameter_default_precision_tests COMMAND onda_processor_tests ParameterDefaultPrecision)
+        add_test(NAME onda_control_endpoint_precision_tests COMMAND onda_processor_tests ControlEndpointPrecision)
+        add_test(NAME onda_control_default_precision_tests COMMAND onda_processor_tests ControlDefaultPrecision)
+        add_test(NAME onda_seed_notification_thread_tests COMMAND onda_processor_tests SeedNotificationThreads)
+        add_test(NAME onda_parameter_default_notification_tests COMMAND onda_processor_tests ParameterDefaultNotifications)
+        add_test(NAME onda_automation_after_unload_tests COMMAND onda_processor_tests AutomationAfterUnload)
+        add_test(NAME onda_automation_flush_after_unload_tests COMMAND onda_processor_tests AutomationFlushAfterUnload)
+        add_test(NAME onda_automation_flush_after_fault_tests COMMAND onda_processor_tests AutomationFlushAfterFault)
+        add_test(NAME onda_automation_echo_work_tests COMMAND onda_processor_tests AutomationEchoWork)
+        add_test(NAME onda_unloaded_endpoint_precision_tests COMMAND onda_processor_tests UnloadedEndpointPrecision)
+        add_test(NAME onda_unloaded_default_precision_tests COMMAND onda_processor_tests UnloadedDefaultPrecision)
     endif()
 
-    add_executable(onda_vst3_smoke tests/Vst3Smoke.cpp)
+    add_executable(onda_vst3_smoke
+        tests/Vst3Smoke.cpp
+        tests/Vst3AutomationTests.cpp
+    )
     target_include_directories(onda_vst3_smoke PRIVATE src)
     target_compile_features(onda_vst3_smoke PRIVATE cxx_std_20)
     target_link_libraries(onda_vst3_smoke PRIVATE
@@ -659,10 +733,12 @@ if(BUILD_TESTING AND ONDA_PLUGIN_BUILD_TESTS)
     target_compile_definitions(onda_vst3_smoke PRIVATE
         ONDA_PLUGIN_VERSION="${PROJECT_VERSION}"
         ONDA_PLUGIN_INPUT_CHANNELS=${ONDA_PLUGIN_INPUT_CHANNELS}
+        ONDA_PLUGIN_CONTROL_INPUTS=${ONDA_PLUGIN_CONTROL_INPUTS}
         ONDA_PLUGIN_OUTPUT_CHANNELS=${ONDA_PLUGIN_OUTPUT_CHANNELS}
         JUCE_PLUGINHOST_AU=0
         JUCE_PLUGINHOST_LADSPA=0
         JUCE_PLUGINHOST_LV2=0
+        JUCE_MODAL_LOOPS_PERMITTED=1
         JUCE_PLUGINHOST_VST=0
         JUCE_PLUGINHOST_VST3=1
         JUCE_USE_CURL=0
@@ -683,6 +759,15 @@ if(BUILD_TESTING AND ONDA_PLUGIN_BUILD_TESTS)
             "$<TARGET_FILE:OndaSynth_VST3>"
             "$<TARGET_FILE:OndaFX_VST3>"
     )
+
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        add_library(onda_vst3_realtime_audit SHARED tests/Vst3RealtimeAudit.cpp)
+        target_compile_features(onda_vst3_realtime_audit PRIVATE cxx_std_20)
+        target_link_libraries(onda_vst3_realtime_audit PRIVATE ${CMAKE_DL_LIBS})
+        add_dependencies(onda_vst3_smoke onda_vst3_realtime_audit)
+        set_tests_properties(onda_vst3_smoke PROPERTIES ENVIRONMENT
+            "LD_PRELOAD=$<TARGET_FILE:onda_vst3_realtime_audit>;ONDA_REQUIRE_VST3_AUDIT=1")
+    endif()
 
     if(ONDA_VST3_VALIDATOR)
         if(NOT EXISTS "${ONDA_VST3_VALIDATOR}")

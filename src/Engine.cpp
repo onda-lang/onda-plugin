@@ -8,7 +8,6 @@
 #include <bit>
 #include <charconv>
 #include <cmath>
-#include <cstdio>
 #include <cstring>
 #include <limits>
 #include <numeric>
@@ -16,10 +15,6 @@
 #include <string_view>
 #include <type_traits>
 #include <utility>
-
-#if defined(__APPLE__)
-#include <xlocale.h>
-#endif
 
 namespace onda::plugin {
 namespace {
@@ -31,6 +26,14 @@ static_assert(sizeof(std::int64_t) == 8U);
 
 constexpr std::size_t runtimeBatchCapacity = 64U * 1024U;
 constexpr std::size_t maximumPendingLogEntries = runtimeLogQueueCapacity - 1U;
+
+template <typename Unsigned>
+Unsigned readLittleEndian(const std::uint8_t *bytes) noexcept {
+  Unsigned value{};
+  for (std::size_t index = 0; index < sizeof(Unsigned); ++index)
+    value |= static_cast<Unsigned>(bytes[index]) << (index * 8U);
+  return value;
+}
 
 Diagnostic error(std::string message) {
   Diagnostic result;
@@ -126,17 +129,15 @@ std::optional<ParameterMapping> parameterMapping(const onda_program_t *program,
                                                  const int index) {
   if (onda_param_array_len(program, index) != 1)
     return std::nullopt;
+  const auto *declaredType = onda_param_type(program, index);
+  if (declaredType == nullptr ||
+      std::string_view{declaredType}.find('[') != std::string_view::npos)
+    return std::nullopt;
   const auto primitive = onda_param_elem_type(program, index);
   const auto type = primitiveName(primitive);
   const auto unit = parameterUnit(program, index);
   if (type.empty() || !unit)
     return std::nullopt;
-
-  const auto plain = onda_param_normalized_to_plain(program, index, 0.5);
-  if (!std::isfinite(plain) ||
-      !std::isfinite(onda_param_plain_to_normalized(program, index, plain))) {
-    return std::nullopt;
-  }
 
   ParameterMapping mapping;
   mapping.parameterIndex = index;
@@ -145,31 +146,18 @@ std::optional<ParameterMapping> parameterMapping(const onda_program_t *program,
   if (const auto *name = onda_param_name(program, index))
     mapping.name = name;
 
-  mapping.defaultPlain = onda_param_default_f64(program, index);
-  const auto normalizedDefault =
-      onda_param_plain_to_normalized(program, index, mapping.defaultPlain);
-  if (!std::isfinite(mapping.defaultPlain) ||
-      !std::isfinite(normalizedDefault)) {
-    return std::nullopt;
-  }
-  mapping.defaultNormalized = std::clamp(normalizedDefault, 0.0, 1.0);
-
-  if (primitive == ONDA_PRIMITIVE_BOOL) {
-    mapping.rangeMin = 0.0;
-    mapping.rangeMax = 1.0;
-    return mapping;
-  }
-
-  if (onda_param_has_range(program, index) != 1)
-    return std::nullopt;
-  mapping.rangeMin = onda_param_range_min_f64(program, index);
-  mapping.rangeMax = onda_param_range_max_f64(program, index);
+  const auto ranged = onda_param_has_range(program, index) == 1;
+  mapping.defaultMayExceedRange = !ranged && primitive != ONDA_PRIMITIVE_BOOL;
+  // This is the plugin's control domain; it adds no range to Onda's storage.
+  mapping.rangeMin = ranged ? onda_param_range_min_f64(program, index) : 0.0;
+  mapping.rangeMax = ranged ? onda_param_range_max_f64(program, index) : 1.0;
   if (!std::isfinite(mapping.rangeMin) || !std::isfinite(mapping.rangeMax) ||
       mapping.rangeMin >= mapping.rangeMax) {
     return std::nullopt;
   }
 
-  const auto scale = onda_param_scale(program, index);
+  const auto scale =
+      ranged ? onda_param_scale(program, index) : ONDA_PARAM_SCALE_LINEAR;
   if (scale == ONDA_PARAM_SCALE_LINEAR)
     mapping.scale = "linear";
   else if (scale == ONDA_PARAM_SCALE_LOG)
@@ -197,7 +185,34 @@ std::optional<ParameterMapping> parameterMapping(const onda_program_t *program,
       return std::nullopt;
     mapping.step = step;
     mapping.stepCount = stepCount;
+  } else if (!ranged && (primitive == ONDA_PRIMITIVE_I32 ||
+                         primitive == ONDA_PRIMITIVE_I64)) {
+    mapping.step = 1.0;
+    mapping.stepCount = 1;
   }
+
+  const auto hasDefault = onda_param_has_default(program, index) == 1;
+  if (primitive == ONDA_PRIMITIVE_I64 && hasDefault) {
+    // Unranged i64 defaults retain the full integer width through the raw API.
+    std::array<std::uint8_t, sizeof(std::int64_t)> bytes{};
+    if (onda_param_default_bytes(program, index, bytes.data(),
+                                 static_cast<int>(bytes.size())) !=
+        static_cast<int>(bytes.size()))
+      return std::nullopt;
+    mapping.defaultPlain =
+        std::bit_cast<std::int64_t>(readLittleEndian<std::uint64_t>(bytes.data()));
+  } else {
+    mapping.defaultPlain =
+        hasDefault ? onda_param_default_f64(program, index)
+                   : std::clamp(0.0, mapping.rangeMin, mapping.rangeMax);
+  }
+  const auto defaultNumber = scalarPlainNumber(mapping.defaultPlain);
+  if (!std::isfinite(defaultNumber))
+    return std::nullopt;
+  mapping.defaultNormalized = mapping.plainToNormalized(defaultNumber);
+  if (!std::isfinite(mapping.defaultNormalized) ||
+      !std::isfinite(mapping.normalizedToPlain(0.5)))
+    return std::nullopt;
   return mapping;
 }
 
@@ -426,29 +441,6 @@ bool appendNumber(RuntimeLogEntry &entry, const Value value) noexcept {
          appendText(entry, {text.data(), converted.ptr});
 }
 
-#if defined(__APPLE__)
-template <typename Value>
-  requires std::is_floating_point_v<Value>
-bool appendNumber(RuntimeLogEntry &entry, const Value value) noexcept {
-  // Floating-point to_chars requires macOS 13.3. The null locale selects
-  // the C locale, and max_digits10 preserves enough digits to round-trip.
-  std::array<char, 64U> text{};
-  const auto written = ::snprintf_l(text.data(), text.size(), nullptr, "%.*g",
-                                    std::numeric_limits<Value>::max_digits10,
-                                    static_cast<double>(value));
-  return written > 0 && static_cast<std::size_t>(written) < text.size() &&
-         appendText(entry, {text.data(), static_cast<std::size_t>(written)});
-}
-#endif
-
-template <typename Unsigned>
-Unsigned readLittleEndian(const std::uint8_t *bytes) noexcept {
-  Unsigned value{};
-  for (std::size_t index = 0; index < sizeof(Unsigned); ++index)
-    value |= static_cast<Unsigned>(bytes[index]) << (index * 8U);
-  return value;
-}
-
 bool appendPayloadScalar(RuntimeLogEntry &entry, const PayloadScalar scalar,
                          const std::uint8_t *bytes) noexcept {
   switch (scalar) {
@@ -607,6 +599,85 @@ PreparedEngine::PreparedEngine(
       bufferStorage_(std::move(bufferStorage)), instance_(std::move(instance)),
       bufferMappings_(std::move(bufferMappings)) {
   smoothedParameterTypes_.fill(-1);
+}
+
+bool PreparedEngine::prepareInputDefaults(Diagnostic &diagnostic) {
+  const auto controls = static_cast<std::size_t>(
+      std::max(inputChannels_ - pluginInputChannels, 0));
+  controlMappings_.reserve(controls);
+  for (int index = 0; index < onda_input_count(program_.get()); ++index) {
+    const auto offset = onda_input_slot_offset(program_.get(), index);
+    const auto length = onda_input_array_len(program_.get(), index);
+    if (offset < 0 || length <= 0 || offset > inputChannels_ - length) {
+      diagnostic = error("Onda returned invalid flattened input metadata");
+      return false;
+    }
+    if (offset + length <= pluginInputChannels)
+      continue;
+    const auto *name = onda_input_name(program_.get(), index);
+    const auto *type = onda_input_type(program_.get(), index);
+    if (name == nullptr || type == nullptr) {
+      diagnostic = error("Onda returned invalid input names/types");
+      return false;
+    }
+    const auto array =
+        std::string_view{type}.find('[') != std::string_view::npos;
+    const auto hasDefault = onda_input_has_default(program_.get(), index) == 1;
+    const auto value =
+        hasDefault ? onda_input_default_f64(program_.get(), index) : 0.0;
+    // The SDK exposes scalar defaults only. Array defaults return NaN.
+    if (!std::isfinite(value) || !std::isfinite(static_cast<float>(value))) {
+      diagnostic = error("External control input '" + std::string{name} +
+                         "' defaults must be finite scalars; declare separate "
+                         "scalar inputs for array defaults");
+      return false;
+    }
+    const auto ranged = onda_input_has_range(program_.get(), index) == 1;
+    // Unranged controls use a unit interval extended to include their default.
+    const auto minimum = ranged
+                             ? onda_input_range_min_f64(program_.get(), index)
+                             : std::min(0.0, value);
+    const auto maximum = ranged
+                             ? onda_input_range_max_f64(program_.get(), index)
+                             : std::max(1.0, value);
+    if (!std::isfinite(minimum) || !std::isfinite(maximum) ||
+        minimum > maximum || !std::isfinite(static_cast<float>(minimum)) ||
+        !std::isfinite(static_cast<float>(maximum))) {
+      diagnostic =
+          error("External control input ranges must be finite f32 ranges");
+      return false;
+    }
+    const auto defaultPlain = std::clamp(value, minimum, maximum);
+    const auto normalized = maximum > minimum
+                                ? (defaultPlain - minimum) / (maximum - minimum)
+                                : 0.0;
+    for (int element = std::max(pluginInputChannels - offset, 0);
+         element < length; ++element) {
+      const auto channel = offset + element;
+      const auto control =
+          static_cast<std::size_t>(channel - pluginInputChannels);
+      if (control != controlMappings_.size()) {
+        diagnostic =
+            error("Onda returned invalid flattened control input metadata");
+        return false;
+      }
+      inputDefaults_[static_cast<std::size_t>(channel)] =
+          static_cast<float>(defaultPlain);
+      controlMinimum_[control] = minimum;
+      controlMaximum_[control] = maximum;
+      ParameterMapping mapping;
+      mapping.name = std::string{name} +
+                     (array ? "[" + std::to_string(element) + "]" : "");
+      mapping.type = "f32";
+      mapping.defaultNormalized = normalized;
+      mapping.defaultPlain = defaultPlain;
+      mapping.rangeMin = minimum;
+      mapping.rangeMax = maximum;
+      resolvedControlValues_[control] = mapping.controlDefault();
+      controlMappings_.push_back(std::move(mapping));
+    }
+  }
+  return true;
 }
 
 bool PreparedEngine::prepareRuntimeOutput(Diagnostic &diagnostic) {
@@ -931,7 +1002,7 @@ PreparedEngine::build(CompileResult compiled, const Product product,
 
   Diagnostic diagnostic;
   const auto inputs = flattenedChannels(compiled.program.get(), true,
-                                        pluginInputChannels, diagnostic);
+                                        pluginTotalInputChannels, diagnostic);
   const auto outputs = flattenedChannels(compiled.program.get(), false,
                                          pluginOutputChannels, diagnostic);
   if (inputs < 0 || outputs < 0) {
@@ -982,6 +1053,10 @@ PreparedEngine::build(CompileResult compiled, const Product product,
       }
     }
 
+    const auto asset = std::ranges::find(compiled.projectBuffers, mapping.name,
+                                         &ProjectBufferInfo::name);
+    mapping.hasProjectDefault =
+        hasProjectDefaults && asset != compiled.projectBuffers.end();
     const auto binding = std::ranges::find(bufferBindings, mapping.name,
                                            &BufferFileBinding::name);
     if (binding == bufferBindings.end() || binding->path.empty()) {
@@ -992,18 +1067,15 @@ PreparedEngine::build(CompileResult compiled, const Product product,
         continue;
       }
 
-      const auto asset = std::ranges::find(
-          compiled.projectBuffers, mapping.name, &ProjectBufferInfo::name);
       if (asset == compiled.projectBuffers.end()) {
         if (bufferError.empty())
           bufferError =
               "Buffer '" + mapping.name + "' is missing from the saved project";
-      } else if (asset->elementType != ONDA_PRIMITIVE_F32 ||
-                 asset->frames > std::numeric_limits<int>::max() ||
+      } else if (asset->frames > std::numeric_limits<int>::max() ||
                  asset->channels > std::numeric_limits<int>::max()) {
         if (bufferError.empty())
           bufferError = "Saved project buffer '" + mapping.name +
-                        "' is not a supported f32 audio buffer";
+                        "' has unsupported dimensions";
       } else {
         mapping.loadedFrames = static_cast<int>(asset->frames);
         mapping.loadedChannels = static_cast<int>(asset->channels);
@@ -1112,7 +1184,8 @@ PreparedEngine::build(CompileResult compiled, const Product product,
       inputs, outputs, std::move(inputSlab), std::move(outputSlab),
       std::move(bufferStorage), std::move(bufferMappings)));
 
-  if (!engine->prepareRuntimeOutput(result.diagnostic))
+  if (!engine->prepareInputDefaults(result.diagnostic) ||
+      !engine->prepareRuntimeOutput(result.diagnostic))
     return result;
   if (!bindAudio(engine->instance_.get(), engine->program_.get(),
                  engine->inputSlab_, true, blockSize, result.diagnostic) ||
@@ -1151,6 +1224,9 @@ PreparedEngine::build(CompileResult compiled, const Product product,
     if (!mapping->stepCount &&
         (primitive == ONDA_PRIMITIVE_F32 || primitive == ONDA_PRIMITIVE_F64))
       engine->smoothedParameterTypes_[slot] = primitive;
+    engine->parameterDomains_[slot] = mapping->scalarDomain();
+    engine->parameterHostDomains_[slot] = mapping->hostDomain();
+    engine->resolvedParameterValues_[slot] = mapping->parameterDefault();
     engine->parameterMappings_[slot] = std::move(*mapping);
   }
 
@@ -1211,74 +1287,173 @@ PreparedEngine::build(CompileResult compiled, const Product product,
 }
 
 void PreparedEngine::applyParameter(const std::size_t slot,
-                                    const float value) noexcept {
-  const auto normalized =
-      std::isfinite(value) ? std::clamp(value, 0.0F, 1.0F) : 0.5F;
-  static_cast<void>(onda_set_param_normalized(
-      instance_.get(), parameterMappings_[slot].parameterIndex,
-      static_cast<double>(normalized)));
+                                    const ScalarValue &value) noexcept {
+  const auto normalized = value.normalized;
+  const auto exact = value.defaultPlain(parameterDomains_[slot]);
+  resolvedParameterValues_[slot] = value;
+  if (parametersStarted_ && !parametersSettleRequested_ &&
+      normalized == parameterTargets_[slot] &&
+      exact == parameterPlainDefaults_[slot] && !parameterRamps_[slot].active())
+    return;
   parameterTargets_[slot] = normalized;
-  if (smoothedParameterTypes_[slot] >= 0) {
-    auto plain = onda_param_normalized_to_plain(
-        program_.get(), parameterMappings_[slot].parameterIndex, normalized);
-    if (smoothedParameterTypes_[slot] == ONDA_PRIMITIVE_F32)
-      plain = static_cast<double>(static_cast<float>(plain));
-    parameterRamps_[slot].reset(plain);
+  parameterPlainDefaults_[slot] = exact;
+  const auto plain =
+      exact ? *exact
+            : ScalarPlain{onda_processor_param_normalized_to_plain(
+                  &parameterHostDomains_[slot], normalized)};
+  parameterRamps_[slot].reset(writeParameterPlain(slot, plain));
+}
+
+double PreparedEngine::writeParameterPlain(const std::size_t slot,
+                                           const ScalarPlain &value) noexcept {
+  const auto index = parameterMappings_[slot].parameterIndex;
+  const auto write = [this, index]<typename T>(const T scalar) noexcept {
+    static_cast<void>(onda_set_param_by_index(instance_.get(), index, &scalar,
+                                              sizeof(scalar)));
+    return static_cast<double>(scalar);
+  };
+  return std::visit(
+      [&](const auto scalar) noexcept {
+        switch (parameterDomains_[slot].type) {
+        case ScalarDomain::Type::f32:
+          return write(static_cast<float>(scalar));
+        case ScalarDomain::Type::f64:
+          return write(static_cast<double>(scalar));
+        case ScalarDomain::Type::i32:
+          return write(static_cast<std::int32_t>(scalar));
+        case ScalarDomain::Type::i64:
+          return write(static_cast<std::int64_t>(scalar));
+        case ScalarDomain::Type::boolean:
+          return write(static_cast<double>(scalar) >= 0.5);
+        }
+        return static_cast<double>(scalar);
+      },
+      value);
+}
+
+template <PreparedEngine::ValueBank Bank, std::size_t Count>
+ScalarValue PreparedEngine::resolveValue(
+    const std::size_t index, const ParameterValue::Target target,
+    const ParameterBank<Count> *values) const noexcept {
+  constexpr auto isControl = Bank == ValueBank::controls;
+  static_assert(Count == (isControl ? controlCount : slotCount));
+  auto &resolved = isControl ? resolvedControlValues_[index]
+                             : resolvedParameterValues_[index];
+  if (target.editor && target.defaulted &&
+      (!isControl || index < controlMappings_.size())) {
+    auto &cached = isControl ? controlResetDefaults_[index]
+                             : parameterResetDefaults_[index];
+    if (cached.stamp != target.stamp && values != nullptr) {
+      if (const auto value = values->defaultValue(index, target.stamp)) {
+        cached.value = *value;
+        cached.stamp = target.stamp;
+      }
+    }
+    // A concurrent publication keeps the fallback and retries next time.
+    // Only complete Reset snapshots are cached; seeding and automation may
+    // overwrite the fallback without changing this immutable stamped value.
+    if (cached.stamp == target.stamp)
+      resolved = cached.value;
+    return resolved;
   }
+  if (parameterSeed_ &&
+      index <
+          (isControl ? parameterSeed_->controlCount : parameterSeed_->count) &&
+      parameterSeed_->applied.load(std::memory_order_acquire) &&
+      target.stamp == (isControl ? parameterSeed_->controlStamps.after[index]
+                                 : parameterSeed_->parameterStamps.after[index])
+                          .load(std::memory_order_acquire))
+    return resolved = isControl ? parameterSeed_->controls[index]
+                                : parameterSeed_->values[index];
+  auto checkpointStamp =
+      checkpointValues_
+          ? (isControl ? checkpointValues_->controlStamps[index]
+                       : checkpointValues_->parameterStamps[index])
+          : 0U;
+  if constexpr (isControl) {
+    if (target.defaulted && initialControlStamps_ != nullptr &&
+        checkpointStamp == ParameterValue::initialStamp) {
+      const auto initialized =
+          (*initialControlStamps_)[index].load(std::memory_order_acquire);
+      if (initialized != 0U)
+        checkpointStamp = initialized;
+    }
+  }
+  if (checkpointValues_ && checkpointStamp == target.stamp)
+    return resolved = isControl ? checkpointValues_->controls[index]
+                                : checkpointValues_->parameters[index];
+  return resolved = ScalarValue{target.value};
 }
 
-float PreparedEngine::parameterValue(
-    const std::size_t slot,
-    const std::array<std::atomic<float> *, slotCount> &slots,
-    const bool useDefaults) const noexcept {
-  const auto value = useDefaults && slot < parameterSeed_->count
-                         ? parameterSeed_->values[slot]
-                         : slots[slot]->load(std::memory_order_relaxed);
-  return std::isfinite(value) ? std::clamp(value, 0.0F, 1.0F) : 0.5F;
+template <PreparedEngine::ValueBank Bank, std::size_t Count>
+ParameterValue::Target PreparedEngine::resolveTarget(
+    const std::size_t index,
+    const ParameterBank<Count> &values) const noexcept {
+  auto target = values.target(index);
+  const auto value = resolveValue<Bank>(index, target, &values);
+  target.value = value.normalized;
+  target.defaulted = value.scalarDefault.has_value();
+  return target;
 }
 
-void PreparedEngine::applyParameters(
-    const std::array<std::atomic<float> *, slotCount> &slots) noexcept {
-  const auto useDefaults = parameterSeed_ && !parameterSeed_->applied.load(
-                                                 std::memory_order_acquire);
+ScalarValue
+PreparedEngine::parameterValue(const std::size_t slot,
+                               const ParameterValue::Target target,
+                               const ParameterState &slots) const noexcept {
+  return resolveValue<ValueBank::parameters>(slot, target, &slots);
+}
+
+ParameterValue::Target
+PreparedEngine::parameterTarget(const std::size_t slot,
+                                const ParameterState &values) const noexcept {
+  return resolveTarget<ValueBank::parameters>(slot, values);
+}
+
+void PreparedEngine::applyParameters(const ParameterState &slots) noexcept {
+  const auto useDefaults =
+      hostCallbackUsesDefaults_ || parameterDefaultsPending();
   for (std::size_t index = 0; index < parameterMappingCount_; ++index) {
-    applyParameter(index, parameterValue(index, slots, useDefaults));
+    applyParameter(index,
+                   useDefaults && index < parameterSeed_->count
+                       ? parameterSeed_->values[index]
+                       : parameterValue(index, slots.target(index), slots));
   }
 }
 
-bool PreparedEngine::beginHostCallback(
-    const std::array<std::atomic<float> *, slotCount> &slots,
-    const int frames) noexcept {
+void PreparedEngine::beginHostCallback(const int frames,
+                                       ParameterAutomation *automation,
+                                       const ControlState *controls,
+                                       ControlAutomation *controlAutomation,
+                                       const bool useDefaults) noexcept {
   hostCallbackFrames_ = frames < 0 ? blockSize_ : frames;
-  if (!blockStarted_)
-    return true;
-
-  const auto useDefaults = parameterSeed_ && !parameterSeed_->applied.load(
-                                                 std::memory_order_acquire);
-  bool changed = parameterBoundaryRequested_;
-  for (std::size_t index = 0; index < parameterMappingCount_; ++index)
-    changed |=
-        parameterValue(index, slots, useDefaults) != parameterTargets_[index] ||
-        parameterRamps_[index].active();
-  if (!changed)
-    return true;
-
-  if (logicalFrame_ == 0) {
-    blockStarted_ = false;
-    return true;
+  // Hold one seeding decision for the whole callback, including acknowledgment
+  // during processing. Deferred curves start with the following callback.
+  hostCallbackUsesDefaults_ =
+      parameterDefaultsPending() || (useDefaults && parameterSeed_ != nullptr);
+  hostAutomation_ = !hostCallbackUsesDefaults_ && automation != nullptr &&
+                            automation->boundLanes() != 0U
+                        ? automation
+                        : nullptr;
+  if (hostAutomation_ != nullptr) {
+    const auto mappedLanes = (std::uint64_t{1} << parameterMappingCount_) - 1U;
+    detail::forEachAutomationLane(
+        hostAutomation_->boundLanes() & mappedLanes,
+        [this](const std::size_t slot) noexcept {
+          if (hostAutomation_->active(slot))
+            hostAutomation_->start(slot, smoothedParameterTypes_[slot] >= 0);
+        });
   }
-
-  // Parameters in sample work are captured by BEGIN_BLOCK. Finish a short
-  // block before changing its values or advancing an active ramp.
-  const auto status =
-      onda_process_unchecked_segment(instance_.get(), logicalFrame_, 0,
-                                     ONDA_PROCESS_END_BLOCK, &executionOutput_);
-  collectExecutionOutput();
-  if (status != 0)
-    return false;
-  logicalFrame_ = 0;
-  blockStarted_ = false;
-  return true;
+  controlState_ = controls;
+  controlAutomation_ = !hostCallbackUsesDefaults_ &&
+                               controlAutomation != nullptr &&
+                               controlAutomation->boundLanes() != 0U
+                           ? controlAutomation
+                           : nullptr;
+  controlInputsPrepared_ = false;
+  // Event-only processing can prepare a boundary without rendering samples.
+  // Refresh it for this callback's targets and actual first chunk length.
+  if (logicalFrame_ == 0)
+    blockStarted_ = false;
 }
 
 bool PreparedEngine::setParameterSmoothingSeconds(
@@ -1290,66 +1465,102 @@ bool PreparedEngine::setParameterSmoothingSeconds(
       *count > static_cast<std::uint64_t>(blockSize_) ? *count : 0U;
   if (samples != smoothingSamples_) {
     smoothingSamples_ = samples;
-    parameterBoundaryRequested_ = true;
     for (auto &ramp : parameterRamps_)
       ramp.setDuration(samples);
+    if (samples == 0U)
+      parametersSettleRequested_ = true;
   }
   return true;
 }
 
 void PreparedEngine::settleParameters() noexcept {
-  parametersStarted_ = false;
-  parameterBoundaryRequested_ = true;
+  parametersSettleRequested_ = true;
 }
 
-void PreparedEngine::updateParameters(
-    const std::array<std::atomic<float> *, slotCount> &slots,
-    const int frames) noexcept {
-  const auto useDefaults = parameterSeed_ && !parameterSeed_->applied.load(
-                                                 std::memory_order_acquire);
+bool PreparedEngine::setInputControlSmoothingSeconds(
+    const double seconds) noexcept {
+  const auto samples = parameterSmoothingSamples(seconds, sampleRate_);
+  if (!samples)
+    return false;
+  if (*samples != controlSmoothingSamples_) {
+    controlSmoothingSamples_ = *samples;
+    for (auto &ramp : controlRamps_)
+      ramp.setDuration(*samples);
+  }
+  return true;
+}
+
+bool PreparedEngine::inputControlRampPending(
+    const std::size_t control, const double normalized,
+    const double seconds) const noexcept {
+  return control < controlMappings_.size() && controlValuesStarted_[control] &&
+         seconds > 0.0 &&
+         (controlRamps_[control].active() || controlUsesDefault_[control] ||
+          controlNormalizedTargets_[control] != normalized);
+}
+
+bool PreparedEngine::editorRampPending(const std::size_t slot,
+                                       const double normalized,
+                                       const double seconds) const noexcept {
+  return slot < parameterMappingCount_ && parametersStarted_ &&
+         !parametersSettleRequested_ && smoothedParameterTypes_[slot] >= 0 &&
+         seconds * sampleRate_ > static_cast<double>(blockSize_) &&
+         (parameterRamps_[slot].active() || parameterPlainDefaults_[slot] ||
+          parameterTargets_[slot] != normalized);
+}
+
+void PreparedEngine::updateParameters(const ParameterState &slots,
+                                      const int frames,
+                                      const int offset) noexcept {
+  const auto useDefaults =
+      hostCallbackUsesDefaults_ || parameterDefaultsPending();
   for (std::size_t slot = 0; slot < parameterMappingCount_; ++slot) {
-    const auto normalized = parameterValue(slot, slots, useDefaults);
-    const auto type = smoothedParameterTypes_[slot];
-    if (!parametersStarted_ || smoothingSamples_ == 0U || type < 0) {
-      applyParameter(slot, normalized);
+    const auto requested = slots.target(slot);
+    if (!useDefaults && hostAutomation_ != nullptr &&
+        hostAutomation_->active(slot, requested.stamp)) {
+      applyParameter(slot, hostAutomation_->valueAt(slot, offset));
       continue;
     }
-    const auto index = parameterMappings_[slot].parameterIndex;
+    const auto value = useDefaults && slot < parameterSeed_->count
+                           ? parameterSeed_->values[slot]
+                           : parameterValue(slot, requested, slots);
+    const auto normalized = value.normalized;
+    const auto type = smoothedParameterTypes_[slot];
+    if (!parametersStarted_ || parametersSettleRequested_ ||
+        smoothingSamples_ == 0U || type < 0 || useDefaults ||
+        !requested.editor || value.scalarDefault) {
+      applyParameter(slot, value);
+      continue;
+    }
     auto &ramp = parameterRamps_[slot];
-    if (normalized != parameterTargets_[slot]) {
-      auto target =
-          onda_param_normalized_to_plain(program_.get(), index, normalized);
+    if (normalized != parameterTargets_[slot] ||
+        parameterPlainDefaults_[slot]) {
+      auto target = onda_processor_param_normalized_to_plain(
+          &parameterHostDomains_[slot], normalized);
       if (type == ONDA_PRIMITIVE_F32)
         target = static_cast<double>(static_cast<float>(target));
       ramp.setTarget(target);
       parameterTargets_[slot] = normalized;
+      parameterPlainDefaults_[slot].reset();
     }
-    const auto value = ramp.advance(static_cast<std::uint64_t>(frames),
-                                    type == ONDA_PRIMITIVE_F32);
-    if (type == ONDA_PRIMITIVE_F32) {
-      const auto scalar = static_cast<float>(value);
-      static_cast<void>(onda_set_param_by_index(instance_.get(), index, &scalar,
-                                                sizeof(scalar)));
-    } else {
-      static_cast<void>(onda_set_param_by_index(instance_.get(), index, &value,
-                                                sizeof(value)));
-    }
+    if (ramp.active())
+      static_cast<void>(writeParameterPlain(
+          slot, ramp.advance(static_cast<std::uint64_t>(frames),
+                             type == ONDA_PRIMITIVE_F32)));
   }
-  if (frames > 0)
-    parametersStarted_ = true;
-  parameterBoundaryRequested_ = false;
+  parametersSettleRequested_ = false;
 }
 
-bool PreparedEngine::ensureBlockStarted(
-    const std::array<std::atomic<float> *, slotCount> &slots,
-    const HostContext &hostContext, const int hostCallbackOffset) noexcept {
+bool PreparedEngine::ensureBlockStarted(const ParameterState &slots,
+                                        const HostContext &hostContext,
+                                        const int hostCallbackOffset) noexcept {
   if (logicalFrame_ == 0 && !blockStarted_) {
     const auto frames =
         hostCallbackFrames_ >= 0
             ? std::clamp(hostCallbackFrames_ - hostCallbackOffset, 0,
                          blockSize_)
             : blockSize_;
-    updateParameters(slots, frames);
+    updateParameters(slots, frames, hostCallbackOffset);
     if (!dispatchHostContext(hostContext, hostCallbackOffset))
       return false;
     blockStarted_ = true;
@@ -1357,18 +1568,132 @@ bool PreparedEngine::ensureBlockStarted(
   return true;
 }
 
-bool PreparedEngine::processSegment(
-    float *const *hostInputs, float *const *hostOutputs,
-    const int callbackOffset, const int frames,
-    const std::array<std::atomic<float> *, slotCount> &slots,
-    const HostContext &hostContext, const int hostCallbackOffset) noexcept {
+ControlValue
+PreparedEngine::controlValue(const std::size_t control,
+                             const ParameterValue::Target target,
+                             const ControlState *values) const noexcept {
+  return resolveValue<ValueBank::controls>(control, target, values);
+}
+
+ParameterValue::Target
+PreparedEngine::controlTarget(const std::size_t control,
+                              const ControlState &values) const noexcept {
+  return resolveTarget<ValueBank::controls>(control, values);
+}
+
+std::uint64_t PreparedEngine::initializeControlDefaults(
+    ControlState &controls, const std::uint64_t retainedLanes) noexcept {
+  if (checkpointValues_ == nullptr || initialControlStamps_ == nullptr)
+    return 0U;
+  std::uint64_t initialized{};
+  for (auto index = parameterSeed_ ? parameterSeed_->controlCount
+                                   : std::size_t{0};
+       index < controlMappings_.size(); ++index) {
+    const auto &value = checkpointValues_->controls[index];
+    const auto lane = std::uint64_t{1} << index;
+    if ((retainedLanes & lane) == 0U && value.scalarDefault &&
+        checkpointValues_->controlStamps[index] ==
+            ParameterValue::initialStamp &&
+        controls.initializeDefault(index, static_cast<float>(value.normalized),
+                                   (*initialControlStamps_)[index]) != 0U)
+      initialized |= lane;
+  }
+  return initialized;
+}
+
+void PreparedEngine::prepareControlInputs(float *const *hostInputs) noexcept {
+  const auto useDefaults =
+      hostCallbackUsesDefaults_ || parameterDefaultsPending();
+  for (std::size_t control = 0; control < controlMappings_.size(); ++control) {
+    const auto channel =
+        static_cast<std::size_t>(pluginInputChannels) + control;
+    if (hostInputs != nullptr && hostInputs[channel] != nullptr) {
+      controlValuesStarted_[control] = false;
+      continue;
+    }
+    if (controlAutomation_ != nullptr && controlAutomation_->active(control)) {
+      // Preserve the last rendered value if a newer editor write cancels this
+      // curve before rendering. Only rendered automation commits ramp state.
+      controlAutomation_->start(control, true);
+      continue;
+    }
+    ControlValue value;
+    ParameterValue::Target target;
+    if (useDefaults && control < parameterSeed_->controlCount) {
+      value = parameterSeed_->controls[control];
+    } else if (controlState_ != nullptr && !useDefaults) {
+      target = controlState_->target(control);
+      value = controlValue(control, target, controlState_);
+    } else {
+      controlRamps_[control].reset(inputDefaults_[channel]);
+      continue;
+    }
+    updateControlTarget(control, target, value, useDefaults);
+  }
+  controlInputsPrepared_ = true;
+}
+
+void PreparedEngine::updateControlTarget(const std::size_t control,
+                                         const ParameterValue::Target target,
+                                         const ControlValue &value,
+                                         const bool useDefaults) noexcept {
+  auto &ramp = controlRamps_[control];
+  const auto plain =
+      value.plain(controlMinimum_[control], controlMaximum_[control]);
+  if (!controlValuesStarted_[control] || useDefaults || !target.editor ||
+      value.scalarDefault || controlSmoothingSamples_ == 0U) {
+    ramp.reset(plain);
+  } else {
+    ramp.setTarget(plain);
+  }
+  controlUsesDefault_[control] = value.scalarDefault.has_value();
+  controlNormalizedTargets_[control] = value.normalized;
+}
+
+bool PreparedEngine::processSegment(float *const *hostInputs,
+                                    float *const *hostOutputs,
+                                    const int callbackOffset, const int frames,
+                                    const ParameterState &slots,
+                                    const HostContext &hostContext,
+                                    const int hostCallbackOffset) noexcept {
+  if (!controlInputsPrepared_)
+    prepareControlInputs(hostInputs);
   for (int channel = 0; channel < inputChannels_; ++channel) {
     auto *destination =
         inputSlab_.data() + channel * blockSize_ + logicalFrame_;
     if (hostInputs != nullptr && hostInputs[channel] != nullptr) {
       std::copy_n(hostInputs[channel] + callbackOffset, frames, destination);
+    } else if (channel >= pluginInputChannels) {
+      const auto control =
+          static_cast<std::size_t>(channel - pluginInputChannels);
+      if (controlAutomation_ != nullptr &&
+          controlAutomation_->active(control)) {
+        const auto target = controlState_ != nullptr
+                                ? controlState_->target(control)
+                                : ParameterValue::Target{};
+        if (controlState_ == nullptr ||
+            controlAutomation_->active(control, target.stamp)) {
+          controlAutomation_->render(
+              control, destination, hostCallbackOffset + callbackOffset, frames,
+              controlMinimum_[control], controlMaximum_[control]);
+          controlRamps_[control].reset(destination[frames - 1]);
+          controlNormalizedTargets_[control] = target.value;
+          controlUsesDefault_[control] = false;
+          controlValuesStarted_[control] = true;
+        } else {
+          updateControlTarget(control, target,
+                              controlValue(control, target, controlState_),
+                              false);
+          controlRamps_[control].render(destination, frames);
+          controlValuesStarted_[control] = true;
+        }
+      } else {
+        controlRamps_[control].render(destination, frames);
+        controlValuesStarted_[control] = true;
+      }
     } else {
-      std::fill_n(destination, frames, 0.0F);
+      std::fill_n(destination, frames,
+                  inputDefaults_[static_cast<std::size_t>(channel)]);
     }
   }
 
@@ -1387,7 +1712,13 @@ bool PreparedEngine::processSegment(
       return false;
     }
   }
-  if (logicalFrame_ + frames == blockSize_)
+  // A callback owns its chunks. MIDI splits keep the current chunk open;
+  // its final real segment closes it, including a short callback tail.
+  const auto endBlock =
+      logicalFrame_ + frames == blockSize_ ||
+      (hostCallbackFrames_ >= 0 &&
+       hostCallbackOffset + callbackOffset + frames == hostCallbackFrames_);
+  if (endBlock)
     flags |= ONDA_PROCESS_END_BLOCK;
 
   const auto status = onda_process_unchecked_segment(
@@ -1397,12 +1728,15 @@ bool PreparedEngine::processSegment(
     return false;
   }
 
+  // Events can prestart a block without rendering any audio. Only rendered
+  // samples complete startup and enable smoothing of subsequent targets.
+  parametersStarted_ = true;
   for (int channel = 0; channel < outputChannels_; ++channel) {
     std::copy_n(outputSlab_.data() + channel * blockSize_ + logicalFrame_,
                 frames, hostOutputs[channel] + callbackOffset);
   }
   logicalFrame_ += frames;
-  if (logicalFrame_ == blockSize_) {
+  if (endBlock) {
     logicalFrame_ = 0;
     blockStarted_ = false;
   }
@@ -1545,12 +1879,13 @@ bool PreparedEngine::dispatchHostContext(
          trigger(binding(HostContextKind::renderMode), hostContext.realtime);
 }
 
-bool PreparedEngine::process(
-    float *const *hostInputs, float *const *hostOutputs, const int frames,
-    const std::span<const MidiEvent> midi,
-    const std::array<std::atomic<float> *, slotCount> &slots,
-    const HostContext &hostContext, const int hostCallbackOffset) noexcept {
-  if (frames < 0 || frames > blockSize_ || hostCallbackOffset < 0)
+bool PreparedEngine::process(float *const *hostInputs,
+                             float *const *hostOutputs, const int frames,
+                             const std::span<const MidiEvent> midi,
+                             const ParameterState &slots,
+                             const HostContext &hostContext,
+                             const int hostCallbackOffset) noexcept {
+  if (frames < 0 || hostCallbackOffset < 0)
     return false;
 
   int position = 0;
@@ -1574,7 +1909,8 @@ bool PreparedEngine::process(
                                 midi[eventIndex].sampleOffset,
                                 static_cast<std::uint32_t>(frames))));
     }
-    next = std::min(next, position + blockSize_ - logicalFrame_);
+    next = std::min(next, position + std::min(frames - position,
+                                              blockSize_ - logicalFrame_));
     if (next == position)
       continue;
     if (!processSegment(hostInputs, hostOutputs, position, next - position,
@@ -1598,8 +1934,7 @@ bool PreparedEngine::process(
 
 EventTriggerResult PreparedEngine::triggerEvent(
     const int index, const std::span<const std::byte> payload,
-    const std::array<std::atomic<float> *, slotCount> &slots,
-    const HostContext &hostContext) noexcept {
+    const ParameterState &slots, const HostContext &hostContext) noexcept {
   if (index < 0 ||
       payload.size() >
           static_cast<std::size_t>(std::numeric_limits<int>::max()) ||
@@ -1617,10 +1952,11 @@ EventTriggerResult PreparedEngine::triggerEvent(
   return EventTriggerResult::runtimeFailure;
 }
 
-bool PreparedEngine::reset(
-    const std::array<std::atomic<float> *, slotCount> &slots) noexcept {
+bool PreparedEngine::reset(const ParameterState &slots) noexcept {
   applyParameters(slots);
   parametersStarted_ = false;
+  controlValuesStarted_.fill(false);
+  parametersSettleRequested_ = false;
   logicalFrame_ = 0;
   blockStarted_ = false;
   const auto status = onda_init_unchecked(

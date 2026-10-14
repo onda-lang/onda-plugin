@@ -9,6 +9,18 @@
 #include "RunViewHost.h"
 #include "StateFormat.h"
 #include "TestAudioFile.h"
+#include "BlockProcessingTests.h"
+#include "AutomationSeedingTests.h"
+#include "ScratchHandoffTests.h"
+#include "ControlInputTests.h"
+#include "ControlAutomationTests.h"
+#include "ControlRenderingTests.h"
+#include "InputControlEditorTests.h"
+#include "UnrangedParameterTests.h"
+#include "ParameterLifecycleTests.h"
+#include "ParameterDefaultTests.h"
+#include "BypassTests.h"
+#include "BypassTestSupport.h"
 
 #include <juce_gui_basics/juce_gui_basics.h>
 
@@ -404,7 +416,7 @@ std::string faultingSource(const onda::plugin::Product product) {
           ? std::string{"outs { out1, out2 }\n"} + instrumentEvents
           : std::string{"ins { in1, in2 }\nouts { out1, out2 }\n"};
   return interface + R"(
-params { divisor: i32 = 0 }
+init { divisor = i32(0) }
 def quotient(value: i32, by: i32) { return value / by }
 sample {
   out1 = f32(quotient(i32(1), divisor))
@@ -670,12 +682,17 @@ makeState(const juce::String &path, const juce::String &browseDirectory,
   }
   stream.writeInt64(0);
   for (const auto value : values)
-    stream.writeFloat(value);
+    onda::plugin::writeScalarValue(stream, value);
   stream.writeInt(width);
   stream.writeInt(height);
   stream.writeBool(layout == onda::plugin::ParamControlLayout::knobs);
   stream.writeString(viewState);
   stream.writeDouble(onda::plugin::defaultParamSmoothingSeconds);
+  stream.writeInt(0);
+  stream.writeBool(true);
+  stream.writeDouble(onda::plugin::defaultParamSmoothingSeconds);
+  for (std::size_t index = 0; index < onda::plugin::controlCount; ++index)
+    onda::plugin::writeScalarValue(stream, 0.5);
   return state;
 }
 
@@ -756,6 +773,7 @@ bool exerciseRunViewAdapter() {
   }
 
   onda::plugin::Processor processor(onda::plugin::Product::effect);
+  processor.prepareToPlay(48'000.0, 64);
   const auto message = onda::plugin::makeRunViewState(
       processor, processor.workerStatus(), processor.canExportProject(),
       "adapter test error");
@@ -773,11 +791,14 @@ bool exerciseRunViewAdapter() {
       static_cast<bool>(state->getProperty("supportsBufferEmbedding")) ||
       static_cast<bool>(state->getProperty("supportsTransport")) ||
       static_cast<bool>(state->getProperty("supportsDeviceSelection")) ||
-      static_cast<bool>(state->getProperty("supportsRunSettings")) ||
+      !static_cast<bool>(state->getProperty("supportsRunSettings")) ||
       !static_cast<bool>(state->getProperty("supportsReset")) ||
       !static_cast<bool>(state->getProperty("supportsParamSmoothing")) ||
       state->getProperty("ondaVersion").toString() != onda_version() ||
       state->getProperty("ondaVersion").toString().isEmpty() ||
+      !std::is_eq(static_cast<double>(state->getProperty("sampleRateHz")) <=>
+                  48'000.0) ||
+      static_cast<int>(state->getProperty("blockSamples")) != 64 ||
       !std::is_eq(static_cast<double>(
                       state->getProperty("paramSmoothingMs")) <=> 30.0) ||
       !std::is_eq(static_cast<double>(state->getProperty(
@@ -795,6 +816,51 @@ bool exerciseRunViewAdapter() {
       state->getProperty("error").toString() != "adapter test error") {
     std::cerr << "run-view capability state was invalid\n";
     return false;
+  }
+
+  // Host restoration can publish view state before compilation starts. Every
+  // waiting state must leave error empty so the view retains pending drafts.
+  {
+    using namespace onda::plugin;
+    SpscSlot<PreparedEngine *> replacements, retirements;
+    std::atomic<bool> deactivate{};
+    Worker worker(Product::effect, replacements, retirements, deactivate);
+    const auto path = testTemporaryRoot() / "waiting.onda";
+    const auto waiting = [&] {
+      const auto pending =
+          makeRunViewState(processor, worker.status(), false, {});
+      if (pending["state"]["error"].toString().isNotEmpty()) {
+        std::cerr << "a waiting worker state rejected pending view restoration\n";
+        return false;
+      }
+      return true;
+    };
+    worker.load(path, false);
+    if (!waiting())
+      return false;
+    worker.restore(path, {}, {});
+    if (!waiting())
+      return false;
+    worker.bindBufferFile("clip", testTemporaryRoot() / "waiting.wav");
+    if (!waiting())
+      return false;
+    worker.clearBuffer("clip");
+    if (!waiting())
+      return false;
+    worker.configure(0.0, 8);
+    if (!waiting())
+      return false;
+    worker.configure(48'000.0, 8);
+    static_cast<void>(worker.waitForPreparation());
+    const auto failure =
+        makeRunViewState(processor, worker.status(), false, {});
+    if (failure["state"]["error"].toString().isEmpty()) {
+      std::cerr << "a failed worker state hid its load error\n";
+      return false;
+    }
+    worker.unload();
+    if (!waiting())
+      return false;
   }
 
   onda::plugin::MidiActivitySnapshot activity;
@@ -917,14 +983,17 @@ bool exerciseUserEvents() {
   juce::Array<juce::var> slice{0.25};
   juce::Array<juce::var> values{0.5, juce::var{fixed}, true, juce::var{slice},
                                 "9007199254740993"};
-  const auto error = processor.triggerEvent("shape", juce::var{values});
+  const auto error = processor.triggerEvent(status.engineGeneration, "shape",
+                                            juce::var{values});
   if (!error.empty() || !waitForOutput(processor, 2.75F)) {
     std::cerr << "user event was not dispatched: " << error << '\n';
     return false;
   }
 
   values.set(4, 9'007'199'254'740'992.0);
-  if (processor.triggerEvent("shape", juce::var{values}).empty()) {
+  if (processor
+          .triggerEvent(status.engineGeneration, "shape", juce::var{values})
+          .empty()) {
     std::cerr << "lossy numeric i64 event argument was accepted\n";
     return false;
   }
@@ -1076,7 +1145,8 @@ sample:
       note(false, 6.0, {3.0, 4.0}, "-3", {7, false}),
   };
   juce::Array<juce::var> values{true, prototypeValue, std::move(notes), 5};
-  const auto error = processor.triggerEvent("configure", values);
+  const auto error = processor.triggerEvent(
+      processor.workerStatus().engineGeneration, "configure", values);
   if (!error.empty() || !waitForOutput(processor, 23.0F)) {
     std::cerr << "structured event was not dispatched: " << error << '\n';
     return false;
@@ -1096,7 +1166,7 @@ sample:
   invalid.getDynamicObject()->setProperty("enabled", true);
   juce::Array<juce::var> invalidNotes{std::move(invalid)};
   if (processor
-          .triggerEvent("configure",
+          .triggerEvent(processor.workerStatus().engineGeneration, "configure",
                         juce::Array<juce::var>{false, prototypeValue,
                                                std::move(invalidNotes), 0})
           .empty() ||
@@ -1943,7 +2013,7 @@ bool exerciseEditorLifecycle() {
   if (loadingOverlay == nullptr ||
       loadingOverlay->getBounds() != editor->getLocalBounds() ||
       loadingOverlay->findColour(juce::Label::backgroundColourId) !=
-          juce::Colour::fromRGB(8, 21, 34)) {
+          juce::Colour::fromRGB(13, 25, 41)) {
     std::cerr << "editor did not cover the initializing web view\n";
     return false;
   }
@@ -2082,7 +2152,7 @@ sample { out1 = clip[0, 0] + retained[1, 0]; out2 = clip[0, 0] + retained[1, 0] 
 
 bool exerciseProjectBufferOverrideRestore() {
   TemporarySource source;
-  if (!source.write(R"(
+  constexpr auto projectSource = R"(
 config const Gain: f32 = 1.0
 buffers { clip: buffer<f32[2]>, untouched: buffer<f32> }
 outs { out1, out2 }
@@ -2090,7 +2160,8 @@ sample {
   out1 = clip[0, 0] * Gain + untouched[0]
   out2 = clip[0, 0] * Gain + untouched[0]
 }
-)"))
+)";
+  if (!source.write(projectSource))
     return false;
   const auto projectPath = source.path().parent_path() / "override.ondaproject";
   {
@@ -2141,7 +2212,31 @@ sample {
     }
     changes = listener.nonParameterChanges;
     processor.getStateInformation(saved);
+    // A failed reload must not make clearing an optional override destructive.
+    if (!source.write("invalid syntax\n"))
+      return false;
+    processor.requestReload();
+    processor.prepareToPlay(48'000.0, 8);
+    if (!processor.workerStatus().active ||
+        !waitForOutput(processor, expectedOverride, 8))
+      return false;
     processor.clearBuffer("clip");
+    juce::MemoryBlock clearing;
+    processor.getStateInformation(clearing);
+    if (clearing != saved) {
+      std::cerr << "clearing a project override discarded its checkpoint\n";
+      return false;
+    }
+    processor.prepareToPlay(48'000.0, 8);
+    if (!processor.workerStatus().active ||
+        !waitForOutput(processor, expectedOverride, 8)) {
+      std::cerr << "failed default replacement stopped the working engine\n";
+      return false;
+    }
+    processor.getStateInformation(clearing);
+    if (clearing != saved || !source.write(projectSource))
+      return false;
+    processor.requestReload();
     if (!waitForOutput(processor, 0.625F, 8)) {
       std::cerr << "clearing an override did not restore the project default\n";
       return false;
@@ -2419,6 +2514,24 @@ sample {
       std::cerr << "disk buffer authority did not refresh the checkpoint\n";
       return false;
     }
+    // Embedded source assets restore required file bindings; clearing one must
+    // still invalidate the image rather than treating that asset as a default.
+    restored.clearBuffer("clip");
+    const auto clearedOutput = processFirstFrame(restored);
+    if (restored.workerStatus().active ||
+        !test::withinTolerance(clearedOutput.first - 1.0F, 1.0e-6F) ||
+        !test::withinTolerance(clearedOutput.second - 1.0F, 1.0e-6F))
+      return false;
+    juce::MemoryBlock clearedState;
+    restored.getStateInformation(clearedState);
+    onda::plugin::Processor incomplete(onda::plugin::Product::effect);
+    incomplete.setStateInformation(clearedState.getData(),
+                                   static_cast<int>(clearedState.getSize()));
+    incomplete.prepareToPlay(48'000.0, 8);
+    if (incomplete.workerStatus().active) {
+      std::cerr << "clearing a required source binding retained its image\n";
+      return false;
+    }
   }
   return true;
 }
@@ -2587,6 +2700,171 @@ bool exerciseExtendedMidi() {
   return true;
 }
 
+bool exerciseEventOnlyParameterSmoothing() {
+  TemporarySource source;
+  if (!source.write(R"(
+outs { out1, out2 }
+params {
+  single: f32 = 0.0 {0.0, 1.0}
+  double: f64 = 0.0 {0.0, 1.0}
+}
+event note_on(id: i32, channel: i32, key: i32, velocity: f32) {}
+event configure() {}
+block {
+  cached_single = single
+  cached_double = double
+  sample { out1 = cached_single; out2 = f32(cached_double) }
+}
+)"))
+    return false;
+
+  for (const auto userEvent : {false, true}) {
+    for (const auto firstFrames : {32, 64}) {
+      onda::plugin::Processor processor(onda::plugin::Product::effect);
+      processor.loadFile(juce::File(onda::plugin::pathToJuce(source.path())));
+      // Prepare synchronously without rendering the engine's first samples.
+      processor.prepareToPlay(48'000.0, 64);
+      if (!processor.workerStatus().active ||
+          !processor.setParamSmoothingSeconds(0.03))
+        return false;
+
+      const auto render = [&](const int frames, const float expected,
+                              juce::MidiBuffer &midi) {
+        juce::AudioBuffer<float> audio(2, frames);
+        allocation_audit::count.store(0, std::memory_order_relaxed);
+        lock_audit::count.store(0, std::memory_order_relaxed);
+        allocation_audit::enabled = lock_audit::enabled = true;
+        processor.processBlock(audio, midi);
+        allocation_audit::enabled = lock_audit::enabled = false;
+        if (allocation_audit::count.load(std::memory_order_relaxed) != 0 ||
+            lock_audit::count.load(std::memory_order_relaxed) != 0)
+          return false;
+        for (int channel = 0; channel < audio.getNumChannels(); ++channel) {
+          for (int frame = 0; frame < frames; ++frame) {
+            if (!test::withinTolerance(
+                    audio.getSample(channel, frame) - expected, 1.0e-6F)) {
+              std::cerr << "event-only callback changed smoothing startup: "
+                        << audio.getSample(channel, frame) << ", expected "
+                        << expected << " (user event " << userEvent
+                        << ", first frames " << firstFrames << ")\n";
+              return false;
+            }
+          }
+        }
+        return true;
+      };
+
+      const auto flushEvent = [&] {
+        juce::MidiBuffer midi;
+        if (userEvent) {
+          if (!processor
+                   .triggerEvent(processor.workerStatus().engineGeneration,
+                                 "configure", juce::Array<juce::var>{})
+                   .empty())
+            return false;
+        } else {
+          midi.addEvent(juce::MidiMessage::noteOn(1, 60, 1.0F), 0);
+        }
+        return render(0, 0.0F, midi);
+      };
+      juce::MidiBuffer emptyMidi;
+      for (const auto reset : {false, true}) {
+        if (reset) {
+          processor.setSlotValue(0, 0.0F);
+          processor.setSlotValue(1, 0.0F);
+          processor.reset();
+        }
+        if (!flushEvent() || !render(firstFrames, 0.0F, emptyMidi))
+          return false;
+        processor.setSlotValue(0, 1.0F);
+        processor.setSlotValue(1, 1.0F);
+        if (!render(64, 64.0F / 1440.0F, emptyMidi) ||
+            !render(64, 128.0F / 1440.0F, emptyMidi))
+          return false;
+      }
+      // Targets changed before the first samples after reset still settle
+      // directly; an event-only callback must not enable smoothing early.
+      processor.reset();
+      if (!flushEvent())
+        return false;
+      processor.setSlotValue(0, 0.0F);
+      processor.setSlotValue(1, 0.0F);
+      if (!render(firstFrames, 0.0F, emptyMidi))
+        return false;
+    }
+  }
+  return true;
+}
+
+bool exerciseUiAndHostParameterChanges() {
+  using namespace onda::plugin;
+  TemporarySource source;
+  if (!source.write(R"(
+outs { out1, out2 }
+params { editor = 0.0 {0.0, 1.0}; automated: f64 = 0.0 {0.0, 1.0} }
+block {
+  cached_editor = editor
+  cached_automated = automated
+  sample { out1 = cached_editor; out2 = f32(cached_automated) }
+}
+)"))
+    return false;
+  Processor processor(Product::effect);
+  processor.loadFile(juce::File(pathToJuce(source.path())));
+  processor.prepareToPlay(1000.0, 8);
+  if (!std::is_eq(processor.paramSmoothingSeconds() <=> 0.03))
+    return false;
+  const auto render = [&](const float left, const std::array<float, 8> &right) {
+    juce::AudioBuffer<float> audio(2, 8);
+    juce::MidiBuffer midi;
+    allocation_audit::count.store(0, std::memory_order_relaxed);
+    lock_audit::count.store(0, std::memory_order_relaxed);
+    allocation_audit::enabled = lock_audit::enabled = true;
+    processor.processBlock(audio, midi);
+    allocation_audit::enabled = lock_audit::enabled = false;
+    if (allocation_audit::count.load(std::memory_order_relaxed) != 0 ||
+        lock_audit::count.load(std::memory_order_relaxed) != 0)
+      return false;
+    for (int frame = 0; frame < 8; ++frame) {
+      if (!test::withinTolerance(audio.getSample(0, frame) - left, 1.0e-6F) ||
+          !test::withinTolerance(audio.getSample(1, frame) -
+                                     right[static_cast<std::size_t>(frame)],
+                                 1.0e-6F)) {
+        std::cerr << "UI smoothing or host ownership failed at sample " << frame
+                  << " (left " << audio.getSample(0, frame) << ", expected "
+                  << left << ")\n";
+        return false;
+      }
+    }
+    return true;
+  };
+  const std::array<float, 8> held{0.8F, 0.8F, 0.8F, 0.8F,
+                                  0.8F, 0.8F, 0.8F, 0.8F};
+  if (!render(0.0F, {}))
+    return false;
+  processor.setSlotValue(0, 1.0F);
+  processor.getParameters()[1]->setValueNotifyingHost(0.8F);
+  if (!render(8.0F / 30.0F, held) || !render(16.0F / 30.0F, held))
+    return false;
+  juce::MemoryBlock saved;
+  processor.getStateInformation(saved);
+  Processor restored(Product::effect);
+  restored.setStateInformation(saved.getData(),
+                               static_cast<int>(saved.getSize()));
+  if (!std::is_eq(restored.slotValue(1) <=> 0.8F) ||
+      !std::is_eq(restored.paramSmoothingSeconds() <=> 0.03))
+    return false;
+  // Host changes cancel the UI ramp and remain authoritative on later calls.
+  processor.getParameters()[0]->setValueNotifyingHost(0.75F);
+  if (!render(0.75F, held) || !render(0.75F, held))
+    return false;
+  processor.setSlotValue(0, 0.0F);
+  if (!render(0.55F, held))
+    return false;
+  processor.getParameters()[0]->setValueNotifyingHost(0.0F);
+  return render(0.0F, held) && render(0.0F, held);
+}
+
 bool exerciseParameterSmoothing() {
   TemporarySource source;
   if (!source.write(R"(
@@ -2601,6 +2879,8 @@ block {
     return false;
 
   onda::plugin::Processor processor(onda::plugin::Product::effect);
+  if (!processor.setParamSmoothingSeconds(0.0))
+    return false;
   processor.prepareToPlay(1000.0, 8);
   processor.loadFile(juce::File(onda::plugin::pathToJuce(source.path())));
   if (!waitForOutput(processor, 0.0F, 8))
@@ -2637,41 +2917,46 @@ block {
     }
     return true;
   };
-  auto *const parameter = processor.getParameters()[0];
-  parameter->setValueNotifyingHost(1.0F);
-  if (!render(8, 8.0F / 30.0F) || !render(4, 12.0F / 30.0F))
+  processor.setSlotValue(0, 1.0F);
+  if (!render(8, 1.0F))
+    return false;
+  processor.setSlotValue(0, 0.0F);
+  if (!render(8, 0.0F) || !processor.setParamSmoothingSeconds(0.03))
+    return false;
+  processor.setSlotValue(0, 1.0F);
+  if (!render(8, 8.0F / 30.0F) || !render(8, 16.0F / 30.0F))
     return false;
   // Retarget from the last f32 value actually published to DSP.
   processor.setSlotValue(0, 0.0F);
-  const auto retargeted = 0.4F * (1.0F - 8.0F / 30.0F);
+  const auto retargeted = (16.0F / 30.0F) * (1.0F - 8.0F / 30.0F);
   if (!render(8, retargeted) || !processor.setParamSmoothingSeconds(0.02) ||
-      !render(4, retargeted * 0.8F) ||
-      !processor.setParamSmoothingSeconds(0.0) || !render(2, 0.0F))
+      !render(8, retargeted * 0.6F) ||
+      !processor.setParamSmoothingSeconds(0.0) || !render(8, 0.0F))
     return false;
-  parameter->setValueNotifyingHost(1.0F);
-  if (!render(2, 1.0F))
+  processor.setSlotValue(0, 1.0F);
+  if (!render(8, 1.0F))
     return false;
   // Durations no longer than the configured Onda block also update directly.
   if (!processor.setParamSmoothingSeconds(0.008))
     return false;
-  parameter->setValueNotifyingHost(0.0F);
+  processor.setSlotValue(0, 0.0F);
   if (!render(8, 0.0F) || !processor.setParamSmoothingSeconds(0.03))
     return false;
-  parameter->setValueNotifyingHost(1.0F);
+  processor.setSlotValue(0, 1.0F);
   for (const auto expected :
        {8.0F / 30.0F, 16.0F / 30.0F, 24.0F / 30.0F, 1.0F}) {
     // Repeated writes of the same target must not restart the ramp.
-    parameter->setValueNotifyingHost(1.0F);
+    processor.setSlotValue(0, 1.0F);
     if (!render(8, expected))
       return false;
   }
-  parameter->setValueNotifyingHost(0.0F);
+  processor.setSlotValue(0, 0.0F);
   if (!render(8, 22.0F / 30.0F))
     return false;
   processor.reset();
   if (!render(8, 0.0F))
     return false;
-  parameter->setValueNotifyingHost(1.0F);
+  processor.setSlotValue(0, 1.0F);
   if (!render(8, 8.0F / 30.0F))
     return false;
   processor.resetParametersToDefaults();
@@ -2728,7 +3013,7 @@ sample { out1 = f32(level); out2 = f32(level) }
   if (!waitForOutput(processor, 1.0F, 8) ||
       !processor.setParamSmoothingSeconds(0.016))
     return false;
-  processor.getParameters()[0]->setValueNotifyingHost(1.0F);
+  processor.setSlotValue(0, 1.0F);
   if (!render(8, 5000.5F) || !render(8, 10000.0F))
     return false;
 
@@ -2800,11 +3085,21 @@ sample { out1 = held * level; out2 = held * level }
     for (int frame = 0; frame < loopStart.getNumSamples(); ++frame) {
       if (!test::withinTolerance(loopStart.getSample(channel, frame),
                                  1.0e-6F)) {
-        std::cerr << "loop-boundary note used the previous callback's level "
+        std::cerr << "Loop-start MIDI observed the previous callback's level "
                   << "(slot " << processor.slotValue(0) << ", output "
                   << loopStart.getSample(channel, frame) << ")\n";
         return false;
       }
+    }
+  }
+
+  // Following callbacks retain the host value without smoothing.
+  juce::AudioBuffer<float> boundary(2, 8);
+  processor.processBlock(boundary, emptyMidi);
+  for (int channel = 0; channel < 2; ++channel) {
+    for (int frame = 0; frame < 8; ++frame) {
+      if (!test::withinTolerance(boundary.getSample(channel, frame), 1.0e-6F))
+        return false;
     }
   }
 
@@ -2848,13 +3143,12 @@ sample { out1 = level; out2 = level }
       processor, processor.workerStatus(), false, {});
   if (!static_cast<bool>(state["state"]["midiKeyboardInteractive"]))
     return false;
-  const auto renders = [&](const float expected) {
+  const auto renders = [&](const float expected, juce::MidiBuffer midi = {}) {
     juce::AudioBuffer<float> audio(2, 8);
     audio.clear();
-    juce::MidiBuffer midi;
     processor.processBlock(audio, midi);
     for (int frame = 0; frame < 8; ++frame) {
-      if (std::abs(audio.getSample(0, frame) - expected) > 0.0001F)
+      if (!test::withinTolerance(audio.getSample(0, frame) - expected, 0.0001F))
         return false;
     }
     return true;
@@ -2885,7 +3179,129 @@ sample { out1 = level; out2 = level }
     return false;
   processor.triggerMidiNote(-1, 1.0F, true);
   processor.triggerMidiNote(128, 1.0F, true);
+  if (!renders(0.0F))
+    return false;
+
+  processor.triggerMidiNote(60, 0.5F, true);
+  if (!renders(0.5F))
+    return false;
+  const auto generation = processor.workerStatus().engineGeneration;
+  processor.requestReload();
+  if (!test::waitUntil(
+          [&] {
+            const auto status = processor.workerStatus();
+            return status.active && !status.compiling &&
+                   status.engineGeneration != generation;
+          },
+          test::yieldToWorker) ||
+      !renders(0.0F))
+    return false;
+
+  juce::MidiBuffer hostNote;
+  hostNote.addEvent(juce::MidiMessage::noteOn(1, 60, 1.0F), 0);
+  if (!renders(1.0F, hostNote))
+    return false;
+  // The browser can release a virtual hold from before adoption. That release
+  // must not dispatch a note-off to the new engine's host voice.
+  processor.triggerMidiNote(60, 0.0F, false);
+  if (!renders(1.0F) || !processor.midiActivitySnapshot().active(60)) {
+    std::cerr << "an obsolete virtual key release silenced a new host note\n";
+    return false;
+  }
+  hostNote.clear();
+  hostNote.addEvent(juce::MidiMessage::noteOff(1, 60), 0);
+  if (!renders(0.0F, hostNote))
+    return false;
+  processor.triggerMidiNote(60, 0.5F, true);
+  if (!renders(0.5F))
+    return false;
+  processor.triggerMidiNote(60, 0.0F, false);
   return renders(0.0F);
+}
+
+bool exerciseHostBypass() {
+  using namespace onda::plugin;
+  TemporarySource source;
+  if (!source.write(R"(
+ins { in1, in2 }
+outs { out1, out2 }
+init { level = 0.0 }
+event note_on(id: i32, channel: i32, key: i32, velocity: f32) { level = velocity }
+event note_off(id: i32, channel: i32, key: i32, velocity: f32) { level = 0.0 }
+sample { out1 = in1 + level; out2 = in2 + level }
+)"))
+    return false;
+  for (const auto product : {Product::instrument, Product::effect}) {
+    Processor processor(product);
+    processor.loadFile(juce::File(pathToJuce(source.path())), false);
+    processor.prepareToPlay(48'000.0, 8);
+    processor.setScopeCaptureEnabled(true);
+    test::BypassReference reference;
+    const auto render = [&](const bool bypassed, const float wet,
+                            juce::MidiBuffer midi = {},
+                            const int changeOffset = 0,
+                            const float previousWet = 0.0F) {
+      juce::AudioBuffer<float> audio(2, 8);
+      for (int channel = 0; channel < 2; ++channel)
+        std::fill_n(audio.getWritePointer(channel), 8, 0.25F);
+      allocation_audit::count.store(0, std::memory_order_relaxed);
+      lock_audit::count.store(0, std::memory_order_relaxed);
+      reference.begin(bypassed, 8);
+      allocation_audit::enabled = lock_audit::enabled = true;
+      if (bypassed)
+        processor.processBlockBypassed(audio, midi);
+      else
+        processor.processBlock(audio, midi);
+      allocation_audit::enabled = lock_audit::enabled = false;
+      if (allocation_audit::count.load(std::memory_order_relaxed) != 0 ||
+          lock_audit::count.load(std::memory_order_relaxed) != 0) {
+        std::cerr << "host bypass allocated or locked on the audio thread\n";
+        return false;
+      }
+      for (int channel = 0; channel < 2; ++channel) {
+        for (int frame = 0; frame < 8; ++frame) {
+          const auto expected = reference.mix(
+              frame < changeOffset ? previousWet : wet,
+              product == Product::effect ? 0.25F : 0.0F, frame);
+          if (!test::withinTolerance(audio.getSample(channel, frame) - expected,
+                                     1.0e-6F)) {
+            std::cerr << "host bypass returned incorrect audio\n";
+            return false;
+          }
+        }
+      }
+      const auto scope = processor.scopeSnapshot();
+      const auto expected = reference.mix(
+          wet, product == Product::effect ? 0.25F : 0.0F, 7);
+      reference.end(8);
+      return scope.channels == 2 && !scope.samples.empty() &&
+             test::withinTolerance(scope.samples.back() - expected, 1.0e-6F);
+    };
+    juce::MidiBuffer noteOn, noteOff;
+    noteOn.addEvent(juce::MidiMessage::noteOn(1, 60, 1.0F), 0);
+    noteOff.addEvent(juce::MidiMessage::noteOff(1, 60), 4);
+    if (!render(false, 1.25F, noteOn) ||
+        !render(true, 0.25F, noteOff, 4, 1.25F) ||
+        processor.midiActivitySnapshot().active(60) ||
+        !render(false, 0.25F)) {
+      std::cerr << "a bypassed note release left a stuck voice\n";
+      return false;
+    }
+    // Presses and editor releases must also advance while output is bypassed.
+    if (!render(true, 1.25F, noteOn) ||
+        !processor.midiActivitySnapshot().active(60) ||
+        !render(false, 1.25F) || !render(true, 0.25F, noteOff, 4, 1.25F))
+      return false;
+    if (product == Product::instrument) {
+      processor.triggerMidiNote(64, 1.0F, true);
+      if (!render(false, 1.25F))
+        return false;
+      processor.releaseKeyboardNotes();
+      if (!render(true, 0.25F) || !render(false, 0.25F))
+        return false;
+    }
+  }
+  return true;
 }
 
 bool exerciseMidiKeyboardMonitor() {
@@ -3055,15 +3471,13 @@ bool exerciseHostContext() {
         << "context capture requested more than one snapshot per callback\n";
     return false;
   }
-  const auto projectedExpected =
-      0.102F + static_cast<float>((2.0 + 2.0 / 48'000.0) / 100.0) + 0.12F +
-      0.004F + 0.003F + 0.0034F + 0.0018F + 0.01F + 0.25F + 64.0F / 127.0F;
+  constexpr auto secondExpected =
+      0.1F + 0.02F + 0.12F + 0.008F + 0.003F + 0.0034F + 0.0018F + 0.01F + 0.25F;
   for (int frame = 0; frame < secondAudio.getNumSamples(); ++frame) {
-    const auto expected = frame < 2 ? firstExpected : projectedExpected;
-    const auto expectedSample = frame < 2 ? 0.1F : 0.102F;
+    const auto expected = secondExpected + (frame < 2 ? 0.0F : 64.0F / 127.0F);
     if (!test::withinTolerance(secondAudio.getSample(0, frame) - expected,
                                1.0e-5F) ||
-        !test::withinTolerance(secondAudio.getSample(1, frame) - expectedSample,
+        !test::withinTolerance(secondAudio.getSample(1, frame) - 0.1F,
                                1.0e-6F)) {
       std::cerr << "host context projection, availability, render mode, or "
                    "MIDI ordering failed\n";
@@ -3091,47 +3505,51 @@ bool exerciseTimelineProjection() {
   for (const auto &event : events) {
     for (const auto playing : {false, true}) {
       for (const auto declaresTransport : {false, true}) {
-        TemporarySource source;
-        auto text =
-            std::string{"outs { out1, out2 }\ninit { held = f64(0) }\n"} +
-            event.declaration +
-            "\nsample { out1 = f32(held); out2 = f32(held) }\n";
-        if (declaresTransport)
-          text += "event transport(playing: bool, recording: bool, looping: "
-                  "bool) {}\n";
-        if (!source.write(text))
-          return false;
+        for (const auto block : {3, 8}) {
+          TemporarySource source;
+          auto text =
+              std::string{"outs { out1, out2 }\ninit { held = f64(0) }\n"} +
+              event.declaration +
+              "\nsample { out1 = f32(held); out2 = f32(held) }\n";
+          if (declaresTransport)
+            text += "event transport(playing: bool, recording: bool, looping: "
+                    "bool) {}\n";
+          if (!source.write(text))
+            return false;
 
-        TestPlayHead playHead;
-        juce::AudioPlayHead::PositionInfo position;
-        position.setIsPlaying(playing);
-        position.setTimeInSamples(100);
-        position.setTimeInSeconds(2.0);
-        position.setPpqPosition(4.0);
-        // A stopped timeline needs no tempo to retain its exact PPQ.
-        if (playing)
-          position.setBpm(120.0);
-        playHead.setPosition(position);
-        onda::plugin::Processor processor(onda::plugin::Product::effect);
-        processor.setPlayHead(&playHead);
-        processor.loadFile(juce::File(onda::plugin::pathToJuce(source.path())),
-                           false);
-        processor.prepareToPlay(48'000.0, 8);
-        if (!processor.workerStatus().active)
-          return false;
-        juce::AudioBuffer<float> audio(2, 6);
-        juce::MidiBuffer midi;
-        for (int callback = 0; callback < 2; ++callback) {
-          processor.processBlock(audio, midi);
-          for (int frame = 0; frame < 6; ++frame) {
-            const auto offset =
-                callback == 1 && frame >= 2 && playing ? 2.0 : 0.0;
-            const auto expected =
-                static_cast<float>(event.value + offset * event.perFrame);
-            if (std::abs(audio.getSample(0, frame) - expected) > 1.0e-6F) {
-              std::cerr << "timeline projection ignored playback state: "
-                        << event.declaration << '\n';
-              return false;
+          TestPlayHead playHead;
+          juce::AudioPlayHead::PositionInfo position;
+          position.setIsPlaying(playing);
+          position.setTimeInSamples(100);
+          position.setTimeInSeconds(2.0);
+          position.setPpqPosition(4.0);
+          // A stopped timeline needs no tempo to retain its exact PPQ.
+          if (playing)
+            position.setBpm(120.0);
+          playHead.setPosition(position);
+          onda::plugin::Processor processor(onda::plugin::Product::effect);
+          processor.setPlayHead(&playHead);
+          processor.prepareToPlay(48'000.0, 8);
+          if (!processor.setPreferredBlockSize(block))
+            return false;
+          processor.loadFile(
+              juce::File(onda::plugin::pathToJuce(source.path())), false);
+          processor.prepareToPlay(48'000.0, 8);
+          if (!processor.workerStatus().active)
+            return false;
+          juce::AudioBuffer<float> audio(2, 6);
+          juce::MidiBuffer midi;
+          for (int callback = 0; callback < 2; ++callback) {
+            processor.processBlock(audio, midi);
+            for (int frame = 0; frame < 6; ++frame) {
+              const auto offset = playing ? frame / block * block : 0;
+              const auto expected =
+                  static_cast<float>(event.value + offset * event.perFrame);
+              if (std::abs(audio.getSample(0, frame) - expected) > 1.0e-6F) {
+                std::cerr << "timeline projection ignored playback state: "
+                          << event.declaration << '\n';
+                return false;
+              }
             }
           }
         }
@@ -3327,7 +3745,8 @@ bool exerciseReplacementDuringRuntimeFailure() {
     if (failure == Failure::reset)
       processor.reset();
     if (failure == Failure::event &&
-        !processor.triggerEvent("fail", juce::Array<juce::var>{}).empty()) {
+        !processor.triggerEvent(generation, "fail", juce::Array<juce::var>{})
+             .empty()) {
       return false;
     }
 
@@ -3561,6 +3980,8 @@ bool exerciseReplacementDuringSeeding() {
                          "out1 = value; out2 = value }\n"))
     return false;
   Processor processor(Product::effect);
+  if (!processor.setParamSmoothingSeconds(0.03))
+    return false;
   processor.prepareToPlay(48'000.0, 64);
   processor.setSlotValue(0, 0.4F);
   processor.setSlotValue(1, 0.1F);
@@ -4071,6 +4492,77 @@ sample { out1 = clip[0, 0] + extra[0, 0]; out2 = clip[0, 0] + extra[0, 0] }
   return processor.workerStatus().bufferChoices().empty();
 }
 
+bool exerciseStaleEditorEvents() {
+  using namespace onda::plugin;
+  TemporarySource source;
+  if (!source.write("outs { out1, out2 }\ninit { held = 0.125 }\n"
+                    "event configure(level: f32) { held = level }\n"
+                    "sample { out1 = held; out2 = held }\n"))
+    return false;
+  Processor processor(Product::effect);
+  processor.loadFile(juce::File(pathToJuce(source.path())), false);
+  processor.prepareToPlay(48'000.0, 64);
+  if (!rendersImmediately(processor, 64, 0.125F))
+    return false;
+  auto editor = std::make_unique<Editor>(processor);
+  const auto before = processor.workerStatus();
+  const auto send = [&](const juce::var &generation) {
+    juce::var command{new juce::DynamicObject};
+    command.getDynamicObject()->setProperty("type", "triggerEvent");
+    command.getDynamicObject()->setProperty("name", "configure");
+    command.getDynamicObject()->setProperty("values",
+                                            juce::Array<juce::var>{0.75});
+    command.getDynamicObject()->setProperty("engineGeneration", generation);
+    EditorTestAccess::command(*editor, command);
+  };
+  const auto oldGeneration =
+      juce::String(std::to_string(before.engineGeneration));
+  // First queue an event for the old engine, then publish a compatible
+  // same-name event without refreshing the editor or adopting the replacement.
+  send(oldGeneration);
+  if (!source.write(
+          "outs { out1, out2 }\ninit { held = 0.25 }\n"
+          "event configure(delaySeconds: f64) { held = f32(delaySeconds) }\n"
+          "sample { out1 = held; out2 = held }\n"))
+    return false;
+  processor.requestReload();
+  if (!test::waitUntil(
+          [&] {
+            const auto status = processor.workerStatus();
+            return status.active && !status.compiling &&
+                   status.engineGeneration != before.engineGeneration;
+          },
+          test::yieldToWorker))
+    return false;
+  const auto after = processor.workerStatus();
+  send(oldGeneration);
+  if (processor
+          .triggerEvent(before.engineGeneration, "configure",
+                        juce::Array<juce::var>{0.75})
+          .empty() ||
+      !rendersImmediately(processor, 64, 0.25F)) {
+    std::cerr << "stale editor event reached the replacement program\n";
+    return false;
+  }
+  for (const auto &invalid :
+       {juce::var{}, juce::var{1}, juce::var{"-1"}, juce::var{"1junk"},
+        juce::var{"18446744073709551616"}}) {
+    send(invalid);
+    if (!rendersImmediately(processor, 64, 0.25F)) {
+      std::cerr << "invalid editor event generation was accepted\n";
+      return false;
+    }
+  }
+  const auto currentGeneration =
+      juce::String(std::to_string(after.engineGeneration));
+  const auto state = makeRunViewState(processor, after, true, {});
+  if (!state["state"]["engineGeneration"].isString() ||
+      state["state"]["engineGeneration"].toString() != currentGeneration)
+    return false;
+  send(currentGeneration);
+  return rendersImmediately(processor, 64, 0.75F);
+}
+
 bool exerciseAutomaticEventReplacement() {
   using namespace onda::plugin;
   TemporarySource source;
@@ -4085,7 +4577,10 @@ bool exerciseAutomaticEventReplacement() {
   if (!rendersImmediately(processor, 64, 0.125F))
     return false;
   const auto before = processor.workerStatus();
-  if (!processor.triggerEvent("alpha", juce::Array<juce::var>{0.5}).empty() ||
+  if (!processor
+           .triggerEvent(before.engineGeneration, "alpha",
+                         juce::Array<juce::var>{0.5})
+           .empty() ||
       !source.write("outs { out1, out2 }\ninit { held = 0.25 }\n"
                     "event beta(values: f64[]) { held = 0.875 }\n"
                     "sample { out1 = held; out2 = held }\n") ||
@@ -4099,8 +4594,9 @@ bool exerciseAutomaticEventReplacement() {
     return false;
   }
   return processor
-             .triggerEvent("beta", juce::Array<juce::var>{juce::var{
-                                       juce::Array<juce::var>{1.0, 2.0}}})
+             .triggerEvent(after.engineGeneration, "beta",
+                           juce::Array<juce::var>{
+                               juce::var{juce::Array<juce::var>{1.0, 2.0}}})
              .empty() &&
          rendersImmediately(processor, 64, 0.875F);
 }
@@ -4307,6 +4803,7 @@ int main(const int argc, const char *const *argv) {
   };
   const Case cases[]{
       {"AlignedAllocation", exerciseAlignedAllocation},
+      {"NewControlDefaults", exerciseNewControlDefaults},
       {"HostPreparation", exerciseHostPreparation},
       {"PreparedParameterInitialization",
        exercisePreparedParameterInitialization},
@@ -4325,6 +4822,7 @@ int main(const int argc, const char *const *argv) {
       {"UserEvents", exerciseUserEvents},
       {"StructuredEvents", exerciseStructuredEvents},
       {"HostParameterPresentation", exerciseHostParameterPresentation},
+      {"UnrangedParameters", exerciseUnrangedParameters},
       {"RuntimeLogging", exerciseRuntimeLogging},
       {"effect", +[] { return exercise(onda::plugin::Product::effect); }},
       {"instrument",
@@ -4332,6 +4830,7 @@ int main(const int argc, const char *const *argv) {
       {"StateRestore", exerciseStateRestore},
       {"EditorLifecycle", exerciseEditorLifecycle},
       {"EditorGestureCancellation", exerciseEditorGestureCancellation},
+      {"StaleEditorEvents", exerciseStaleEditorEvents},
       {"AudioFileBuffers", exerciseAudioFileBuffers},
       {"ProjectBufferOverrideRestore", exerciseProjectBufferOverrideRestore},
       {"IncompleteBufferStateRestore", exerciseIncompleteBufferStateRestore},
@@ -4340,9 +4839,34 @@ int main(const int argc, const char *const *argv) {
       {"ProjectExportRelinksAuthority", exerciseProjectExportRelinksAuthority},
       {"ExtendedMidi", exerciseExtendedMidi},
       {"HostAutomationBeforeMidi", exerciseHostAutomationBeforeMidi},
+      {"EventOnlyParameterSmoothing", exerciseEventOnlyParameterSmoothing},
+      {"UiAndHostParameterChanges", exerciseUiAndHostParameterChanges},
+      {"BlockProcessing", exerciseBlockProcessing},
+      {"CallbackProcessing", exerciseCallbackProcessing},
+      {"CallbackSmoothing", exerciseCallbackSmoothing},
+      {"AutomationDuringSeeding", exerciseAutomationDuringSeeding},
+      {"ScratchHandoff", exerciseScratchHandoff},
+      {"ControlInputs", exerciseControlInputs},
+      {"ControlAutomation", exerciseControlAutomation},
+      {"ControlRendering", exerciseControlRendering},
+      {"InputControlEditor", exerciseInputControlEditor},
+      {"ParameterEndpointPrecision", exerciseParameterEndpointPrecision},
+      {"ParameterDefaultPrecision", exerciseParameterDefaultPrecision},
+      {"ControlEndpointPrecision", exerciseControlEndpointPrecision},
+      {"ControlDefaultPrecision", exerciseControlDefaultPrecision},
+      {"SeedNotificationThreads", exerciseSeedNotificationThreads},
+      {"ParameterDefaultNotifications", exerciseParameterDefaultNotifications},
+      {"AutomationAfterUnload", exerciseAutomationAfterUnload},
+      {"AutomationFlushAfterUnload", exerciseAutomationFlushAfterUnload},
+      {"AutomationFlushAfterFault", exerciseAutomationFlushAfterFault},
+      {"AutomationEchoWork", exerciseAutomationEchoWork},
+      {"UnloadedEndpointPrecision", exerciseUnloadedEndpointPrecision},
+      {"UnloadedDefaultPrecision", exerciseUnloadedDefaultPrecision},
       {"ParameterSmoothing", exerciseParameterSmoothing},
       {"MidiKeyboardMonitor", exerciseMidiKeyboardMonitor},
       {"ClickableMidiKeyboard", exerciseClickableMidiKeyboard},
+      {"HostBypass", exerciseHostBypass},
+      {"BypassTransitions", exerciseBypassTransitions},
       {"EventMetadataGating", exerciseEventMetadataGating},
       {"HostContext", exerciseHostContext},
       {"TimelineProjection", exerciseTimelineProjection},

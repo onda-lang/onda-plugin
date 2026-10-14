@@ -1,6 +1,7 @@
 #include "Processor.h"
 
 #include "Editor.h"
+#include "HostParameter.h"
 #include "JucePath.h"
 #include "ProjectExport.h"
 #include "ProjectPath.h"
@@ -86,6 +87,11 @@ std::string slotId(const std::size_t index) {
   const auto number = static_cast<int>(index + 1U);
   return number < 10 ? "slot0" + std::to_string(number)
                      : "slot" + std::to_string(number);
+}
+
+std::string controlId(const std::size_t index) {
+  return "input" + (index < 9U ? std::string{"0"} : std::string{}) +
+         std::to_string(index + 1U);
 }
 
 float normalized(const float value) noexcept {
@@ -209,181 +215,44 @@ ProjectImage readProjectImage(juce::MemoryInputStream &stream, bool &valid) {
 
 } // namespace
 
-class Processor::SlotParameter final : public juce::AudioParameterFloat {
-public:
-  explicit SlotParameter(const std::size_t index)
-      : AudioParameterFloat(juce::ParameterID{slotId(index), 1},
-                            slotName(index),
-                            juce::NormalisableRange<float>{0.0F, 1.0F}, 0.5F),
-        slotName_(slotName(index)) {}
-
-  bool setMapping(const ParameterMapping *const mapping) {
-    std::lock_guard lock(mappingMutex_);
-    if ((mapping == nullptr && !mapping_) ||
-        (mapping != nullptr && mapping_ && *mapping == *mapping_)) {
-      return false;
-    }
-    mapping_ = mapping == nullptr
-                   ? std::shared_ptr<const ParameterMapping>{}
-                   : std::make_shared<const ParameterMapping>(*mapping);
-    return true;
-  }
-
-  juce::String getName(const int maximumLength) const override {
-    const auto mapping = mappingSnapshot();
-    if (mapping && maximumLength <= 8)
-      return juce::String(mapping->name).substring(0, maximumLength);
-    const auto displayName =
-        mapping ? juce::String(mapping->name) + " [" + slotName_ + "]"
-                : slotName_;
-    return displayName.substring(0, maximumLength);
-  }
-
-  juce::String getLabel() const override {
-    const auto mapping = mappingSnapshot();
-    return mapping ? juce::String(mapping->unit) : juce::String{};
-  }
-
-  float getDefaultValue() const override {
-    const auto mapping = mappingSnapshot();
-    return mapping ? static_cast<float>(mapping->defaultNormalized) : 0.5F;
-  }
-
-  int getNumSteps() const override {
-    const auto mapping = mappingSnapshot();
-    if (!mapping)
-      return juce::AudioProcessorParameter::getDefaultNumParameterSteps();
-    if (mapping->type == "bool")
-      return 2;
-    if (!mapping->stepCount)
-      return juce::AudioProcessorParameter::getDefaultNumParameterSteps();
-    constexpr auto maximum = std::numeric_limits<int>::max();
-    if (*mapping->stepCount >= static_cast<std::int64_t>(maximum - 1))
-      return maximum;
-    return static_cast<int>(*mapping->stepCount + 1);
-  }
-
-  bool isDiscrete() const override {
-    const auto mapping = mappingSnapshot();
-    return mapping && (mapping->type == "bool" || mapping->stepCount);
-  }
-
-  bool isBoolean() const override {
-    const auto mapping = mappingSnapshot();
-    return mapping && mapping->type == "bool";
-  }
-
-  juce::String getText(const float normalizedValue,
-                       const int maximumLength) const override {
-    const auto mapping = mappingSnapshot();
-    if (!mapping)
-      return truncate(juce::String(normalizedValue), maximumLength);
-    if (mapping->type == "bool")
-      return truncate(normalizedValue >= 0.5F ? "On" : "Off", maximumLength);
-
-    const auto parameterDomain = domain(*mapping);
-    const auto plain = onda_processor_param_normalized_to_plain(
-        &parameterDomain, static_cast<double>(normalizedValue));
-    const auto text =
-        mapping->type == "i32" || mapping->type == "i64"
-            ? juce::String(static_cast<juce::int64>(std::llround(plain)))
-            : juce::String(plain);
-    return truncate(text, maximumLength);
-  }
-
-  float getValueForText(const juce::String &text) const override {
-    const auto mapping = mappingSnapshot();
-    if (!mapping)
-      return normalizedText(text);
-    if (mapping->type == "bool") {
-      const auto lowered = text.trim().toLowerCase();
-      if (lowered == "on" || lowered == "true" || lowered == "yes")
-        return 1.0F;
-      if (lowered == "off" || lowered == "false" || lowered == "no")
-        return 0.0F;
-      return lowered.getDoubleValue() >= 0.5 ? 1.0F : 0.0F;
-    }
-
-    const auto parameterDomain = domain(*mapping);
-    const auto normalizedValue = onda_processor_param_plain_to_normalized(
-        &parameterDomain, text.getDoubleValue());
-    return std::isfinite(normalizedValue)
-               ? static_cast<float>(std::clamp(normalizedValue, 0.0, 1.0))
-               : 0.5F;
-  }
-
-private:
-  [[nodiscard]] std::shared_ptr<const ParameterMapping>
-  mappingSnapshot() const {
-    std::lock_guard lock(mappingMutex_);
-    return mapping_;
-  }
-
-  static juce::String slotName(const std::size_t index) {
-    return "Slot " + juce::String(static_cast<int>(index + 1U));
-  }
-
-  static juce::String truncate(juce::String text, const int maximumLength) {
-    return maximumLength > 0 ? text.substring(0, maximumLength) : text;
-  }
-
-  static float normalizedText(const juce::String &text) {
-    const auto value = text.getDoubleValue();
-    return std::isfinite(value)
-               ? static_cast<float>(std::clamp(value, 0.0, 1.0))
-               : 0.5F;
-  }
-
-  static onda_processor_param_scalar scalar(const std::string_view type) {
-    if (type == "f64")
-      return ONDA_PROCESSOR_PARAM_SCALAR_F64;
-    if (type == "i32")
-      return ONDA_PROCESSOR_PARAM_SCALAR_I32;
-    if (type == "i64")
-      return ONDA_PROCESSOR_PARAM_SCALAR_I64;
-    return ONDA_PROCESSOR_PARAM_SCALAR_F32;
-  }
-
-  static onda_processor_param_domain domain(const ParameterMapping &mapping) {
-    return {
-        .minimum = mapping.rangeMin,
-        .maximum = mapping.rangeMax,
-        .step = mapping.step.value_or(0.0),
-        .curve = mapping.curve.value_or(0.0),
-        .step_count = static_cast<std::uint32_t>(mapping.stepCount.value_or(0)),
-        .scale = mapping.scale == "log" ? ONDA_PROCESSOR_PARAM_SCALE_LOG
-                                        : ONDA_PROCESSOR_PARAM_SCALE_LINEAR,
-        .scalar = scalar(mapping.type),
-        .has_curve = static_cast<std::uint8_t>(mapping.curve.has_value()),
-        .unit = nullptr,
-    };
-  }
-
-  const juce::String slotName_;
-  mutable std::mutex mappingMutex_;
-  std::shared_ptr<const ParameterMapping> mapping_;
-};
-
 Processor::Processor(const Product product)
-    : AudioProcessor(buses()), product_(product),
-      parameterState_(*this, nullptr, "OndaSlots", parameters()) {
+    : AudioProcessor(buses()), product_(product) {
   for (std::size_t index = 0; index < slotCount; ++index) {
     const auto id = slotId(index);
-    slotAtomics_[index] = parameterState_.getRawParameterValue(id);
-    slotParameters_[index] = parameterState_.getParameter(id);
-    presentedSlotParameters_[index] =
-        dynamic_cast<SlotParameter *>(slotParameters_[index]);
-    jassert(slotAtomics_[index] != nullptr &&
-            slotParameters_[index] != nullptr &&
-            presentedSlotParameters_[index] != nullptr);
+    hostParameterIds_[index] = {
+        juce::VST3ClientExtensions::convertJuceParameterId(id), index, false};
+    auto parameter = std::make_unique<HostParameter>(
+        id, "Slot " + juce::String(static_cast<int>(index + 1U)),
+        slotState_[index], true);
+    slotParameters_[index] = parameter.get();
+    addParameter(parameter.release());
   }
+  for (std::size_t index = 0; index < controlCount; ++index) {
+    const auto id = controlId(index);
+    hostParameterIds_[slotCount + index] = {
+        juce::VST3ClientExtensions::convertJuceParameterId(id), index, true};
+    auto parameter = std::make_unique<HostParameter>(
+        id, "Control " + juce::String(static_cast<int>(index + 1U)),
+        controlState_[index], false);
+    controlParameters_[index] = parameter.get();
+    addParameter(parameter.release());
+  }
+  std::ranges::sort(hostParameterIds_, {}, &HostParameterId::id);
   worker_ = std::make_unique<Worker>(
       product_, replacements_, retirements_, deactivateRequested_,
       Worker::BuildFunction{}, nullptr,
       [this] {
-        ParameterValues values;
-        for (std::size_t index = 0; index < slotCount; ++index)
-          values[index] = slotValue(index);
+        HostParameterValues values;
+        for (std::size_t index = 0; index < slotCount; ++index) {
+          const auto target = slotState_.preciseSnapshot(index);
+          values.parameters[index] = target.value;
+          values.parameterStamps[index] = target.stamp;
+        }
+        for (std::size_t index = 0; index < controlCount; ++index) {
+          const auto target = controlState_.preciseSnapshot(index);
+          values.controls[index] = target.value;
+          values.controlStamps[index] = target.stamp;
+        }
         return values;
       },
       Worker::ProjectBuildFunction{}, [this] { triggerAsyncUpdate(); });
@@ -398,6 +267,9 @@ Processor::~Processor() {
   delete replacements_.tryPop();
   delete retirements_.tryPop();
   delete active_;
+  delete scratchReplacements_.tryPop();
+  delete scratchRetirements_.tryPop();
+  delete dryScratch_;
 }
 
 juce::AudioProcessor::BusesProperties Processor::buses() {
@@ -407,48 +279,53 @@ juce::AudioProcessor::BusesProperties Processor::buses() {
         "Input",
         juce::AudioChannelSet::canonicalChannelSet(pluginInputChannels), true);
   }
+  for (int index = 0; index < pluginControlInputs; ++index)
+    result = result.withInput("Control " + juce::String(index + 1),
+                              juce::AudioChannelSet::mono(), false);
   return result.withOutput(
       "Output",
       juce::AudioChannelSet::canonicalChannelSet(pluginOutputChannels), true);
-}
-
-juce::AudioProcessorValueTreeState::ParameterLayout Processor::parameters() {
-  juce::AudioProcessorValueTreeState::ParameterLayout layout;
-  for (std::size_t index = 0; index < slotCount; ++index)
-    layout.add(std::make_unique<SlotParameter>(index));
-  return layout;
 }
 
 void Processor::prepareToPlay(const double sampleRate,
                               const int maximumBlockSize) {
   std::unique_lock preparationLock(preparationMutex_);
   const auto safeBlockSize = std::max(maximumBlockSize, 1);
+  const auto oldOndaBlockSize = ondaBlockSize();
+  const auto preference = preferredBlockSize();
+  const auto ondaSize =
+      preference > 0 ? std::min(preference, safeBlockSize) : safeBlockSize;
   const auto changed =
       !sameSampleRate(sampleRate,
                       expectedSampleRate_.load(std::memory_order_acquire)) ||
-      safeBlockSize != expectedBlockSize_.load(std::memory_order_acquire);
+      ondaSize != oldOndaBlockSize;
   expectedSampleRate_.store(sampleRate, std::memory_order_release);
   expectedBlockSize_.store(safeBlockSize, std::memory_order_release);
-  for (auto &channel : dryScratch_)
-    channel.resize(static_cast<std::size_t>(safeBlockSize));
+  auto scratch = std::make_unique<DryScratch>(safeBlockSize);
+  // Host preparation runs with audio suspended; reclaim all scratch directly.
+  delete scratchReplacements_.tryPop();
+  delete scratchRetirements_.tryPop();
+  delete std::exchange(dryScratch_, scratch.release());
+  bypassMix_.reset(sampleRate, 0.005);
+  bypassStarted_ = false;
   if (changed) {
     deactivateRequested_.store(true, std::memory_order_release);
   }
   clearMidiActivity();
-  worker_->configure(sampleRate, safeBlockSize);
+  worker_->configure(sampleRate, ondaSize);
   configuredBlockSize_.store(safeBlockSize, std::memory_order_release);
-  const auto seeded = synchronizeEngine();
+  synchronizeEngine();
   preparationLock.unlock();
-  notifySlotValues(seeded);
+  notifyDeferredAutomation();
 }
 
-std::size_t Processor::synchronizeEngine() {
+void Processor::synchronizeEngine() {
   // Called with audio suspended during host preparation, or from an offline
   // callback. Neither path needs a message-loop tick to finish preparation.
   offlinePreparedGeneration_ = worker_->waitForPreparation();
   delete retirements_.tryPop();
   acquireEngine();
-  return applySeedValues();
+  applySeedValues();
 }
 
 double Processor::getTailLengthSeconds() const {
@@ -467,14 +344,24 @@ void Processor::reset() {
 }
 
 bool Processor::isBusesLayoutSupported(const BusesLayout &layouts) const {
+  if (layouts.inputBuses.size() != pluginInputBuses ||
+      layouts.outputBuses.size() != 1)
+    return false;
   const auto expectedOutput =
       juce::AudioChannelSet::canonicalChannelSet(pluginOutputChannels);
   if (layouts.getMainOutputChannelSet() != expectedOutput)
     return false;
-  if constexpr (pluginInputChannels == 0)
-    return layouts.getMainInputChannelSet().isDisabled();
-  return layouts.getMainInputChannelSet() ==
-         juce::AudioChannelSet::canonicalChannelSet(pluginInputChannels);
+  if constexpr (pluginInputChannels > 0) {
+    if (layouts.inputBuses[0] !=
+        juce::AudioChannelSet::canonicalChannelSet(pluginInputChannels))
+      return false;
+  }
+  for (int index = pluginMainInputBuses; index < pluginInputBuses; ++index) {
+    const auto &layout = layouts.inputBuses[index];
+    if (!layout.isDisabled() && layout != juce::AudioChannelSet::mono())
+      return false;
+  }
+  return true;
 }
 
 const juce::String Processor::getName() const {
@@ -520,10 +407,40 @@ void Processor::acquireEngine() noexcept {
   replacement->attachLogSink(runtimeLogSink_);
   active_ = replacement;
   activeFaulted_ = false;
+  if (auto *seed = active_->parameterSeed();
+      seed != nullptr && !seed->started.load(std::memory_order_acquire)) {
+    for (std::size_t index = 0; index < seed->count; ++index)
+      seed->parameterStamps.before[index] = slotState_.snapshot(index).stamp;
+    for (std::size_t index = 0; index < seed->controlCount; ++index)
+      seed->controlStamps.before[index] = controlState_.snapshot(index).stamp;
+    seed->started.store(true, std::memory_order_release);
+  }
   worker_->setActiveGeneration(replacement->buildGeneration());
+  const auto initialized = active_->initializeControlDefaults(
+      controlState_, controlAutomation_.retainedLanes());
+  detail::forEachAutomationLane(
+      initialized,
+      [this](const std::size_t index) noexcept {
+        controlAutomation_.notify(index);
+      });
+  if (initialized != 0U)
+    defaultValuesChanged_.store(true, std::memory_order_release);
   clearMidiActivity();
   scopeCapture_.requestReset();
   runtimeFaulted_.store(false, std::memory_order_release);
+}
+
+void Processor::acquireDryScratch() noexcept {
+  if (scratchReplacements_.empty() || !scratchRetirements_.empty())
+    return;
+  if (auto *replacement = scratchReplacements_.tryPop()) {
+    if (dryScratch_ != nullptr) {
+      const auto retired = scratchRetirements_.tryPush(dryScratch_);
+      jassert(retired);
+      juce::ignoreUnused(retired);
+    }
+    dryScratch_ = replacement;
+  }
 }
 
 void Processor::faultActive() noexcept {
@@ -647,8 +564,64 @@ void Processor::fallback(juce::AudioBuffer<float> &audio) noexcept {
     audio.clear(channel, 0, audio.getNumSamples());
 }
 
+void Processor::restoreDry(float *const *outputs, const int offset,
+                           const int frames) noexcept {
+  for (int channel = 0; channel < pluginOutputChannels; ++channel) {
+    auto *output = outputs[channel] + offset;
+    if (product_ == Product::effect && channel < pluginPassthroughChannels)
+      std::copy_n(dryScratch_->channel(static_cast<std::size_t>(channel)) + offset,
+                  frames, output);
+    else
+      std::fill_n(output, frames, 0.0F);
+  }
+}
+
+void Processor::applyBypass(float *const *outputs, const int frames,
+                            const bool bypassed) noexcept {
+  if (frames <= 0)
+    return;
+  const auto target = bypassed ? 0.0 : 1.0;
+  if (!bypassStarted_) {
+    bypassMix_.setCurrentAndTargetValue(target);
+    bypassStarted_ = true;
+  } else {
+    bypassMix_.setTargetValue(target);
+  }
+  // Advance once per real sample, after all DSP/MIDI segments. Retargeting
+  // starts at the current mix, and settled wet output needs no extra pass.
+  int frame = 0;
+  while (frame < frames && bypassMix_.isSmoothing()) {
+    const auto wet = bypassMix_.getNextValue();
+    for (int channel = 0; channel < pluginOutputChannels; ++channel) {
+      const auto dry =
+          product_ == Product::effect && channel < pluginPassthroughChannels
+              ? dryScratch_->channel(static_cast<std::size_t>(channel))[frame]
+              : 0.0F;
+      outputs[channel][frame] =
+          wet <= 0.0
+              ? dry
+              : static_cast<float>(std::lerp(
+                    static_cast<double>(dry),
+                    static_cast<double>(outputs[channel][frame]), wet));
+    }
+    ++frame;
+  }
+  if (bypassed)
+    restoreDry(outputs, frame, frames - frame);
+}
+
 void Processor::processBlock(juce::AudioBuffer<float> &audio,
                              juce::MidiBuffer &midi) {
+  processAudio(audio, midi, false);
+}
+
+void Processor::processBlockBypassed(juce::AudioBuffer<float> &audio,
+                                     juce::MidiBuffer &midi) {
+  processAudio(audio, midi, true);
+}
+
+void Processor::processAudio(juce::AudioBuffer<float> &audio,
+                             juce::MidiBuffer &midi, const bool bypassed) {
   juce::ScopedNoDenormals noDenormals;
   const auto frames = audio.getNumSamples();
   if (isNonRealtime()) {
@@ -661,16 +634,19 @@ void Processor::processBlock(juce::AudioBuffer<float> &audio,
                     required);
     else if (offlinePreparedGeneration_ != worker_->requestGeneration()) {
       std::unique_lock preparationLock(preparationMutex_);
-      const auto seeded = synchronizeEngine();
+      synchronizeEngine();
       preparationLock.unlock();
-      notifySlotValues(seeded);
+      notifyDeferredAutomation();
     }
   }
+  acquireDryScratch();
   const auto maximum = expectedBlockSize_.load(std::memory_order_acquire);
-  if (frames < 0 || frames > maximum || maximum <= 0) {
+  if (frames < 0 || frames > maximum || maximum <= 0 ||
+      dryScratch_ == nullptr || frames > dryScratch_->capacity) {
     fallback(audio);
     if (frames > maximum && frames > 0) {
-      deactivateRequested_.store(true, std::memory_order_release);
+      if (preferredBlockSize() == 0 || preferredBlockSize() > maximum)
+        deactivateRequested_.store(true, std::memory_order_release);
       expectedBlockSize_.store(frames, std::memory_order_release);
     }
     return;
@@ -681,10 +657,18 @@ void Processor::processBlock(juce::AudioBuffer<float> &audio,
       active_ == nullptr || activeFaulted_ ||
       !sameSampleRate(active_->sampleRate(),
                       expectedSampleRate_.load(std::memory_order_acquire)) ||
-      active_->blockSize() != maximum) {
+      active_->blockSize() != ondaBlockSize()) {
     fallback(audio);
     return;
   }
+
+  active_->beginHostCallback(
+      frames, &hostAutomation_.curves, &controlState_,
+      &controlAutomation_.curves,
+      automationCaptured_ && automationCapturedDefaults_ &&
+          automationCapturedSeed_ == active_->parameterSeedRevision());
+  reconcileHostAutomation(active_,
+                          active_->hostCallbackUsesParameterDefaults());
 
   HostContext hostContext;
   hostContext.realtime = !isNonRealtime();
@@ -698,7 +682,7 @@ void Processor::processBlock(juce::AudioBuffer<float> &audio,
   }
 
   if (resetRequested_.exchange(false, std::memory_order_acq_rel) &&
-      !active_->reset(slotAtomics_)) {
+      !active_->reset(slotState_)) {
     faultActive();
     fallback(audio);
     return;
@@ -707,13 +691,15 @@ void Processor::processBlock(juce::AudioBuffer<float> &audio,
   if (parameterSettleRequested_.exchange(false, std::memory_order_acq_rel))
     active_->settleParameters();
   if (!active_->setParameterSmoothingSeconds(paramSmoothingSeconds()) ||
-      !active_->beginHostCallback(slotAtomics_, frames)) {
+      !active_->setInputControlSmoothingSeconds(
+          inputControlSmoothingSeconds())) {
     faultActive();
     fallback(audio);
     return;
   }
-
-  while (userEvents_.tryPop(userEventScratch_)) {
+  for (std::size_t count = 0;
+       count < userEventQueueCapacity && userEvents_.tryPop(userEventScratch_);
+       ++count) {
     if (userEventScratch_.generation != active_->buildGeneration())
       continue;
     if (userEventScratch_.payloadBytes > userEventScratch_.payload.size()) {
@@ -725,7 +711,7 @@ void Processor::processBlock(juce::AudioBuffer<float> &audio,
         userEventScratch_.eventIndex,
         {userEventScratch_.payload.data(),
          static_cast<std::size_t>(userEventScratch_.payloadBytes)},
-        slotAtomics_, hostContext);
+        slotState_, hostContext);
     if (result == EventTriggerResult::inputRejected)
       continue;
     if (result == EventTriggerResult::runtimeFailure) {
@@ -736,28 +722,44 @@ void Processor::processBlock(juce::AudioBuffer<float> &audio,
   }
 
   if (product_ == Product::effect) {
-    for (int channel = 0; channel < static_cast<int>(dryScratch_.size());
-         ++channel) {
+    for (int channel = 0; channel < pluginPassthroughChannels; ++channel) {
       std::copy_n(audio.getReadPointer(channel), frames,
-                  dryScratch_[static_cast<std::size_t>(channel)].data());
+                  dryScratch_->channel(static_cast<std::size_t>(channel)));
     }
   }
 
-  std::array<float *, static_cast<std::size_t>(pluginInputChannels)> inputs{};
-  for (int channel = 0; channel < pluginInputChannels; ++channel)
+  const auto inputCount = active_->inputChannels();
+  // Only the program's declared input prefix is initialized and consumed.
+  std::array<float *, static_cast<std::size_t>(pluginTotalInputChannels)>
+      inputs;
+  for (int channel = 0; channel < std::min(inputCount, pluginInputChannels);
+       ++channel)
     inputs[static_cast<std::size_t>(channel)] = audio.getWritePointer(channel);
+  // JUCE packs enabled buses, while Onda's control channel positions are fixed.
+  // Null pointers leave disconnected controls at their prepared defaults.
+  auto hostChannel = pluginInputChannels;
+  for (int control = 0; control < inputCount - pluginInputChannels; ++control) {
+    auto &input =
+        inputs[static_cast<std::size_t>(pluginInputChannels + control)];
+    if (getChannelCountOfBus(true, pluginMainInputBuses + control) != 0) {
+      input = audio.getWritePointer(hostChannel++);
+    } else {
+      input = nullptr;
+    }
+  }
   std::array<float *, static_cast<std::size_t>(pluginOutputChannels)> outputs{};
   for (int channel = 0; channel < pluginOutputChannels; ++channel)
     outputs[static_cast<std::size_t>(channel)] = audio.getWritePointer(channel);
   const auto processRange =
-      [this, &inputs, &outputs,
+      [this, &inputs, &outputs, inputCount,
        &hostContext](const int offset, const int count,
                      const std::span<const MidiEvent> events) noexcept {
-        std::array<float *, static_cast<std::size_t>(pluginInputChannels)>
-            shiftedInputs{};
-        for (int channel = 0; channel < pluginInputChannels; ++channel) {
+        std::array<float *, static_cast<std::size_t>(pluginTotalInputChannels)>
+            shiftedInputs;
+        for (int channel = 0; channel < inputCount; ++channel) {
+          auto *input = inputs[static_cast<std::size_t>(channel)];
           shiftedInputs[static_cast<std::size_t>(channel)] =
-              inputs[static_cast<std::size_t>(channel)] + offset;
+              input != nullptr ? input + offset : nullptr;
         }
         std::array<float *, static_cast<std::size_t>(pluginOutputChannels)>
             shiftedOutputs{};
@@ -766,8 +768,7 @@ void Processor::processBlock(juce::AudioBuffer<float> &audio,
               outputs[static_cast<std::size_t>(channel)] + offset;
         }
         return active_->process(shiftedInputs.data(), shiftedOutputs.data(),
-                                count, events, slotAtomics_, hostContext,
-                                offset);
+                                count, events, slotState_, hostContext, offset);
       };
 
   if (keyboardGeneration_ != active_->buildGeneration()) {
@@ -775,12 +776,17 @@ void Processor::processBlock(juce::AudioBuffer<float> &audio,
     keyboardGeneration_ = active_->buildGeneration();
   }
   const auto dispatchKeyboardNote = [&](const int key, const float velocity) {
+    auto &held = keyboardHeldNotes_[static_cast<std::size_t>(key)];
+    // Adoption and queue cancellation invalidate old virtual presses. Their
+    // later releases must not stop a host note on the active engine.
+    if (velocity <= 0.0F && !held)
+      return true;
     const MidiEvent event{velocity > 0.0F ? MidiKind::noteOn
                                           : MidiKind::noteOff,
                           0, 0, key, velocity};
     if (!processRange(0, 0, std::span<const MidiEvent>{&event, 1U}))
       return false;
-    keyboardHeldNotes_[static_cast<std::size_t>(key)] = velocity > 0.0F;
+    held = velocity > 0.0F;
     return true;
   };
   auto succeeded = true;
@@ -842,14 +848,9 @@ void Processor::processBlock(juce::AudioBuffer<float> &audio,
     succeeded = processRange(position, frames - position, {});
   if (!succeeded) {
     faultActive();
-    fallback(audio);
-    if (product_ == Product::effect) {
-      for (int channel = 0; channel < static_cast<int>(dryScratch_.size());
-           ++channel) {
-        std::copy_n(dryScratch_[static_cast<std::size_t>(channel)].data(),
-                    frames, audio.getWritePointer(channel));
-      }
-    }
+    restoreDry(outputs.data(), 0, frames);
+  } else {
+    applyBypass(outputs.data(), frames, bypassed);
   }
   scopeCapture_.push(outputs, frames);
 }
@@ -863,12 +864,18 @@ void Processor::processBlock(juce::AudioBuffer<double> &audio,
     audio.clear(channel, 0, audio.getNumSamples());
 }
 
+void Processor::processBlockBypassed(juce::AudioBuffer<double> &audio,
+                                     juce::MidiBuffer &midi) {
+  processBlock(audio, midi);
+}
+
 juce::AudioProcessorEditor *Processor::createEditor() {
   return new Editor(*this);
 }
 
 void Processor::loadFile(const juce::File &file, const bool seedDefaults) {
   if (file.existsAsFile()) {
+    std::lock_guard preparationLock(preparationMutex_);
     const auto path = pathFromJuce(file.getFullPathName());
     {
       std::lock_guard lock(stateMutex_);
@@ -926,19 +933,18 @@ bool Processor::saveProjectAsAsync(
   try {
     const auto snapshot =
         worker_->projectExportSnapshot().value_or(ProjectExportSnapshot{});
-    exportPool_.addJob(
-        [this, snapshot, directory,
-         callback = std::move(completionHandler)]() mutable {
-          auto saveResult = saveProjectSnapshot(snapshot, directory);
-          exportPending_.store(false, std::memory_order_release);
-          if (callback) {
-            juce::MessageManager::callAsync(
-                [deliveredCallback = std::move(callback),
-                 deliveredResult = std::move(saveResult)]() mutable {
-                  deliveredCallback(std::move(deliveredResult));
-                });
-          }
-        });
+    exportPool_.addJob([this, snapshot, directory,
+                        callback = std::move(completionHandler)]() mutable {
+      auto saveResult = saveProjectSnapshot(snapshot, directory);
+      exportPending_.store(false, std::memory_order_release);
+      if (callback) {
+        juce::MessageManager::callAsync(
+            [deliveredCallback = std::move(callback),
+             deliveredResult = std::move(saveResult)]() mutable {
+              deliveredCallback(std::move(deliveredResult));
+            });
+      }
+    });
   } catch (...) {
     exportPending_.store(false, std::memory_order_release);
     return false;
@@ -962,7 +968,7 @@ void Processor::clearBuffer(const std::string_view name) {
   worker_->clearBuffer(name);
 }
 
-void Processor::unload(const bool notifyHost) {
+void Processor::clearRuntimeState() {
   runtimeFaulted_.store(false, std::memory_order_release);
   runtimeRecoveryRequested_.store(false, std::memory_order_release);
   resetRequested_.store(false, std::memory_order_release);
@@ -970,24 +976,33 @@ void Processor::unload(const bool notifyHost) {
   activeLogGeneration_.store(0U, std::memory_order_release);
   clearMidiActivity();
   clearRuntimeLog();
+}
+
+void Processor::unload(const bool notifyHost) {
+  clearRuntimeState();
   worker_->unload(notifyHost);
 }
 
 void Processor::requestReload() { worker_->requestRebuild(); }
 
-void Processor::resetParametersToDefaults() {
-  const auto status = worker_->status();
-  const auto mapped = std::min(status.mappings.size(), slotCount);
-  for (std::size_t index = 0; index < slotCount; ++index) {
-    const auto value =
-        index < mapped
-            ? static_cast<float>(status.mappings[index].defaultNormalized)
-            : 0.5F;
+void Processor::resetParametersToDefaults(const ParameterReset bank) {
+  const auto controls =
+      worker_->resetParameters(slotState_, controlState_, bank);
+  if (bank != ParameterReset::controls)
+    parameterSettleRequested_.store(true, std::memory_order_release);
+  for (std::size_t index = 0;
+       bank != ParameterReset::controls && index < slotCount; ++index) {
     beginSlotGesture(index);
-    setSlotValue(index, value);
+    slotParameters_[index]->notifyEditorValue();
     endSlotGesture(index);
   }
-  parameterSettleRequested_.store(true, std::memory_order_release);
+  for (std::size_t index = 0;
+       bank != ParameterReset::parameters && index < controls; ++index) {
+    auto *parameter = controlParameters_[index];
+    parameter->beginChangeGesture();
+    parameter->notifyEditorValue();
+    parameter->endChangeGesture();
+  }
 }
 
 void Processor::requestUserReset() {
@@ -995,11 +1010,15 @@ void Processor::requestUserReset() {
   reset();
 }
 
-std::string Processor::triggerEvent(const std::string_view name,
+std::string Processor::triggerEvent(const std::uint64_t generation,
+                                    const std::string_view name,
                                     const juce::var &values) {
   const auto status = worker_->status();
   if (!status.active || status.engineGeneration == 0)
     return "No active Onda program";
+  if (generation != status.engineGeneration)
+    return "The Onda program changed; retry the event after the editor "
+           "refreshes";
   const auto event =
       std::ranges::find(status.events, name, &EventMapping::name);
   if (event == status.events.end())
@@ -1011,7 +1030,7 @@ std::string Processor::triggerEvent(const std::string_view name,
   }
 
   UserEventCommand command;
-  command.generation = status.engineGeneration;
+  command.generation = generation;
   command.eventIndex = event->index;
   std::size_t payloadBytes{};
   std::string payloadError;
@@ -1033,6 +1052,7 @@ WorkerStatus Processor::workerStatus() const {
   if (faulted) {
     status.message = "Onda runtime safety check failed; processing is bypassed";
     status.compiling = false;
+    status.hasError = true;
     status.active = false;
   }
   return status;
@@ -1126,9 +1146,15 @@ juce::File Processor::lastBrowseDirectory() const {
 }
 
 float Processor::slotValue(const std::size_t index) const noexcept {
-  return index < slotCount
-             ? slotAtomics_[index]->load(std::memory_order_relaxed)
-             : 0.5F;
+  return index < slotCount ? static_cast<float>(slotState_.value(index)) : 0.5F;
+}
+
+std::uint64_t Processor::slotStamp(const std::size_t index) const noexcept {
+  return index < slotCount ? slotState_.snapshot(index).stamp : 0U;
+}
+
+HostParameterValues Processor::hostParameterValues() const {
+  return worker_->hostParameterValues();
 }
 
 void Processor::beginSlotGesture(const std::size_t index) {
@@ -1138,12 +1164,161 @@ void Processor::beginSlotGesture(const std::size_t index) {
 
 void Processor::setSlotValue(const std::size_t index, const float value) {
   if (index < slotCount)
-    slotParameters_[index]->setValueNotifyingHost(normalized(value));
+    slotParameters_[index]->setEditorValue(normalized(value));
 }
 
 void Processor::endSlotGesture(const std::size_t index) {
   if (index < slotCount)
     slotParameters_[index]->endChangeGesture();
+}
+
+float Processor::inputControlValue(const std::size_t index) const noexcept {
+  return index < controlCount ? static_cast<float>(controlState_.value(index))
+                              : 0.5F;
+}
+
+std::uint64_t
+Processor::inputControlStamp(const std::size_t index) const noexcept {
+  return index < controlCount ? controlState_.snapshot(index).stamp : 0U;
+}
+
+void Processor::beginInputControlGesture(const std::size_t index) {
+  if (index < controlCount)
+    controlParameters_[index]->beginChangeGesture();
+}
+
+void Processor::setInputControlValue(const std::size_t index,
+                                     const float value) {
+  if (index < controlCount)
+    controlParameters_[index]->setEditorValue(normalized(value));
+}
+
+void Processor::endInputControlGesture(const std::size_t index) {
+  if (index < controlCount)
+    controlParameters_[index]->endChangeGesture();
+}
+
+juce::String Processor::controlInputName(const std::size_t index) const {
+  return index < controlCount ? controlParameters_[index]->getName(128)
+                              : juce::String{};
+}
+
+void Processor::clearHostAutomation() noexcept {
+  hostAutomation_.curves.clear();
+  controlAutomation_.curves.clear();
+  automationCaptured_ = false;
+  automationPublication_.reset();
+}
+
+const PreparedEngine *Processor::automationEngine() const noexcept {
+  // Faults and deactivation can precede retirement during parameter-only flushes.
+  if (activeFaulted_ || deactivateRequested_.load(std::memory_order_acquire))
+    return nullptr;
+  return active_;
+}
+
+void Processor::publishHostAutomationTargets() noexcept {
+  const auto *engine = automationEngine();
+  const auto useDefaults =
+      engine != nullptr &&
+      (engine->parameterDefaultsPending() ||
+       (automationCaptured_ && automationCapturedDefaults_ &&
+        automationCapturedSeed_ == engine->parameterSeedRevision()));
+  reconcileHostAutomation(engine, useDefaults);
+}
+
+void Processor::reconcileHostAutomation(const PreparedEngine *const engine,
+                                        const bool useDefaults) noexcept {
+  const auto *seed = engine != nullptr ? engine->parameterSeed() : nullptr;
+  const auto acknowledged =
+      seed != nullptr && seed->applied.load(std::memory_order_acquire);
+  const AutomationPublication publication{seed != nullptr ? seed->revision : 0U,
+                                          useDefaults, acknowledged};
+  // Capture invalidates this cache. Revisit published endpoints only when
+  // adoption or seed acknowledgment changes their publication context.
+  if (automationPublication_ == publication)
+    return;
+  hostAutomation_.publish(publication.seed, useDefaults,
+                          acknowledged ? &seed->parameterStamps : nullptr);
+  controlAutomation_.publish(publication.seed, useDefaults,
+                             acknowledged ? &seed->controlStamps : nullptr);
+  automationPublication_ = publication;
+}
+
+bool Processor::ownsHostParameter(const std::uint32_t id) const noexcept {
+  const auto found =
+      std::ranges::lower_bound(hostParameterIds_, id, {}, &HostParameterId::id);
+  return found != hostParameterIds_.end() && found->id == id;
+}
+
+void Processor::captureHostAutomation(const std::uint32_t id,
+                                      const AutomationQueue queue,
+                                      const int frames) noexcept {
+  const auto *engine = automationEngine();
+  const auto *seed = engine != nullptr ? engine->parameterSeed() : nullptr;
+  const auto acknowledged =
+      seed != nullptr && seed->applied.load(std::memory_order_acquire);
+  const auto found =
+      std::ranges::lower_bound(hostParameterIds_, id, {}, &HostParameterId::id);
+  if (found == hostParameterIds_.end() || found->id != id)
+    return;
+  automationPublication_.reset();
+  if (!automationCaptured_) {
+    automationCaptured_ = true;
+    automationCapturedDefaults_ = seed != nullptr && !acknowledged;
+    automationCapturedSeed_ = seed != nullptr ? seed->revision : 0U;
+  }
+  if (found->control) {
+    const auto target = engine != nullptr
+                            ? engine->controlTarget(found->index, controlState_)
+                            : controlState_.target(found->index);
+    controlAutomation_.capture(
+        found->index, queue, frames, seed != nullptr ? seed->revision : 0U,
+        acknowledged ? &seed->controlStamps : nullptr,
+        engine != nullptr &&
+            engine->inputControlRampPending(found->index, target.value,
+                                            inputControlSmoothingSeconds()),
+        target);
+  } else {
+    const auto target = engine != nullptr
+                            ? engine->parameterTarget(found->index, slotState_)
+                            : slotState_.target(found->index);
+    hostAutomation_.capture(
+        found->index, queue, frames, seed != nullptr ? seed->revision : 0U,
+        acknowledged ? &seed->parameterStamps : nullptr,
+        engine != nullptr &&
+            !parameterSettleRequested_.load(std::memory_order_acquire) &&
+            engine->editorRampPending(found->index, target.value,
+                                      paramSmoothingSeconds()),
+        target);
+  }
+}
+
+int Processor::ondaBlockSize() const noexcept {
+  const auto maximum = hostBlockSize();
+  const auto preference = preferredBlockSize();
+  return preference > 0 ? std::min(preference, maximum) : maximum;
+}
+
+bool Processor::canSetBlockSize() const {
+  const auto status = worker_->status();
+  return status.path.empty() && !status.active && !status.compiling;
+}
+
+bool Processor::setPreferredBlockSize(const int samples) {
+  std::unique_lock lock(preparationMutex_);
+  if (samples < 0 || (samples > 0 && samples > hostBlockSize()) ||
+      !canSetBlockSize())
+    return false;
+  if (preferredBlockSize() == samples)
+    return true;
+  preferredBlockSize_.store(samples, std::memory_order_release);
+  if (hostBlockSize() > 0)
+    worker_->configure(hostSampleRate(), ondaBlockSize());
+  lock.unlock();
+  updateHostDisplay(juce::AudioProcessorListener::ChangeDetails{}
+                        .withNonParameterStateChanged(true));
+  return true;
 }
 
 std::pair<int, int> Processor::editorSize() const noexcept {
@@ -1186,6 +1361,30 @@ bool Processor::setParamSmoothingSeconds(const double seconds) {
   if (!parameterSmoothingSamples(seconds, std::max(1.0, hostSampleRate())))
     return false;
   if (!std::is_eq(paramSmoothingSeconds_.exchange(
+                      seconds, std::memory_order_relaxed) <=> seconds))
+    updateHostDisplay(juce::AudioProcessorListener::ChangeDetails{}
+                          .withNonParameterStateChanged(true));
+  return true;
+}
+
+ParamControlLayout Processor::inputControlLayout() const noexcept {
+  return inputControlLayout_.load(std::memory_order_relaxed);
+}
+
+void Processor::setInputControlLayout(const ParamControlLayout layout) {
+  if (inputControlLayout_.exchange(layout, std::memory_order_relaxed) != layout)
+    updateHostDisplay(juce::AudioProcessorListener::ChangeDetails{}
+                          .withNonParameterStateChanged(true));
+}
+
+double Processor::inputControlSmoothingSeconds() const noexcept {
+  return inputControlSmoothingSeconds_.load(std::memory_order_relaxed);
+}
+
+bool Processor::setInputControlSmoothingSeconds(const double seconds) {
+  if (!parameterSmoothingSamples(seconds, std::max(1.0, hostSampleRate())))
+    return false;
+  if (!std::is_eq(inputControlSmoothingSeconds_.exchange(
                       seconds, std::memory_order_relaxed) <=> seconds))
     updateHostDisplay(juce::AudioProcessorListener::ChangeDetails{}
                           .withNonParameterStateChanged(true));
@@ -1336,35 +1535,60 @@ void Processor::drainRuntimeLogs() {
   runtimeLogRevision_.fetch_add(1U, std::memory_order_release);
 }
 
-void Processor::commitSlotValue(const std::size_t index, const float value) {
-  const auto committed = normalized(value);
-  slotParameters_[index]->setValue(committed);
-  // DSP and worker snapshots read the APVTS atomics, whose listener update
-  // otherwise waits until notification. Keep these private mirrors in sync.
-  slotAtomics_[index]->store(committed, std::memory_order_relaxed);
+void Processor::notifyDeferredAutomation() {
+  const auto *manager = juce::MessageManager::getInstanceWithoutCreating();
+  if (manager == nullptr || !manager->isThisTheMessageThread())
+    return;
+  const auto notify = [](auto &automation, const auto &parameters) {
+    detail::forEachAutomationLane(
+        automation.takeNotifications(),
+        [&](const std::size_t index) { parameters[index]->notifyHostValue(); });
+  };
+  notify(hostAutomation_, slotParameters_);
+  notify(controlAutomation_, controlParameters_);
 }
 
-void Processor::notifySlotValues(const std::size_t count) {
-  // Host callbacks may synchronously save/restore state or prepare the engine.
-  // Read the current value so reentry cannot replay stale committed values.
-  for (std::size_t index = 0; index < count; ++index)
-    slotParameters_[index]->sendValueChangedMessageToListeners(
-        slotParameters_[index]->getValue());
-}
-
-std::size_t Processor::applySeedValues() {
+void Processor::applySeedValues() {
   if (auto seed = worker_->takeSeedValues()) {
-    // Commit every slot before exposing the completed seed to host callbacks.
-    for (std::size_t index = 0; index < seed->count; ++index)
-      commitSlotValue(index, seed->values[index]);
+    auto changed = false;
+    // Conditional writes preserve edits since adoption. Publish every result
+    // before acknowledgment lets audio reconcile retained queue endpoints.
+    for (std::size_t index = 0; index < seed->count; ++index) {
+      const auto stamp = slotState_.seed(
+          index, static_cast<float>(seed->values[index].normalized),
+          seed->parameterStamps.before[index],
+          seed->parameterStamps.after[index],
+          seed->values[index].scalarDefault.has_value());
+      hostAutomation_.notify(index);
+      changed = changed || stamp != 0U;
+    }
+    for (std::size_t index = 0; index < seed->controlCount; ++index) {
+      const auto stamp = controlState_.seed(
+          index, static_cast<float>(seed->controls[index].normalized),
+          seed->controlStamps.before[index], seed->controlStamps.after[index],
+          seed->controls[index].scalarDefault.has_value());
+      controlAutomation_.notify(index);
+      changed = changed || stamp != 0U;
+    }
     worker_->finishSeeding(seed);
-    return seed->count;
+    if (changed)
+      defaultValuesChanged_.store(true, std::memory_order_release);
   }
-  return 0;
 }
 
 void Processor::timerCallback() {
   drainRuntimeLogs();
+  // Snapshot before draining notifications so the controller is current when
+  // the host refreshes its cache. Preparation can suppress wrapper restarts,
+  // so deliver this only from the message-thread timer.
+  const auto defaultsChanged =
+      defaultValuesChanged_.exchange(false, std::memory_order_acq_rel);
+  // Host/controller listeners may allocate or lock. Deferred DSP targets are
+  // already committed; publish their current presentation on this thread.
+  notifyDeferredAutomation();
+  if (defaultsChanged)
+    updateHostDisplay(juce::AudioProcessorListener::ChangeDetails{}
+                          .withProgramChanged(true));
   if (!retirements_.empty())
     worker_->requestRetirementCollection();
   const auto notifyProjectChange = worker_->takeProjectStateChange();
@@ -1374,7 +1598,8 @@ void Processor::timerCallback() {
       expected != configuredBlockSize_.load(std::memory_order_acquire);
   const auto needsRecovery =
       runtimeRecoveryRequested_.load(std::memory_order_acquire);
-  if (!worker_->hasPendingSeedValues() && !needsResize && !needsRecovery) {
+  if (!worker_->hasPendingSeedValues() && !needsResize && !needsRecovery &&
+      scratchRetirements_.empty()) {
     if (notifyProjectChange)
       updateHostDisplay(juce::AudioProcessorListener::ChangeDetails{}
                             .withNonParameterStateChanged(true));
@@ -1388,36 +1613,43 @@ void Processor::timerCallback() {
                             .withNonParameterStateChanged(true));
     return;
   }
-  const auto seeded = applySeedValues();
+  applySeedValues();
+  delete scratchRetirements_.tryPop();
   if (needsResize) {
-    for (auto &channel : dryScratch_)
-      channel.resize(static_cast<std::size_t>(expected));
+    auto scratch = std::make_unique<DryScratch>(expected);
+    delete scratchReplacements_.replace(scratch.release());
     worker_->configure(expectedSampleRate_.load(std::memory_order_acquire),
-                       expected);
+                       ondaBlockSize());
     configuredBlockSize_.store(expected, std::memory_order_release);
   }
   if (runtimeRecoveryRequested_.exchange(false, std::memory_order_acq_rel))
     worker_->requestRebuild();
   preparationLock.unlock();
-  notifySlotValues(seeded);
+  notifyDeferredAutomation();
   if (notifyProjectChange)
     updateHostDisplay(juce::AudioProcessorListener::ChangeDetails{}
                           .withNonParameterStateChanged(true));
 }
 
 void Processor::handleAsyncUpdate() {
-  if (refreshSlotParameterInfo())
+  if (refreshHostParameterInfo())
     updateHostDisplay(
         juce::AudioProcessorListener::ChangeDetails{}.withParameterInfoChanged(
             true));
 }
 
-bool Processor::refreshSlotParameterInfo() {
-  const auto mappings = worker_->parameterMappings();
+bool Processor::refreshHostParameterInfo() {
+  const auto status = worker_->status();
+  const auto &mappings = status.mappings;
   auto changed = false;
   for (std::size_t index = 0; index < slotCount; ++index) {
     const auto *mapping = index < mappings.size() ? &mappings[index] : nullptr;
-    changed = presentedSlotParameters_[index]->setMapping(mapping) || changed;
+    changed = slotParameters_[index]->setMapping(mapping) || changed;
+  }
+  for (std::size_t index = 0; index < controlCount; ++index) {
+    const auto *mapping =
+        index < status.controls.size() ? &status.controls[index] : nullptr;
+    changed = controlParameters_[index]->setMapping(mapping) || changed;
   }
   return changed;
 }
@@ -1426,9 +1658,9 @@ void Processor::getStateInformation(juce::MemoryBlock &destination) {
   juce::MemoryOutputStream stream(destination, false);
   stream.writeInt(static_cast<int>(stateMagic));
   stream.writeInt(stateVersion);
-  const auto snapshot = [this] {
+  const auto [snapshot, blockPreference] = [this] {
     std::lock_guard preparationLock(preparationMutex_);
-    return worker_->persistedStateSnapshot();
+    return std::pair{worker_->persistedStateSnapshot(), preferredBlockSize()};
   }();
   const auto &project = snapshot.project;
   stream.writeString(pathToJuce(project.path));
@@ -1442,13 +1674,18 @@ void Processor::getStateInformation(juce::MemoryBlock &destination) {
     stream.writeString(pathToJuce(binding.path));
   }
   writeProjectImage(stream, project.projectImage);
-  for (std::size_t index = 0; index < slotCount; ++index)
-    stream.writeFloat(normalized(snapshot.parameters[index]));
+  for (const auto &value : snapshot.values.parameters)
+    writeScalarValue(stream, value);
   stream.writeInt(editorWidth_.load(std::memory_order_relaxed));
   stream.writeInt(editorHeight_.load(std::memory_order_relaxed));
   stream.writeBool(paramControlLayout() == ParamControlLayout::knobs);
   stream.writeString(viewState());
   stream.writeDouble(paramSmoothingSeconds());
+  stream.writeInt(blockPreference);
+  stream.writeBool(inputControlLayout() == ParamControlLayout::knobs);
+  stream.writeDouble(inputControlSmoothingSeconds());
+  for (const auto &value : snapshot.values.controls)
+    writeScalarValue(stream, value);
 }
 
 void Processor::setStateInformation(const void *data, const int byteCount) {
@@ -1488,12 +1725,12 @@ void Processor::setStateInformation(const void *data, const int byteCount) {
     if (!validProjectImage)
       return;
 
-    std::array<float, slotCount> restored{};
-    for (auto &value : restored) {
-      if (stream.getNumBytesRemaining() <
-          static_cast<juce::int64>(sizeof(float)))
+    HostParameterValues restored;
+    for (auto &value : restored.parameters) {
+      const auto parameter = readScalarValue(stream);
+      if (!parameter)
         return;
-      value = normalized(stream.readFloat());
+      value = *parameter;
     }
     if (stream.getNumBytesRemaining() < 9U)
       return;
@@ -1513,21 +1750,56 @@ void Processor::setStateInformation(const void *data, const int byteCount) {
     if (!parameterSmoothingSamples(smoothingSeconds,
                                    std::max(1.0, hostSampleRate())))
       return;
+    if (stream.getNumBytesRemaining() < 4)
+      return;
+    const auto blockPreference = stream.readInt();
+    if (blockPreference < 0)
+      return;
+
+    if (stream.getNumBytesRemaining() < 9)
+      return;
+    const auto inputLayout = stream.readBool() ? ParamControlLayout::knobs
+                                               : ParamControlLayout::sliders;
+    const auto inputSmoothing = stream.readDouble();
+    if (!parameterSmoothingSamples(inputSmoothing,
+                                   std::max(1.0, hostSampleRate())))
+      return;
+
+    for (auto &value : restored.controls) {
+      const auto control = readScalarValue(stream);
+      if (!control)
+        return;
+      value = *control;
+    }
 
     std::unique_lock preparationLock(preparationMutex_);
     deactivateRequested_.store(true, std::memory_order_release);
-    for (std::size_t index = 0; index < slotCount; ++index)
-      commitSlotValue(index, restored[index]);
-    if (path->isEmpty() && !projectImage.valid()) {
-      unload(false);
-    } else {
-      worker_->restore(pathFromJuce(*path), std::move(projectImage),
-                       std::move(bufferBindings));
+    preferredBlockSize_.store(blockPreference, std::memory_order_release);
+    if (hostBlockSize() > 0)
+      worker_->configure(hostSampleRate(), ondaBlockSize());
+    for (std::size_t index = 0; index < slotCount; ++index) {
+      restored.parameterStamps[index] = slotState_[index].set(
+          static_cast<float>(restored.parameters[index].normalized));
+      hostAutomation_.notify(index);
     }
+    for (std::size_t index = 0; index < controlCount; ++index) {
+      restored.controlStamps[index] = controlState_[index].set(
+          static_cast<float>(restored.controls[index].normalized));
+      controlAutomation_.notify(index);
+    }
+    if (path->isEmpty() && !projectImage.valid())
+      clearRuntimeState();
+    worker_->restore(pathFromJuce(*path), std::move(projectImage),
+                     std::move(bufferBindings),
+                     Worker::ExistingEnginePolicy::deactivateImmediately,
+                     std::move(restored));
     editorWidth_.store(std::clamp(width, 360, 1600), std::memory_order_relaxed);
     editorHeight_.store(std::clamp(height, 480, 1400),
                         std::memory_order_relaxed);
     paramControlLayout_.store(layout, std::memory_order_relaxed);
+    inputControlLayout_.store(inputLayout, std::memory_order_relaxed);
+    inputControlSmoothingSeconds_.store(inputSmoothing,
+                                        std::memory_order_relaxed);
     paramSmoothingSeconds_.store(smoothingSeconds, std::memory_order_relaxed);
     {
       std::lock_guard lock(stateMutex_);
@@ -1536,7 +1808,7 @@ void Processor::setStateInformation(const void *data, const int byteCount) {
     }
     viewStateRestoreRevision_.fetch_add(1U, std::memory_order_release);
     preparationLock.unlock();
-    notifySlotValues(slotCount);
+    notifyDeferredAutomation();
   } catch (...) {
     // Host-provided state is untrusted and must never escape the VST callback.
   }

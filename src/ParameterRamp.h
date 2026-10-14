@@ -1,5 +1,7 @@
 #pragma once
 
+#include "LinearInterpolation.h"
+
 #include <algorithm>
 #include <cmath>
 #include <compare>
@@ -21,7 +23,7 @@ parameterSmoothingSamples(const double seconds,
   return static_cast<std::uint64_t>(count);
 }
 
-// Host-owned linear ramp in plain units, advanced once per audio block.
+// Plain-unit editor transitions advanced by actual rendered samples.
 class ParameterRamp final {
 public:
   void reset(const double value) noexcept {
@@ -51,6 +53,36 @@ public:
   }
 
   [[nodiscard]] bool active() const noexcept { return elapsed_ < samples_; }
+
+  void render(float *destination, const int frames) noexcept {
+    if (frames <= 0)
+      return;
+    const auto remaining = samples_ - elapsed_;
+    const auto count = static_cast<int>(
+        std::min(static_cast<std::uint64_t>(frames), remaining));
+    if (count > 0) {
+      const auto finishes = static_cast<std::uint64_t>(count) == remaining;
+      const auto interpolated = count - (finishes ? 1 : 0);
+      const auto duration = static_cast<double>(samples_);
+      detail::withLinearInterpolation(
+          start_, target_, [&](const auto interpolate) noexcept {
+            for (int frame = 0; frame < interpolated; ++frame) {
+              const auto position =
+                  elapsed_ + static_cast<std::uint64_t>(frame) + 1U;
+              // Division preserves the rounding of scalar advance(). Absolute
+              // positions keep output independent of render segment sizes.
+              const auto weight = static_cast<double>(position) / duration;
+              destination[frame] = static_cast<float>(interpolate(weight));
+            }
+          });
+      if (finishes)
+        destination[count - 1] = static_cast<float>(target_);
+      elapsed_ += static_cast<std::uint64_t>(count);
+      current_ = static_cast<double>(destination[count - 1]);
+    }
+    std::fill_n(destination + count, frames - count,
+                static_cast<float>(current_));
+  }
 
   [[nodiscard]] double advance(const std::uint64_t frames,
                                const bool singlePrecision) noexcept {

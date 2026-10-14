@@ -9,6 +9,13 @@ assert.ok(script, "Could not locate the editor's injected host bridge");
 
 const commands = [];
 let receiveState;
+let renderedState;
+let documentReady;
+const smoothingAttributes = {};
+const sampleRateRow = {};
+const sampleRate = { closest() { return sampleRateRow; } };
+const runSettings = { style: {} };
+const blockSelect = { replaceChildren(...options) { this.options = options; } };
 const window = {
   __JUCE__: {
     backend: {
@@ -22,11 +29,24 @@ const window = {
       },
     },
   },
-  _onHostMessage() {},
+  _onHostMessage(message) { renderedState = message.state; },
 };
 runInNewContext(script, {
   window,
-  document: { addEventListener() {}, querySelector() { return null; } },
+  document: {
+    addEventListener(type, callback) {
+      if (type === "DOMContentLoaded") documentReady = callback;
+    },
+    querySelector() { return null; },
+    getElementById(id) {
+      if (id === "run-sample-rate") return sampleRate;
+      if (id === "run-block-size") return blockSelect;
+      if (id === "file-picker-settings") return runSettings;
+      assert.equal(id, "param-smoothing-ms");
+      return { setAttribute(name, value) { smoothingAttributes[name] = value; } };
+    },
+    createElement() { return {}; },
+  },
   __ONDA_PARAM_CONTROL_V2__: {
     createParamDomain: ({ minimum, maximum }) => ({
       plainToNormalized: value => (value - minimum) / (maximum - minimum),
@@ -34,6 +54,55 @@ runInNewContext(script, {
     }),
   },
 });
+documentReady();
+assert.equal(smoothingAttributes["aria-label"], "Editor parameter smoothing duration in milliseconds");
+assert.match(smoothingAttributes.title, /DAW automation updates at block boundaries/);
+assert.equal(sampleRate.disabled, true);
+assert.equal(sampleRateRow.hidden, true);
+const blockChoices = () => Array.from(blockSelect.options)
+  .filter(option => !option.hidden).map(option => option.value);
+assert.deepEqual(blockChoices(), ["0"]);
+assert.equal(blockSelect.disabled, true);
+receiveState({ type: "state", state: {
+  hostBlockSamples: 96, preferredBlockSamples: 0, canSetBlockSize: true,
+} });
+assert.deepEqual(Array.from(blockSelect.options, option => option.value),
+                 ["96", "48", "24", "12"]);
+assert.equal(blockSelect.value, "96");
+assert.equal(blockSelect.disabled, false);
+window.ipc.postMessage({ type: "setRunSettings", sampleRateHz: 48000, blockSamples: 96 });
+assert.equal(commands.pop().blockSamples, 0, "The maximum must follow the host");
+window.ipc.postMessage({ type: "setRunSettings", sampleRateHz: 48000, blockSamples: 48 });
+assert.equal(commands.pop().blockSamples, 48);
+// Normal loaded-view rendering must not append a duplicate maximum or change
+// the menu selection on each ordinary parameter update.
+receiveState({ type: "state", state: {
+  hostBlockSamples: 96, preferredBlockSamples: 0, canSetBlockSize: true,
+} });
+assert.deepEqual(blockChoices(), ["96", "48", "24", "12"]);
+assert.equal(blockSelect.value, "96");
+// Preserve an active fixed size after a host-capacity change while offering
+// only the maximum and its subdivisions as new choices.
+receiveState({ type: "state", state: {
+  hostBlockSamples: 96, preferredBlockSamples: 32, canSetBlockSize: false,
+} });
+assert.equal(blockSelect.value, "32");
+assert.equal(blockSelect.disabled, true);
+assert.deepEqual(blockChoices(), ["96", "48", "24", "12"]);
+assert.equal(blockSelect.options.at(-1).disabled, true);
+receiveState({ type: "state", state: {
+  hostBlockSamples: 64, preferredBlockSamples: 32, canSetBlockSize: true,
+} });
+assert.deepEqual(blockChoices(), ["64", "32", "16", "8"]);
+assert.equal(blockSelect.value, "32");
+receiveState({ type: "state", state: {
+  hostBlockSamples: 101, preferredBlockSamples: 0, canSetBlockSize: true,
+} });
+assert.deepEqual(blockChoices(), ["101", "50", "25", "12"]);
+receiveState({ type: "state", state: {
+  hostBlockSamples: 2, preferredBlockSamples: 0, canSetBlockSize: true,
+} });
+assert.deepEqual(blockChoices(), ["2", "1"]);
 
 const first = {
   name: "Slot 1 -> level", label: "level", type: "f32",
@@ -80,4 +149,50 @@ drag(first, 0.75, true);
 commands.length = 0;
 state([]);
 assertEnded();
-console.log("Editor bridge gesture cancellation passed");
+// Event commands belong to the last rendered event schema, even if the native
+// worker has already published a replacement. Keep 64-bit generations exact.
+const eventState = generation => receiveState({
+  type: "state", state: {
+    engineGeneration: generation,
+    events: [{ name: "configure", args: [] }],
+  },
+});
+const trigger = () => window.ipc.postMessage(JSON.stringify({
+  type: "triggerEvent", name: "configure", values: [0.75],
+}));
+eventState("9007199254740993");
+trigger();
+assert.equal(commands.pop().engineGeneration, "9007199254740993");
+// A partial update must not reassign the event controls' generation.
+state([first]);
+trigger();
+assert.equal(commands.pop().engineGeneration, "9007199254740993");
+eventState("9007199254740994");
+trigger();
+assert.equal(commands.pop().engineGeneration, "9007199254740994");
+console.log("Editor bridge gesture cancellation and event generations passed");
+
+// Input controls share conversion and gesture lifetimes without sharing a bank.
+const control = { ...first, name: "Input 1 -> cv", rangeMin: -2, rangeMax: 2, enabled: true };
+receiveState({ type: "state", state: { path: "input.onda", params: [first], inputControls: [control] } });
+commands.length = 0;
+window.ipc.postMessage({ type: "setInputControl", name: control.name, value: 1, commit: false });
+assert.equal(commands.pop().value, 0.75);
+receiveState({ type: "state", state: { params: [{ ...first, normalizedValue: 0.25 }] } });
+assertEnded();
+receiveState({ type: "state", state: { inputControls: [{ ...control, enabled: false }] } });
+assert.deepEqual(commands.splice(0).map(message => [message.type, message.name]),
+  [["endInputControlGesture", control.name]]);
+receiveState({ type: "state", state: { inputControls: [{ ...control, rangeMin: 2, rangeMax: 2 }] } });
+window.ipc.postMessage({ type: "setInputControl", name: control.name, value: 2, commit: true });
+assert.equal(commands.pop().value, control.normalizedValue);
+
+receiveState({ type: "state", state: { inputControls: [{ ...control,
+  rangeMin: -1e30, rangeMax: 1e30, normalizedValue: 0.5, value: 0.25 }] } });
+assert.equal(renderedState.inputControls[0].value, 0.25, "Exact plain defaults survive UI normalization");
+
+for (const value of ["9007199254740993", "-9007199254740993",
+                     "9223372036854775807", "-9223372036854775808"]) {
+  state([{ ...first, type: "i64", value, default: value, step: 1, stepCount: 1 }]);
+  assert.equal(renderedState.params[0].value, value, "Exact i64 defaults survive bridge conversion");
+}

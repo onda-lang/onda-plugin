@@ -63,9 +63,7 @@ sample {
     output << R"(
 ins { in1, in2 }
 outs { out1, out2 }
-params {
-  divisor: i32 = 0
-}
+init { divisor = i32(0) }
 def quotient(value: i32, by: i32) {
   return value / by
 }
@@ -278,6 +276,10 @@ sample {
     return path_;
   }
 
+  [[nodiscard]] const std::filesystem::path &dependencyPath() const noexcept {
+    return dependencyPath_;
+  }
+
 private:
   static std::string constantEffect(const std::string_view value) {
     return "ins { in1, in2 }\nouts { out1, out2 }\nsample {\n"
@@ -352,7 +354,54 @@ bool exerciseNativeFilesystemWatcher() {
       return false;
     }
   }
+  if (!watcher.watch(paths).empty())
+    return false;
+  const auto revision = watcher.revision();
+  std::filesystem::create_directory(directory / "unrelated");
+  {
+    std::ofstream output(directory / "unrelated" / "sibling.onda");
+    output << "unrelated activity\n";
+  }
+  // Directory notifications must also ignore entries beside the watched file.
+  const auto sibling = watched.parent_path() / "sibling.onda";
+  {
+    std::ofstream output(sibling);
+    output << "unrelated sibling\n";
+  }
+  std::filesystem::rename(sibling, watched.parent_path() / "renamed.onda");
+  std::filesystem::remove(watched.parent_path() / "renamed.onda");
+  std::filesystem::create_directory(watched.parent_path() / "unrelated");
+  std::this_thread::sleep_for(std::chrono::milliseconds(600));
+  if (watcher.revision() != revision) {
+    std::cerr << "unrelated directory activity invalidated the source\n";
+    return false;
+  }
   static_cast<void>(watcher.watch(std::span<const std::filesystem::path>{}));
+#if defined(__linux__)
+  // An ancestor and a symlinked content directory can share an inotify inode.
+  const auto alias = directory / "alias";
+  std::filesystem::create_directory_symlink(directory, alias);
+  const auto aliasedSource = alias / "source.onda";
+  std::atomic<bool> aliasObserved{};
+  FilesystemWatcher aliasWatcher([&](const FilesystemWatcher::Paths changed) {
+    if (std::ranges::find(changed, aliasedSource) != changed.end())
+      aliasObserved.store(true, std::memory_order_release);
+  });
+  const std::array aliasedPaths{aliasedSource};
+  if (!aliasWatcher.watch(aliasedPaths).empty())
+    return false;
+  {
+    std::ofstream output(aliasedSource);
+    output << "outs { out1 }\nsample { out1 = 0.75 }\n";
+  }
+  if (!test::waitUntil(
+          [&] { return aliasObserved.load(std::memory_order_acquire); },
+          test::yieldToWorker)) {
+    std::cerr << "an ancestor subscription hid a symlinked source edit\n";
+    return false;
+  }
+  static_cast<void>(aliasWatcher.watch(std::span<const std::filesystem::path>{}));
+#endif
   std::filesystem::remove_all(directory, ignored);
   return true;
 }
@@ -369,13 +418,11 @@ onda::plugin::PreparedEngine *waitForReplacement(
   return nullptr;
 }
 
-bool produces(onda::plugin::PreparedEngine &engine, const float expected) {
-  std::array<std::atomic<float>, onda::plugin::slotCount> values;
-  std::array<std::atomic<float> *, onda::plugin::slotCount> slots{};
-  for (std::size_t index = 0; index < values.size(); ++index) {
-    values[index].store(0.5F);
-    slots[index] = &values[index];
-  }
+bool produces(onda::plugin::PreparedEngine &engine, const float expected,
+              const float hostValue = 0.5F) {
+  onda::plugin::ParameterState slots;
+  for (std::size_t index = 0; index < onda::plugin::slotCount; ++index)
+    slots.set(index, hostValue);
   std::array<float, 8U> left{};
   std::array<float, 8U> right{};
   std::array<float *, 2U> outputs{left.data(), right.data()};
@@ -388,6 +435,168 @@ bool produces(onda::plugin::PreparedEngine &engine, const float expected) {
          std::all_of(right.begin(), right.end(), [expected](const float value) {
            return close(value, expected);
          });
+}
+
+bool exerciseMovedSourceAncestor() {
+  using namespace onda::plugin;
+  const auto directory = testTemporaryRoot() / "linked-project";
+  const auto moved = testTemporaryRoot() / "moved-project";
+  const auto relativeSource = std::filesystem::path{"code"} / "src" / "main.onda";
+  const auto source = directory / relativeSource;
+  std::filesystem::create_directories(source.parent_path());
+  const auto write = [&](const std::filesystem::path &path, const float value) {
+    std::ofstream output(path, std::ios::binary | std::ios::trunc);
+    output << "outs { out1, out2 }\nsample { out1 = " << value
+           << "; out2 = " << value << " }\n";
+    output.close();
+    return static_cast<bool>(output);
+  };
+  if (!write(source, 0.25F))
+    return false;
+
+  SpscSlot<PreparedEngine *> replacements;
+  SpscSlot<PreparedEngine *> retirements;
+  std::atomic<bool> deactivate{};
+  Worker worker(Product::effect, replacements, retirements, deactivate);
+  worker.configure(48'000.0, 8);
+  worker.load(source, false);
+  static_cast<void>(worker.waitForPreparation());
+  std::unique_ptr<PreparedEngine> initial{replacements.tryPop()};
+  if (!initial || !produces(*initial, 0.25F))
+    return false;
+  worker.setActiveGeneration(initial->buildGeneration());
+  const auto generation = initial->buildGeneration();
+
+  std::filesystem::rename(directory, moved);
+  const auto failed = test::waitUntil(
+      [&] {
+        const auto status = worker.status();
+        return !status.compiling && status.message != "Active" &&
+               status.engineGeneration == generation;
+      },
+      test::yieldToWorker);
+  std::unique_ptr<PreparedEngine> unexpected{replacements.tryPop()};
+  if (!failed || unexpected || !worker.status().active || deactivate.load() ||
+      worker.status().path != source || !produces(*initial, 0.25F)) {
+    std::cerr << "moving a source ancestor did not report an error while "
+                 "retaining the linked engine (status "
+              << worker.status().message << ")\n";
+    return false;
+  }
+
+  // Restoring the linked path resumes watching; the moved path is not followed.
+  if (!write(moved / relativeSource, 0.75F))
+    return false;
+  std::filesystem::rename(moved, directory);
+  std::unique_ptr<PreparedEngine> restored{waitForReplacement(replacements)};
+  if (!restored || !produces(*restored, 0.75F) ||
+      restored->buildGeneration() == generation ||
+      worker.status().message != "Active") {
+    std::cerr << "restoring a moved source ancestor did not resume loading\n";
+    return false;
+  }
+  return true;
+}
+
+bool exerciseSymlinkedBufferDirectory() {
+#if defined(__linux__) || defined(__APPLE__)
+  using namespace onda::plugin;
+  const auto directory = testTemporaryRoot() / "symlinked-buffer";
+  const auto source = directory / "source" / "main.onda";
+  const auto alias = directory / "assets" / "link";
+  const auto intermediate = directory / "routes" / "current";
+  const auto firstDirectory = directory / "first";
+  const auto secondDirectory = directory / "second";
+  std::filesystem::create_directories(source.parent_path());
+  std::filesystem::create_directories(alias.parent_path());
+  std::filesystem::create_directories(intermediate.parent_path());
+  std::filesystem::create_directory(firstDirectory);
+  std::filesystem::create_directory(secondDirectory);
+  const auto writeAsset = [](const std::filesystem::path &path,
+                             const float value) {
+    Diagnostic diagnostic;
+    const std::array samples{value};
+    const auto bytes =
+        encodeF32BufferAsset(samples, 1, 1, 48'000.0F, diagnostic);
+    if (bytes.empty())
+      return false;
+    std::ofstream output(path, std::ios::binary);
+    output.write(reinterpret_cast<const char *>(bytes.data()),
+                 static_cast<std::streamsize>(bytes.size()));
+    output.close();
+    return static_cast<bool>(output);
+  };
+  if (!writeAsset(firstDirectory / "clip.ondabuffer", 0.25F) ||
+      !writeAsset(secondDirectory / "clip.ondabuffer", 0.75F))
+    return false;
+  {
+    std::ofstream output(source);
+    output << "buffers { clip: buffer<f32> }\nouts { out1, out2 }\n"
+              "sample { out1 = clip[0]; out2 = clip[0] }\n";
+  }
+  std::filesystem::create_directory_symlink(firstDirectory, intermediate);
+  std::filesystem::create_directory_symlink(intermediate, alias);
+
+  SpscSlot<PreparedEngine *> replacements;
+  SpscSlot<PreparedEngine *> retirements;
+  std::atomic<bool> deactivate{};
+  Worker worker(Product::effect, replacements, retirements, deactivate);
+  worker.configure(48'000.0, 8);
+  worker.loadWithBufferBindings(
+      source, {{.name = "clip", .path = alias / "clip.ondabuffer"}}, false);
+  static_cast<void>(worker.waitForPreparation());
+  std::unique_ptr<PreparedEngine> initial{replacements.tryPop()};
+  if (!initial || !produces(*initial, 0.25F))
+    return false;
+  worker.setActiveGeneration(initial->buildGeneration());
+
+  // A link may traverse another link outside its lexical ancestor chain.
+  const auto nextIntermediate = intermediate.parent_path() / "next-link";
+  std::filesystem::create_directory_symlink(secondDirectory, nextIntermediate);
+  std::filesystem::rename(nextIntermediate, intermediate);
+  std::unique_ptr<PreparedEngine> indirect{waitForReplacement(replacements)};
+  if (!indirect || !produces(*indirect, 0.75F)) {
+    std::cerr << "retargeting an indirect buffer symlink did not reload it\n";
+    return false;
+  }
+  worker.setActiveGeneration(indirect->buildGeneration());
+  const auto checkpoint = worker.persistedProjectState();
+
+  std::filesystem::remove(alias);
+  if (!test::waitUntil(
+          [&] {
+            const auto status = worker.status();
+            return !status.compiling && status.message != "Active";
+          },
+          test::yieldToWorker) ||
+      !worker.status().active || deactivate.load() ||
+      worker.persistedProjectState().projectImage != checkpoint.projectImage ||
+      !produces(*indirect, 0.75F)) {
+    std::cerr << "removing a buffer directory symlink did not report an error "
+                 "while retaining the engine and checkpoint\n";
+    return false;
+  }
+
+  std::filesystem::create_directory_symlink(firstDirectory, alias);
+  std::unique_ptr<PreparedEngine> restored{waitForReplacement(replacements)};
+  if (!restored || !produces(*restored, 0.25F) ||
+      worker.status().message != "Active") {
+    std::cerr
+        << "restoring a buffer directory symlink did not load its target\n";
+    return false;
+  }
+  worker.setActiveGeneration(restored->buildGeneration());
+
+  const auto nextAlias = alias.parent_path() / "next-link";
+  std::filesystem::create_directory_symlink(secondDirectory, nextAlias);
+  std::filesystem::rename(nextAlias, alias);
+  std::unique_ptr<PreparedEngine> retargeted{waitForReplacement(replacements)};
+  if (!retargeted || !produces(*retargeted, 0.75F)) {
+    std::cerr << "atomically retargeting a buffer symlink did not reload it\n";
+    return false;
+  }
+#endif
+  return true;
 }
 
 std::vector<onda::plugin::RuntimeLogEntry>
@@ -526,6 +735,332 @@ bool exerciseExportRelinkConflicts(const onda::plugin::ProjectImage &image,
   return true;
 }
 
+bool exerciseBuildParameterSnapshot() {
+  using namespace onda::plugin;
+  TemporarySource source;
+  source.writeText(R"(
+outs { out1, out2 }
+params { gain = 0.5 { 0.0, 1.0 } }
+init { pin held = gain }
+sample { out1 = held; out2 = held }
+)");
+  const auto initial =
+      PreparedEngine::build(source.path(), Product::effect, 48'000.0, 8);
+  if (!initial.engine)
+    return false;
+
+  for (const auto fromImage : {false, true}) {
+    SpscSlot<PreparedEngine *> replacements;
+    SpscSlot<PreparedEngine *> retirements;
+    std::atomic<bool> deactivate{};
+    std::atomic<int> snapshotReads{};
+    Worker worker(Product::effect, replacements, retirements, deactivate, {},
+                  nullptr, [&] {
+                    ParameterValues values;
+                    values.fill(0.5F);
+                    // Model automation changing between host-value reads.
+                    values[0] = snapshotReads.fetch_add(1) == 0 ? 0.25F : 0.75F;
+                    return HostParameterValues{.parameters = values, .controls = {}};
+                  });
+    worker.configure(48'000.0, 8);
+    if (fromImage)
+      worker.restore({}, initial.projectImage, {});
+    else
+      worker.load(source.path(), false);
+    static_cast<void>(worker.waitForPreparation());
+    std::unique_ptr<PreparedEngine> engine{replacements.tryPop()};
+    if (!engine || snapshotReads.load() != 1 ||
+        worker.status().usingProjectImage != fromImage ||
+        !produces(*engine, 0.25F)) {
+      std::cerr << "build did not initialize from one parameter snapshot "
+                << "(saved image " << fromImage << ", reads "
+                << snapshotReads.load() << ")\n";
+      return false;
+    }
+  }
+  return true;
+}
+
+bool exerciseReloadDuringSeeding() {
+  using namespace onda::plugin;
+  for (const auto operation : {"reload", "configure", "watch", "acknowledge"}) {
+    TemporarySource source;
+    const auto writePatch = [&](const std::string_view defaultValue) {
+      source.writeText(
+          "outs { out1, out2 }\nparams { gain = " + std::string{defaultValue} +
+          " { 0.0, 1.0 } }\n"
+          "init { pin held = gain }\n"
+          "sample { out1 = held + gain; out2 = held + gain }\n");
+    };
+    writePatch("0.25");
+    SpscSlot<PreparedEngine *> replacements;
+    SpscSlot<PreparedEngine *> retirements;
+    std::atomic<bool> deactivate{};
+    std::atomic<float> hostValue{0.9F};
+    std::mutex gateMutex;
+    std::condition_variable gateWake;
+    bool gateBuild{};
+    bool buildStarted{};
+    bool releaseBuild{};
+    Worker::BuildFunction build =
+        [&](const auto &path, const auto product, const auto sampleRate,
+            const auto blockSize, const auto bindings, const auto &parameters) {
+          {
+            std::unique_lock lock(gateMutex);
+            if (gateBuild) {
+              buildStarted = true;
+              gateWake.notify_all();
+              if (!gateWake.wait_for(lock, test::waitTimeout,
+                                     [&] { return releaseBuild; }))
+                return BuildResult{};
+            }
+          }
+          return PreparedEngine::build(path, product, sampleRate, blockSize,
+                                       bindings, parameters);
+        };
+    Worker worker(Product::effect, replacements, retirements, deactivate,
+                  std::move(build), nullptr, [&] {
+                    ParameterValues values;
+                    values.fill(hostValue.load());
+                    return HostParameterValues{.parameters = values, .controls = {}};
+                  });
+    worker.configure(48'000.0, 8);
+    worker.load(source.path(), true);
+    static_cast<void>(worker.waitForPreparation());
+    std::unique_ptr<PreparedEngine> first{replacements.tryPop()};
+    if (!first)
+      return false;
+    worker.setActiveGeneration(first->buildGeneration());
+    const auto seed = worker.takeSeedValues();
+    if (!seed || !produces(*first, 0.5F, hostValue.load()))
+      return false;
+
+    const std::string_view action(operation);
+    const auto acknowledge = action == "acknowledge";
+    if (acknowledge) {
+      std::lock_guard lock(gateMutex);
+      gateBuild = true;
+    } else if (action != "configure") {
+      // The new declaration changes presentation defaults, not host values.
+      writePatch("0.75");
+    }
+    if (action == "configure")
+      worker.configure(96'000.0, 8);
+    else if (action != "watch")
+      worker.requestRebuild();
+
+    if (acknowledge) {
+      bool started;
+      {
+        std::unique_lock lock(gateMutex);
+        started = gateWake.wait_for(lock, test::waitTimeout,
+                                    [&] { return buildStarted; });
+      }
+      // The rebuild has snapshotted the seed. Acknowledge it and automate
+      // before publication; the new engine must read the current host value.
+      hostValue.store(static_cast<float>(seed->values[0].normalized));
+      worker.finishSeeding(seed);
+      hostValue.store(0.6F);
+      {
+        std::lock_guard lock(gateMutex);
+        releaseBuild = true;
+      }
+      gateWake.notify_all();
+      if (!started)
+        return false;
+    }
+    std::unique_ptr<PreparedEngine> second{waitForReplacement(replacements)};
+    if (!second || second->buildGeneration() == first->buildGeneration() ||
+        !produces(*second, acknowledge ? 0.85F : 0.5F, hostValue.load())) {
+      std::cerr << operation
+                << " did not preserve committed parameter values\n";
+      return false;
+    }
+    worker.setActiveGeneration(second->buildGeneration());
+    if (worker.takeSeedValues()) {
+      std::cerr << operation << " created a second default seed\n";
+      return false;
+    }
+    if (!acknowledge) {
+      hostValue.store(static_cast<float>(seed->values[0].normalized));
+      worker.finishSeeding(seed);
+      hostValue.store(0.6F);
+    }
+    if (!produces(*second, 0.85F, hostValue.load())) {
+      std::cerr << operation
+                << " blocked automation after seed acknowledgment\n";
+      return false;
+    }
+  }
+  return true;
+}
+
+bool exerciseTypedProjectDefaults() {
+  using namespace onda::plugin;
+  struct Case {
+    std::string_view type;
+    std::string_view value;
+    std::string_view expression;
+    float expected;
+  };
+  const Case cases[]{
+      {"f32", "0.25", "data[0]", 0.25F},
+      {"f64", "0.25", "f32(data[0])", 0.25F},
+      {"i32", "7", "f32(data[0])", 7.0F},
+      {"i64", "\"13\"", "f32(data[0])", 13.0F},
+      {"bool", "true", "f32(i32(data[0]))", 1.0F},
+  };
+  TemporaryAudioFile audioFile{"typed-default-override"};
+  if (!audioFile.write(0.1F, 0.5F))
+    return false;
+  for (const auto &testCase : cases) {
+    const auto root = testTemporaryRoot() / testCase.type;
+    std::filesystem::create_directory(root);
+    const auto entry = root / "main.onda";
+    const auto project = root / "project.ondaproject";
+    {
+      std::ofstream source(entry);
+      source << "buffers { data: buffer<" << testCase.type
+             << "> }\nouts { out1, out2 }\nsample { value = "
+             << testCase.expression << "; out1 = value; out2 = value }\n";
+      std::ofstream manifest(project);
+      manifest << "{\"entry\":\"main.onda\",\"buffers\":{\"data\":{\"inline\":{"
+                  "\"element\":\""
+               << testCase.type
+               << "\",\"channels\":1,\"sample_rate\":48000,\"values\":["
+               << testCase.value << "]}}}}";
+    }
+    auto disk = PreparedEngine::build(project, Product::effect, 48'000.0, 8);
+    if (!disk.engine || !disk.projectImage.valid() ||
+        !produces(*disk.engine, testCase.expected)) {
+      std::cerr << testCase.type
+                << " project default failed: " << disk.diagnostic.message
+                << '\n';
+      return false;
+    }
+    const auto buffers = disk.engine->bufferMappings();
+    if (buffers.size() != 1U || buffers[0].loadedFrames != 1 ||
+        buffers[0].loadedChannels != 1 ||
+        !close(buffers[0].loadedSampleRate, 48'000.0F) ||
+        !buffers[0].loadedPath.empty())
+      return false;
+    if (testCase.type != "f32") {
+      const std::array bindings{
+          BufferFileBinding{.name = "data", .path = audioFile.path()}};
+      const auto overridden = PreparedEngine::build(project, Product::effect,
+                                                    48'000.0, 8, bindings);
+      if (overridden.engine || overridden.diagnostic.message.find(
+                                   "require an f32") == std::string::npos) {
+        std::cerr << "non-f32 audio-file override was accepted\n";
+        return false;
+      }
+    }
+    std::filesystem::remove(entry);
+    std::filesystem::remove(project);
+    auto restored =
+        PreparedEngine::build(disk.projectImage, Product::effect, 48'000.0, 8);
+    const auto exported = exportProject(disk.projectImage, root / "exported");
+    if (!exported)
+      return false;
+    auto portable = PreparedEngine::build(exported.projectFile, Product::effect,
+                                          48'000.0, 8);
+    if (!restored.engine || !portable.engine ||
+        !produces(*restored.engine, testCase.expected) ||
+        !produces(*portable.engine, testCase.expected)) {
+      std::cerr << testCase.type << " default did not survive restore/export\n";
+      return false;
+    }
+  }
+  return true;
+}
+
+bool exerciseFilesystemProjects() {
+  using namespace onda::plugin;
+  struct ExtensionCase {
+    const char *name;
+    const char *extension;
+  };
+  for (const auto &[name, extension] :
+       {ExtensionCase{"lowercase", ".ondaproject"},
+        ExtensionCase{"uppercase", ".ONDAPROJECT"},
+        ExtensionCase{"mixedcase", ".OndaProject"}}) {
+    for (const auto externalImport : {false, true}) {
+      const auto root =
+          testTemporaryRoot() / (std::string{"project-graph-"} + name +
+                                 (externalImport ? "-external" : "-contained"));
+      const auto projectDirectory = root / "project";
+      const auto dependencyDirectory =
+          (externalImport ? root : projectDirectory) / "shared";
+      const auto entry = projectDirectory / "code" / "main.onda";
+      const auto dependency = dependencyDirectory / "shared.onda";
+      const auto project =
+          projectDirectory / (std::string{"patch"} + extension);
+      std::filesystem::create_directories(entry.parent_path());
+      std::filesystem::create_directories(dependencyDirectory);
+      std::filesystem::create_directory(projectDirectory / "assets");
+      {
+        std::ofstream source(entry);
+        source
+            << "import " << (externalImport ? "../../" : "../")
+            << "shared/shared\nbuffers { clip: buffer<f32> }\n"
+               "outs { out1, out2 }\nsample { value = shared_gain() + clip[0]; "
+               "out1 = value; out2 = value }\n";
+        std::ofstream imported(dependency);
+        imported << "def shared_gain() { return 0.5 }\n";
+        std::ofstream manifest(project);
+        manifest
+            << R"({"entry":"code/main.onda","buffers":{"clip":{"file":"assets/clip.ondabuffer"}}})";
+      }
+      Diagnostic diagnostic;
+      const std::array samples{0.25F};
+      const auto asset =
+          encodeF32BufferAsset(samples, 1, 1, 48'000.0F, diagnostic);
+      if (asset.empty())
+        return false;
+      {
+        std::ofstream output(projectDirectory / "assets" / "clip.ondabuffer",
+                             std::ios::binary);
+        output.write(reinterpret_cast<const char *>(asset.data()),
+                     static_cast<std::streamsize>(asset.size()));
+      }
+      auto disk = PreparedEngine::build(project, Product::effect, 48'000.0, 8);
+      if (!disk.engine || !disk.projectImage.valid() ||
+          std::ranges::find(disk.watchPaths, dependency) ==
+              disk.watchPaths.end() ||
+          !produces(*disk.engine, 0.75F)) {
+        std::cerr << "filesystem project failed (" << extension
+                  << ", external import " << externalImport
+                  << "): " << disk.diagnostic.message << '\n';
+        return false;
+      }
+      // Restore and export must use the complete checkpoint, including imports
+      // and manifest-relative assets, after the original files disappear.
+      std::filesystem::remove_all(projectDirectory);
+      if (externalImport)
+        std::filesystem::remove_all(dependencyDirectory);
+      auto restored = PreparedEngine::build(disk.projectImage, Product::effect,
+                                            48'000.0, 8);
+      const auto exported = exportProject(disk.projectImage, root / "exported");
+      if (!exported) {
+        std::cerr << "filesystem project export failed: " << exported.error
+                  << '\n';
+        return false;
+      }
+      auto portable = PreparedEngine::build(exported.projectFile,
+                                            Product::effect, 48'000.0, 8);
+      if (!restored.engine || !portable.engine ||
+          !produces(*restored.engine, 0.75F) ||
+          !produces(*portable.engine, 0.75F)) {
+        std::cerr << "filesystem project did not survive restore/export: "
+                  << restored.diagnostic.message << "; "
+                  << portable.diagnostic.message << '\n';
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
 bool exerciseDiskRepairDuringFallback() {
   using namespace onda::plugin;
   TemporarySource source;
@@ -612,6 +1147,9 @@ bool exerciseDiskRepairDuringFallback() {
 
 int main() {
   if (!exerciseDiagnosticOwnership() || !exerciseNativeFilesystemWatcher() ||
+      !exerciseMovedSourceAncestor() || !exerciseSymlinkedBufferDirectory() ||
+      !exerciseBuildParameterSnapshot() || !exerciseReloadDuringSeeding() ||
+      !exerciseTypedProjectDefaults() || !exerciseFilesystemProjects() ||
       !exerciseDiskRepairDuringFallback())
     return 1;
   auto invalidBytes =
@@ -658,7 +1196,9 @@ int main() {
   const auto mappings = built.engine->parameterMappings();
   if (mappings.size() != 1U || mappings[0].name != "gain" ||
       mappings[0].type != "f32" ||
-      !test::withinTolerance(mappings[0].defaultPlain - 0.5, 1.0e-5) ||
+      !test::withinTolerance(
+          onda::plugin::scalarPlainNumber(mappings[0].defaultPlain) - 0.5,
+          1.0e-5) ||
       !test::withinTolerance(mappings[0].rangeMin, 1.0e-5) ||
       !test::withinTolerance(mappings[0].rangeMax - 1.0, 1.0e-5) ||
       mappings[0].scale != "linear" || mappings[0].curve || mappings[0].step ||
@@ -667,12 +1207,9 @@ int main() {
     return 1;
   }
 
-  std::array<std::atomic<float>, onda::plugin::slotCount> values;
-  std::array<std::atomic<float> *, onda::plugin::slotCount> slots{};
-  for (std::size_t index = 0; index < values.size(); ++index) {
-    values[index].store(index == 0U ? 0.25F : 0.5F);
-    slots[index] = &values[index];
-  }
+  onda::plugin::ParameterState slots;
+  for (std::size_t index = 0; index < onda::plugin::slotCount; ++index)
+    slots.set(index, index == 0U ? 0.25F : 0.5F);
 
   std::array<float, 5U> left{4.0F, 8.0F, 12.0F, 16.0F, 20.0F};
   std::array<float, 5U> right{20.0F, 16.0F, 12.0F, 8.0F, 4.0F};
@@ -692,7 +1229,7 @@ int main() {
 
   left.fill(8.0F);
   right.fill(4.0F);
-  values[0].store(0.5F);
+  slots.set(0, 0.5F);
   if (!built.engine->process(inputs.data(), outputs.data(), 5, {}, slots)) {
     std::cerr << "boundary-crossing process call failed\n";
     return 1;
@@ -1068,7 +1605,7 @@ int main() {
               << parameterAwareInstrument.diagnostic.message << '\n';
     return 1;
   }
-  values[0].store(0.75F);
+  slots.set(0, 0.75F);
   instrumentLeft.fill(0.0F);
   instrumentRight.fill(0.0F);
   const std::array parameterBoundaryEvent{onda::plugin::MidiEvent{
@@ -1090,20 +1627,28 @@ int main() {
     std::cerr << "parameter-aware instrument reset failed\n";
     return 1;
   }
-  values[0].store(1.0F);
+  slots.set(0, 1.0F);
+  parameterAwareInstrument.engine->beginHostCallback(6);
   if (!parameterAwareInstrument.engine->process(
           nullptr, instrumentOutputs.data(), 6, {}, slots)) {
     std::cerr << "parameter-aware loop setup failed\n";
     return 1;
   }
-  values[0].store(0.0F);
+  slots.set(0, 0.0F);
   instrumentLeft.fill(1.0F);
-  if (!parameterAwareInstrument.engine->beginHostCallback(slots) ||
-      !parameterAwareInstrument.engine->process(
+  parameterAwareInstrument.engine->beginHostCallback(2);
+  if (!parameterAwareInstrument.engine->process(
           nullptr, instrumentOutputs.data(), 2, parameterBoundaryEvent,
           slots) ||
-      !close(instrumentLeft[0], 0.0F)) {
-    std::cerr << "loop-boundary MIDI saw stale host automation\n";
+      !close(instrumentLeft[0], 0.0F) || !close(instrumentLeft[1], 0.0F)) {
+    std::cerr << "MIDI observed the previous callback's parameters\n";
+    return 1;
+  }
+  parameterAwareInstrument.engine->beginHostCallback(2);
+  if (!parameterAwareInstrument.engine->process(
+          nullptr, instrumentOutputs.data(), 2, parameterBoundaryEvent, slots) ||
+      !close(instrumentLeft[0], 0.0F) || !close(instrumentLeft[1], 0.0F)) {
+    std::cerr << "boundary MIDI did not observe pending host automation\n";
     return 1;
   }
   parameterAwareInstrument.engine.reset();
@@ -1149,12 +1694,16 @@ int main() {
         return !rejected.engine && rejected.diagnostic.message.find(
                                        expectedDiagnostic) != std::string::npos;
       };
-  if (!expectRejected("ins { in1, in2, in3 }\nouts { out1, out2 }\n"
+  const auto inputLimit = "at most " +
+      std::to_string(onda::plugin::pluginTotalInputChannels) + " f32 channels";
+  if (!expectRejected("ins " +
+                          std::to_string(onda::plugin::pluginTotalInputChannels + 1) +
+                          "\nouts { out1, out2 }\n"
                       "sample { out1 = in1; out2 = in2 }\n",
-                      "at most 2 f32 channels") ||
+                      inputLimit) ||
       !expectRejected("ins { in1: f64 }\nouts { out1 }\n"
                       "sample { out1 = f32(in1) }\n",
-                      "at most 2 f32 channels")) {
+                      inputLimit)) {
     std::cerr << "unsupported plugin interface was not rejected\n";
     return 1;
   }
@@ -1392,7 +1941,7 @@ sample { out1 = in1; out2 = in2 }
     if (deactivate.load() || !seed || seed->count != 1U ||
         seed->revision != worker.requestGeneration() ||
         workerEngine->buildGeneration() != worker.requestGeneration() ||
-        !close(seed->values[0], 0.5F)) {
+        !test::withinTolerance(seed->values[0].normalized - 0.5, 1.0e-5)) {
       std::cerr << "worker did not publish the initial engine\n";
       return 1;
     }
@@ -1831,6 +2380,29 @@ sample { out1 = in1; out2 = in2 }
       return 1;
     }
 
+    const auto &editedPath =
+        withDependency ? source.dependencyPath() : source.path();
+    const auto preservedTime = std::filesystem::last_write_time(editedPath);
+    const auto preservedSize = std::filesystem::file_size(editedPath);
+    if (withDependency)
+      source.writeDependency("def dependency_gain() { return 0.8 }\n");
+    else
+      source.writeConstantEffect("0.8");
+    std::filesystem::last_write_time(editedPath, preservedTime);
+    if (std::filesystem::file_size(editedPath) != preservedSize) {
+      std::cerr << "preserved-metadata edit changed the fixture size\n";
+      return 1;
+    }
+    std::unique_ptr<onda::plugin::PreparedEngine> preservedEdit{
+        waitForReplacement(watchReplacements)};
+    if (!preservedEdit ||
+        buildCalls.load(std::memory_order_relaxed) != initialBuildCalls + 1 ||
+        !produces(*preservedEdit, 0.8F)) {
+      std::cerr << "native notification missed a same-size, same-time edit "
+                << "(imported " << withDependency << ")\n";
+      return 1;
+    }
+
     if (!source.replaceConstantEffect("0.75")) {
       std::cerr << "could not atomically replace watched source\n";
       return 1;
@@ -1838,7 +2410,7 @@ sample { out1 = in1; out2 = in2 }
     std::unique_ptr<onda::plugin::PreparedEngine> changed{
         waitForReplacement(watchReplacements)};
     if (!changed ||
-        buildCalls.load(std::memory_order_relaxed) != initialBuildCalls + 1 ||
+        buildCalls.load(std::memory_order_relaxed) != initialBuildCalls + 2 ||
         !produces(*changed, 0.75F)) {
       std::cerr << "metadata-gated watcher did not rebuild a content edit once "
                 << "(initial " << initialBuildCalls << ", current "

@@ -166,10 +166,9 @@ ProjectImage loadFilesystemProjectImage(
     diagnostic.message = "Could not resolve the Onda project for checkpointing";
     return {};
   }
-  const auto root = canonicalProject.parent_path();
-
-  std::vector<StoredProjectFile> storage;
-  storage.reserve(watchPaths.size());
+  auto root = canonicalProject.parent_path();
+  std::vector<std::filesystem::path> canonicalPaths;
+  canonicalPaths.reserve(watchPaths.size());
   for (const auto &watchPath : watchPaths) {
     const auto canonicalPath = std::filesystem::canonical(watchPath, errorCode);
     if (errorCode) {
@@ -177,13 +176,24 @@ ProjectImage loadFilesystemProjectImage(
           "Could not resolve an Onda project file for checkpointing";
       return {};
     }
-    const auto relativePath = canonicalPath.lexically_relative(root);
-    if (!isSafeRelativeProjectPath(relativePath)) {
-      diagnostic.message =
-          "An Onda project file is outside the checkpoint root";
-      return {};
+    // The transport workspace must also contain imports outside the manifest
+    // directory. Onda still owns manifest containment and source resolution.
+    while (!isSafeRelativeProjectPath(canonicalPath.lexically_relative(root))) {
+      const auto parent = root.parent_path();
+      if (parent == root) {
+        diagnostic.message =
+            "Onda project files do not share a checkpoint root";
+        return {};
+      }
+      root = parent;
     }
+    canonicalPaths.push_back(canonicalPath);
+  }
 
+  std::vector<StoredProjectFile> storage;
+  storage.reserve(canonicalPaths.size());
+  for (const auto &canonicalPath : canonicalPaths) {
+    const auto relativePath = canonicalPath.lexically_relative(root);
     const auto byteCount = std::filesystem::file_size(canonicalPath, errorCode);
     if (errorCode || byteCount > std::vector<std::uint8_t>{}.max_size() ||
         byteCount > static_cast<std::uintmax_t>(

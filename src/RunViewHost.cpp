@@ -35,6 +35,12 @@ void set(juce::var &target, const juce::Identifier &key, juce::var value) {
   target.getDynamicObject()->setProperty(key, std::move(value));
 }
 
+juce::var scalarPlainValue(const ScalarPlain &plain) {
+  if (const auto *integer = std::get_if<std::int64_t>(&plain))
+    return juce::String(std::to_string(*integer));
+  return juce::var{std::get<double>(plain)};
+}
+
 juce::int64 logCounter(const std::uint64_t value) noexcept {
   return static_cast<juce::int64>(std::min(
       value,
@@ -111,19 +117,18 @@ juce::var makeRunViewState(Processor &processor, const WorkerStatus &status,
   auto state = object();
   set(state, "running", status.active);
   set(state, "connected", status.active);
+  // Use decimal text to preserve the full generation through JavaScript.
+  set(state, "engineGeneration",
+      juce::String(std::to_string(status.engineGeneration)));
   set(state, "path",
       status.path.empty() ? juce::String{} : pathToJuce(status.path));
   set(state, "status",
       status.compiling ? juce::String{"Compiling"}
                        : juce::String(status.message));
-  const auto isError = !status.path.empty() && !status.compiling &&
-                       status.message != "Active" &&
-                       status.message != "Waiting to compile" &&
-                       status.message != "Waiting for host specialization";
   set(state, "error",
       !actionError.empty()
           ? juce::String(actionError)
-          : (isError ? juce::String(status.message) : juce::String{}));
+          : (status.hasError ? juce::String(status.message) : juce::String{}));
   set(state, "sourceDirty", false);
   set(state, "supportsSourceSelection", true);
   set(state, "supportsProjectExport", true);
@@ -131,7 +136,10 @@ juce::var makeRunViewState(Processor &processor, const WorkerStatus &status,
   set(state, "supportsBufferEmbedding", false);
   set(state, "supportsTransport", false);
   set(state, "supportsDeviceSelection", false);
-  set(state, "supportsRunSettings", false);
+  set(state, "supportsRunSettings", true);
+  set(state, "canSetBlockSize", processor.canSetBlockSize());
+  set(state, "hostBlockSamples", processor.hostBlockSize());
+  set(state, "preferredBlockSamples", processor.preferredBlockSize());
   set(state, "supportsReset", true);
   set(state, "ondaVersion", juce::String::fromUTF8(onda_version()));
   set(state, "supportsParamSmoothing", true);
@@ -155,7 +163,7 @@ juce::var makeRunViewState(Processor &processor, const WorkerStatus &status,
           ? juce::String{"knobs"}
           : juce::String{"sliders"});
   set(state, "sampleRateHz", processor.hostSampleRate());
-  set(state, "blockFrames", processor.hostBlockSize());
+  set(state, "blockSamples", processor.ondaBlockSize());
 
   if (includeRuntimeLog)
     appendRuntimeLog(state, processor.runtimeLogSnapshot());
@@ -238,20 +246,19 @@ juce::var makeRunViewState(Processor &processor, const WorkerStatus &status,
   set(state, "events", std::move(events));
   set(state, "resetEventArguments", resetEventArguments);
 
-  juce::Array<juce::var> parameters;
-  parameters.ensureStorageAllocated(static_cast<int>(status.mappings.size()));
-  for (std::size_t index = 0; index < status.mappings.size(); ++index) {
-    const auto &mapping = status.mappings[index];
+  const auto values = processor.hostParameterValues();
+  const auto metadata = [](const ParameterMapping &mapping,
+                           const juce::String &name, const ScalarValue &value) {
     auto parameter = object();
-    set(parameter, "name",
-        "Slot " + juce::String(static_cast<int>(index + 1U)) + " -> " +
-            juce::String(mapping.name));
+    set(parameter, "name", name);
     set(parameter, "label", juce::String(mapping.name));
     set(parameter, "type", juce::String(mapping.type));
-    set(parameter, "normalizedValue",
-        static_cast<double>(processor.slotValue(index)));
+    set(parameter, "scalar", true);
+    set(parameter, "normalizedValue", value.normalized);
     set(parameter, "hostValueDomain", "normalized");
-    set(parameter, "default", mapping.defaultPlain);
+    if (const auto exact = value.defaultPlain(mapping.scalarDomain()))
+      set(parameter, "value", scalarPlainValue(*exact));
+    set(parameter, "default", scalarPlainValue(mapping.defaultPlain));
     set(parameter, "rangeMin", mapping.rangeMin);
     set(parameter, "rangeMax", mapping.rangeMax);
     set(parameter, "scale", juce::String(mapping.scale));
@@ -264,9 +271,38 @@ juce::var makeRunViewState(Processor &processor, const WorkerStatus &status,
         mapping.stepCount
             ? juce::var{static_cast<juce::int64>(*mapping.stepCount)}
             : juce::var{});
-    parameters.add(std::move(parameter));
-  }
+    return parameter;
+  };
+  juce::Array<juce::var> parameters;
+  for (std::size_t index = 0; index < status.mappings.size(); ++index)
+    parameters.add(
+        metadata(status.mappings[index],
+                 "Slot " + juce::String(static_cast<int>(index + 1U)) + " -> " +
+                     juce::String(status.mappings[index].name),
+                 values.parameters[index]));
   set(state, "params", std::move(parameters));
+
+  juce::Array<juce::var> controls;
+  for (std::size_t index = 0; index < status.controls.size(); ++index) {
+    auto control =
+        metadata(status.controls[index],
+                 "Input " + juce::String(static_cast<int>(index + 1U)) +
+                     " -> " + juce::String(status.controls[index].name),
+                 values.controls[index]);
+    set(control, "enabled",
+        processor.getChannelCountOfBus(true, pluginMainInputBuses +
+                                                 static_cast<int>(index)) == 0);
+    controls.add(std::move(control));
+  }
+  set(state, "inputControls", std::move(controls));
+  set(state, "supportsInputControlSmoothing", true);
+  set(state, "inputControlSmoothingMs",
+      processor.inputControlSmoothingSeconds() * 1000.0);
+  set(state, "inputControlSmoothingDefaultMs",
+      defaultParamSmoothingSeconds * 1000.0);
+  set(state, "inputControlLayout",
+      processor.inputControlLayout() == ParamControlLayout::knobs ? "knobs"
+                                                                  : "sliders");
 
   auto message = object();
   set(message, "type", "state");

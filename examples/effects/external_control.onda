@@ -1,0 +1,7 @@
+ins:
+  audio: f32[2]
+  gain_cv = 1.0 {0.0, 1.0}
+
+sample:
+  out1 = audio[0] * gain_cv
+  out2 = audio[1] * gain_cv

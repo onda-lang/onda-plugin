@@ -2,21 +2,20 @@
   <img src="assets/svg/onda-logo-dark-circle.svg" alt="onda logo" width="40" align="absmiddle" /> Onda VST3 Plugin
 </h1>
 
-`OndaSynth` and `OndaFX` are two VST3 plugins that allow you to run the 
-the [Onda](https://onda-lang.org) audio programming language in your favorite DAW.
+`OndaSynth` and `OndaFX` are VST3 plugins for running the
+[Onda](https://onda-lang.org) audio programming language in your DAW.
 
 [Pre-built binaries](https://github.com/onda-lang/onda-plugin/releases) are available for Windows, macOS and Linux.
-The pre-built macOS VST3 binaries are not signed.
+The macOS VST3 binaries require macOS 14 (Sonoma) or later and are not signed.
 
 ## Examples
 
-The [`examples`](examples) contain tested, plug-in-ready instruments and effects
-that show basic Onda programs. Load instrument patches in `OndaSynth` and effects in `OndaFX`
-through the embedded run view. 
+Load instrument patches in `OndaSynth` and effects in `OndaFX` through the
+embedded editor. The [examples](examples) include ready-to-use patches for both.
 
 ## DSP events
 
-The plugin recognizes this canonical MIDI surface:
+Onda programs can receive these MIDI events:
 
 ```onda
 event note_on(id: i32, channel: i32, key: i32, velocity: f32)
@@ -28,16 +27,12 @@ event cc(channel: i32, index: i32, value: f32)
 event program_change(channel: i32, program: i32)
 ```
 
-Instruments via `OndaSynth` require exact `note_on` and `note_off` declarations; 
-every other declaration is optional. Effects may omit all of them. Declaring a
-name with a different payload rejects the load. Channels are zero-based,
-ordinary MIDI notes use `id = -1`, and all continuous values except program
-number are normalized to `[0, 1]`. Pitch bend uses `0.5` as its center.
-Incoming messages whose event is not declared are ignored without splitting
-audio processing at their offsets. 
+`OndaSynth` requires `note_on` and `note_off` with the signatures above; all other
+events are optional. `OndaFX` may omit them all. Channels are zero-based, MIDI
+notes use `id = -1`, and velocity, pressure, bend, and CC values use `[0, 1]`.
+Pitch bend is centered at `0.5`.
 
-JUCE playhead data is exposed through these optional, read-only host-context
-events:
+These optional events provide DAW transport and timing information:
 
 ```onda
 event transport(playing: bool, recording: bool, looping: bool)
@@ -51,71 +46,112 @@ event loop_region(start_quarter_note: f64, end_quarter_note: f64)
 event render_mode(realtime: bool)
 ```
 
-At each logical Onda block start, the callback snapshots host parameters and
-then dispatches the declared context events in the order above before MIDI and
-audio processing. When declared, `render_mode` is dispatched unconditionally.
-Every other event is dispatched only when the current JUCE `PositionInfo`
-supplies its field; there are no separate availability flags. If a host stops
-supplying a field, its handler is not called again, so the Onda program decides
-whether and how long to retain the previous value.
-
-While transport is playing, sample and second positions are projected from the
-host callback start to the logical block boundary. Quarter-note position is
-projected at an interior boundary only when the same snapshot also supplies
-tempo. Stopped timeline positions remain unchanged, including when the program
-does not declare a `transport` event. Bar position and loop points use the host-provided values. 
+Timing events run at the start of each Onda block, before MIDI and audio.
+Except for `render_mode`, an event is sent only when the DAW supplies its value.
+Initialize any fallback values your program needs, such as a default tempo.
 
 ## Parameters and automation
 
-The VST3 exposes 32 permanent, normalized automation slots so parameter IDs
-and saved DAW automation remain stable while Onda programs are recompiled.
-After a successful compile, mapped slots present their Onda names, units,
-defaults, boolean/discrete step counts, and normalized-to-plain text conversion
-to the host. Logarithmic scaling, curves, and step snapping use Onda's processor
-ABI. 
+The plugin provides 32 DAW automation slots for `params`. Mapped slots use the
+loaded program's parameter names and units. Slots remain stable when the
+program is recompiled.
 
-Continuous `f32` and `f64` parameters use host-owned, block-rate linear smoothing
-in plain units for both editor changes and DAW automation. The **Smooth** control
-in the Params header defaults to 30 ms and is saved per plugin instance with
-the DAW project. Set it to 0 for direct updates; disabling smoothing settles
-active targets at the next callback. Integer, boolean, and stepped parameters,
-and durations no longer than one configured block, update directly. Startup,
-reload, and reset apply current values immediately.
+Scalar numeric parameters without a declared range appear in **Params** and map to
+DAW slots using a plugin-owned 0–1 control range. This adds no range to the Onda
+declaration and preserves authored defaults. Declare an explicit range when
+controls should cover other values, for example `frequency = 440.0 {20.0, 20000.0}`.
+Integer controls use whole-number steps; boolean controls use toggles.
+
+Continuous `params` automation follows the DAW's normalized linear curve,
+sampled at the start of each Onda block. Discrete parameters hold the latest
+point at that boundary. Automation points and MIDI events do not create extra
+Onda blocks.
+
+**Smooth**, in the Params header, smooths continuous float parameter changes
+made in the editor. It defaults to 30 ms; set it to 0 to disable it. Integer,
+boolean, and stepped parameters are not smoothed. Transitions are linear in
+plain units and update once per Onda block. A duration of one configured block
+or less applies immediately.
+
+DAW automation normally bypasses smoothing. While an editor transition is
+pending, a DAW automation queue whose points all match the editor target is
+treated as feedback, preserving the transition. Genuine automation with the
+same values is indistinguishable from that feedback and also preserves the
+transition.
+
+Bypass transitions use a 5 ms crossfade to the main audio input in OndaFX and
+silence in OndaSynth. DSP, MIDI, and automation keep advancing during bypass.
+
+Choose an **Onda Block Size** before loading a program. **Host** follows the
+DAW's configured buffer size; shorter DAW buffers are always respected.
+Smaller blocks update `params` automation and editor smoothing more frequently
+and use more CPU. Control input automation remains sample-accurate
+at every block size. Smoothing and block-size settings are saved with your DAW
+project.
+
+The final Onda block in a DAW callback can be shorter than the configured size.
+Onda's `BLOCK_SIZE` (`BS`) still reports the configured size, so authored clocks,
+smoothers, and block-rate oscillators such as `std::osc::KSine` can run ahead if
+they advance time by `BS`. Use per-sample timing for those algorithms when short
+callbacks are possible. The plugin's editor smoothing uses the actual sample
+count. See [the architecture notes](docs/architecture.md) for the SDK follow-up.
+
+## Audio inputs and outputs
+
+The default layout has two main audio inputs and two outputs. Declare channels
+as individual `f32` ports or `f32[N]` arrays, where `N` is the channel count.
+
+## Control inputs
+
+The default build provides 16 optional mono control inputs. In the stereo
+layout, declare the two main input channels first; subsequent inputs map to
+`Control 1`, `Control 2`, and so on. See
+[external_control.onda](examples/effects/external_control.onda) for an example.
+
+Each control appears as a named, automatable DAW parameter. Its bus starts
+disabled, and parameter automation supplies its value at every sample. To use
+an external signal, enable and route the corresponding bus through your DAW's
+sidechain or auxiliary inputs. The routed signal takes precedence; disabling
+the bus returns to the latest parameter value, including automation received
+while the bus was enabled. Control input automation and routed signals bypass
+the **Smooth** setting.
+
+The editor's **Input Controls** section shows the controls declared by the
+loaded program. It has independent **Sliders/Knobs**, **Smooth**, and **Reset**
+controls. Its Smooth setting defaults to 30 ms and smooths manual edits in plain
+units at every sample; set it to 0 to disable it. Reset restores input defaults
+without resetting Params. With an external bus enabled, its editors are disabled
+and show **External input**. Layout and smoothing settings are saved in the DAW
+project.
+
+Controls start at their declared input default, or zero. Declare an input range
+to set the values covered by automation, which maps linearly to that range.
+Routed signals are passed directly to Onda. Use scalar control inputs when you
+need defaults; control arrays must omit defaults.
+
+For different scaling or quantization, apply the conversion explicitly in the
+`sample` block. Additional input-control metadata is
+[deferred](docs/architecture.md#deferred-input-control-metadata).
 
 ## Audio buffers
 
-An `.ondaproject` input uses the immutable buffer defaults retained by Onda's
-compiled program. External buffers can also be bound by name to an audio file
-from the embedded run view, either for a source input or as an explicit project
-override. The picker accepts every format registered by this JUCE build; the
-cross-platform defaults include WAV, AIFF, FLAC, and Ogg Vorbis. Files are
-decoded on the background worker into pointer-stable, interleaved `f32` storage
-before the replacement engine is published. In addition to the JUCE formats,
-the loader accepts Onda's canonical `.ondabuffer` container.
+Bind audio files to named buffers in the editor. Supported formats include WAV,
+AIFF, FLAC, Ogg Vorbis, and `.ondabuffer`. Audio-file bindings require read-only
+`f32` buffers. An `.ondaproject` can also supply buffer defaults; clearing a
+binding restores its project default when available.
 
-Audio-file bindings must be read-only: programs that may write a bound buffer
-are rejected during preparation because Onda project assets are immutable.
-The worker uses native filesystem notifications for source and bound audio
-files, so an edit prepares a new engine while the current one keeps running.
+Linked source and audio files reload automatically after edits. Failed reloads
+keep the previous working program playing; missing required buffers must be
+bound before a new program can run.
 
-Plugin state stores buffer names and absolute audio-file paths for live disk
-reloading, while the project image always contains the matching canonical
-assets for deterministic DAW restore. Moving a linked audio file therefore
-falls back to the saved project image. Clearing a binding restores an available
-`.ondaproject` default; otherwise the current engine remains inactive until
-every declared buffer is bound. Failed replacements retain the last complete project checkpoint.
-If a replacement requires new buffer bindings, the view exposes those choices
-while the previous engine keeps playing. Binding or clearing these pending
-buffers preserves the last complete checkpoint until preparation succeeds.
+Your DAW project saves the program, buffer data, and plugin settings. If linked
+files are unavailable when reopening it, the plugin restores the saved version.
 
 ## Build
 
 Requirements:
 
 - CMake 3.22+, Ninja, and a C++20 compiler
-- The plug-in version selected by [`plugin-version`](plugin-version)
-- The Onda release SDK selected by [`onda-version`](onda-version)
-- JUCE selected by [`juce-version`](juce-version)
 - Linux editor builds: GTK 3 and WebKitGTK 4.1 development packages
 
 Configure and build the plugins:
@@ -131,27 +167,19 @@ To run tests:
 ctest --test-dir build --output-on-failure
 ```
 
-The VST3 audio layout is fixed at compile time and defaults to 2 inputs and 2
-outputs. Custom builds can expose between 0 and 64 inputs and between 1 and 64
-outputs; for example:
+Custom builds can change the fixed input, control, and output channel counts:
 
 ```sh
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
   -DONDA_PLUGIN_INPUT_CHANNELS=4 \
+  -DONDA_PLUGIN_CONTROL_INPUTS=8 \
   -DONDA_PLUGIN_OUTPUT_CHANNELS=8
 ```
 
-An Onda program may declare up to the configured number of channels. Unused
-host inputs are ignored and unused host outputs are cleared. The published
-archives retain the default 2-input/2-output layout.
+Main and control inputs together must not exceed 64 channels; outputs support
+1 to 64 channels. Set `ONDA_PLUGIN_CONTROL_INPUTS=0` to omit control inputs.
 
-CMake reads `plugin-version` for the embedded VST3 version and package release
-identity. `-DONDA_PLUGIN_VERSION=x.y.z` overrides it explicitly; otherwise the
-`ONDA_PLUGIN_VERSION` environment variable takes precedence over the file.
-
-Independently, `onda-version` selects the Onda SDK and the Onda source revision
-used for embedded run-view resources. The embedded-resource test checks that
-the pinned run view supports scroll-position persistence. `-DONDA_VERSION=x.y.z` overrides
-that pin; otherwise the `ONDA_VERSION` environment variable takes precedence
-over the file. This separation allows plug-in-only fixes to ship without
-changing the Onda SDK dependency.
+Versions are pinned in [plugin-version](plugin-version),
+[onda-version](onda-version), and [juce-version](juce-version).
+See [architecture](docs/architecture.md) and [test documentation](tests/README.md)
+for implementation and validation details.

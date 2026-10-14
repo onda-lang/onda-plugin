@@ -3,9 +3,13 @@
 #include "StateFormat.h"
 #include "TemporaryDirectory.h"
 #include "TestNumeric.h"
+#include "Vst3TestSupport.h"
+#include "Vst3AutomationTests.h"
+#include "ControlInputTestSupport.h"
 
 #include <juce_audio_processors_headless/juce_audio_processors_headless.h>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cmath>
@@ -93,35 +97,13 @@ struct ProductExpectation {
       juce::File{onda::plugin::pathToJuce(testTemporaryRoot() / "hosted.onda")};
   if (!source.replaceWithText(
           "outs { out1 }\n"
-          "event note_on(id: i32, channel: i32, key: i32, velocity: f32) {}\n"
-          "event note_off(id: i32, channel: i32, key: i32, velocity: f32) {}\n"
-          "sample { out1 = 0.25 }\n"))
+          "init { level = 0.25 }\n"
+          "event note_on(id: i32, channel: i32, key: i32, velocity: f32) { level = velocity }\n"
+          "event note_off(id: i32, channel: i32, key: i32, velocity: f32) { level = 0.0 }\n"
+          "sample { out1 = level }\n"))
     return false;
-  juce::MemoryBlock componentState;
-  {
-    juce::MemoryOutputStream stream(componentState, false);
-    stream.writeInt(static_cast<int>(onda::plugin::stateMagic));
-    stream.writeInt(onda::plugin::stateVersion);
-    stream.writeString(source.getFullPathName());
-    stream.writeString({});
-    stream.writeInt(0);
-    stream.writeInt64(0);
-    for (int slot = 0; slot < 32; ++slot)
-      stream.writeFloat(0.5F);
-    stream.writeInt(480);
-    stream.writeInt(720);
-    stream.writeBool(false);
-    stream.writeString({});
-    stream.writeDouble(onda::plugin::defaultParamSmoothingSeconds);
-  }
-  juce::XmlElement state("VST3PluginState");
-  state.createNewChildElement("IComponent")
-      ->addTextElement(componentState.toBase64Encoding());
-  juce::MemoryBlock hostState;
-  juce::AudioProcessor::copyXmlToBinary(state, hostState);
   instance.setNonRealtime(true);
-  instance.setStateInformation(hostState.getData(),
-                               static_cast<int>(hostState.getSize()));
+  setOndaProgram(instance, source);
   const auto channels =
       juce::jmax(ONDA_PLUGIN_INPUT_CHANNELS, ONDA_PLUGIN_OUTPUT_CHANNELS);
   for (int activation = 0; activation < 2; ++activation) {
@@ -141,7 +123,113 @@ struct ProductExpectation {
     }
     instance.releaseResources();
   }
+  // Exercise the exported VST3 Bypass parameter through JUCE's actual host.
+  instance.prepareToPlay(48'000.0, 64);
+  auto *const bypass = instance.getParameters()[32 + onda::plugin::pluginControlInputs];
+  const auto dryChannels =
+      instance.getName() == "OndaFX"
+          ? juce::jmin(ONDA_PLUGIN_INPUT_CHANNELS, ONDA_PLUGIN_OUTPUT_CHANNELS)
+          : 0;
+  test::BypassReference reference;
+  for (int step = 0; step < 3; ++step) {
+    const auto bypassed = step == 1;
+    bypass->setValueNotifyingHost(bypassed ? 1.0F : 0.0F);
+    juce::AudioBuffer<float> audio(channels, 64);
+    for (int channel = 0; channel < channels; ++channel)
+      std::fill_n(audio.getWritePointer(channel), 64, 0.375F);
+    juce::MidiBuffer midi;
+    if (step == 0)
+      midi.addEvent(juce::MidiMessage::noteOn(1, 60, 1.0F), 0);
+    else if (bypassed)
+      midi.addEvent(juce::MidiMessage::noteOff(1, 60), 16);
+    reference.begin(bypassed, 64);
+    instance.processBlock(audio, midi);
+    for (int channel = 0; channel < ONDA_PLUGIN_OUTPUT_CHANNELS; ++channel) {
+      for (int frame = 0; frame < 64; ++frame) {
+        const auto wet = channel == 0 &&
+                                 (step == 0 || (step == 1 && frame < 16))
+                             ? 1.0F
+                             : 0.0F;
+        const auto expected = reference.mix(
+            wet, channel < dryChannels ? 0.375F : 0.0F, frame);
+        if (!check(std::abs(audio.getSample(channel, frame) - expected) <
+                       1.0e-6F,
+                   instance.getName() + " failed host bypass or note release"))
+          return false;
+      }
+    }
+    reference.end(64);
+  }
+  instance.releaseResources();
   return true;
+}
+
+[[nodiscard]] bool smokeBypassTransitions(juce::AudioPluginInstance &instance) {
+  using namespace onda::plugin;
+  const juce::File source{
+      pathToJuce(testTemporaryRoot() / "vst3-bypass-transitions.onda")};
+  if (!source.replaceWithText(test::bypassTransitionSource()))
+    return false;
+  setOndaProgram(instance, source, 0.5F, 3);
+  instance.setNonRealtime(false);
+  if constexpr (pluginControlInputs > 0) {
+    auto layout = instance.getBusesLayout();
+    layout.inputBuses.set(pluginMainInputBuses, juce::AudioChannelSet::mono());
+    if (!instance.setBusesLayout(layout))
+      return false;
+  }
+  const auto render = [&](juce::AudioBuffer<float> &audio,
+                          juce::MidiBuffer &midi, const bool bypassed) {
+    instance.getParameters()[32 + pluginControlInputs]
+        ->setValueNotifyingHost(bypassed ? 1.0F : 0.0F);
+    instance.processBlock(audio, midi);
+    return true;
+  };
+  for (const auto sampleRate : {48'000.0, 96'000.0})
+    if (!test::checkBypassTransitions(instance, instance.getName() == "OndaFX",
+                                      sampleRate, render))
+      return false;
+  instance.getParameters()[32 + pluginControlInputs]->setValueNotifyingHost(0.0F);
+  return instance.disableNonMainBuses();
+}
+
+[[nodiscard]] bool smokeControlInputs(juce::AudioPluginInstance &instance) {
+  if constexpr (onda::plugin::pluginControlInputs > 0) {
+    const juce::File source{onda::plugin::pathToJuce(
+        testTemporaryRoot() / "vst3-control-inputs.onda")};
+    if (!source.replaceWithText(test::controlInputSource()))
+      return false;
+    const std::array defaults{0.25F, 0.75F};
+    setOndaProgram(instance, source, 0.5F, 3, defaults);
+  }
+  instance.setNonRealtime(false);
+  const auto render = [&](juce::AudioBuffer<float> &audio,
+                          juce::MidiBuffer &midi, const bool bypassed) {
+    instance.getParameters()[32 + onda::plugin::pluginControlInputs]
+        ->setValueNotifyingHost(bypassed ? 1.0F : 0.0F);
+    instance.processBlock(audio, midi);
+    return true;
+  };
+  if (!test::checkControlInputRouting(instance, instance.getName() == "OndaFX",
+                                      render))
+    return false;
+  if constexpr (onda::plugin::pluginControlInputs > 0) {
+    const juce::File all{onda::plugin::pathToJuce(
+        testTemporaryRoot() / "vst3-all-control-inputs.onda")};
+    if (!all.replaceWithText(test::allControlInputSource()))
+      return false;
+    const std::vector<float> defaults(
+        static_cast<std::size_t>(onda::plugin::pluginControlInputs), 0.125F);
+    setOndaProgram(instance, all, 0.5F, 3, defaults);
+    if (!test::checkLastControlInputRouting(instance, render))
+      return false;
+  }
+  const juce::File unused{onda::plugin::pathToJuce(
+      testTemporaryRoot() / "vst3-unused-controls.onda")};
+  if (!unused.replaceWithText(test::unusedControlInputSource()))
+    return false;
+  setOndaProgram(instance, unused, 0.5F, 3);
+  return test::checkUnusedControlInputs(instance, render);
 }
 
 [[nodiscard]] bool smokeProduct(juce::VST3PluginFormatHeadless &format,
@@ -187,7 +275,7 @@ struct ProductExpectation {
   auto succeeded = true;
   const auto parameterCount = instance->getParameters().size();
   succeeded &= check(
-      parameterCount == 2113,
+      parameterCount == 2113 + onda::plugin::pluginControlInputs,
       description.name +
           " must expose 32 Onda slots, bypass, and 2080 VST3 MIDI mappings "
           "(found " +
@@ -218,7 +306,7 @@ struct ProductExpectation {
                   juce::String(index));
   }
   if (parameterCount > 32) {
-    const auto *bypass = instance->getParameters()[32];
+    const auto *bypass = instance->getParameters()[32 + onda::plugin::pluginControlInputs];
     succeeded &= check(bypass->getName(64) == "Bypass",
                        description.name + " final parameter must be Bypass");
     succeeded &= check(bypass->getNumSteps() == 2,
@@ -227,7 +315,7 @@ struct ProductExpectation {
                        description.name + " bypass must default off");
   }
   auto midiMappingsAreNonAutomatable = true;
-  for (int index = 33; index < parameterCount; ++index)
+  for (int index = 33 + onda::plugin::pluginControlInputs; index < parameterCount; ++index)
     midiMappingsAreNonAutomatable &=
         !instance->getParameters()[index]->isAutomatable();
   succeeded &= check(midiMappingsAreNonAutomatable,
@@ -298,6 +386,16 @@ struct ProductExpectation {
   instance->releaseResources();
   secondInstance->releaseResources();
   succeeded &= smokeLoadedProgram(*instance);
+  succeeded &= smokeAutomation(*instance);
+  succeeded &= smokeCallbackProcessing(*instance);
+  succeeded &= smokeParameterDefaults(*instance);
+  succeeded &= smokeControlAutomation(*instance);
+  succeeded &= smokeParameterConversions(format, description, module);
+  succeeded &= smokeAutomationNotifications(format, description, module);
+  succeeded &= smokeOfflineAutomationNotifications(format, description, module);
+  succeeded &= check(smokeControlInputs(*instance),
+                     instance->getName() + " control input smoke failed");
+  succeeded &= smokeBypassTransitions(*instance);
 
   return succeeded;
 }
