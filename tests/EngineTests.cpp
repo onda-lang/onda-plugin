@@ -1,5 +1,6 @@
 #include "TemporaryDirectory.h"
 #include "TestNumeric.h"
+#include "TestRunner.h"
 #include "TestWait.h"
 
 #include "AudioFile.h"
@@ -1143,15 +1144,7 @@ bool exerciseDiskRepairDuringFallback() {
   return true;
 }
 
-} // namespace
-
-int main() {
-  if (!exerciseDiagnosticOwnership() || !exerciseNativeFilesystemWatcher() ||
-      !exerciseMovedSourceAncestor() || !exerciseSymlinkedBufferDirectory() ||
-      !exerciseBuildParameterSnapshot() || !exerciseReloadDuringSeeding() ||
-      !exerciseTypedProjectDefaults() || !exerciseFilesystemProjects() ||
-      !exerciseDiskRepairDuringFallback())
-    return 1;
+int exerciseEngineAndWorker() {
   auto invalidBytes =
       std::make_shared<const std::vector<std::uint8_t>>(3U, 0xffU);
   onda::plugin::Diagnostic invalidDiagnostic;
@@ -2528,6 +2521,23 @@ sample { out1 = in1; out2 = in2 }
     }
   }
 
-  std::cout << "onda_plugin_tests: passed\n";
   return 0;
+}
+
+} // namespace
+
+int main(const int argc, char **argv) {
+  const test::Case cases[]{
+      {"DiagnosticOwnership", exerciseDiagnosticOwnership},
+      {"NativeFilesystemWatcher", exerciseNativeFilesystemWatcher},
+      {"MovedSourceAncestor", exerciseMovedSourceAncestor},
+      {"SymlinkedBufferDirectory", exerciseSymlinkedBufferDirectory},
+      {"BuildParameterSnapshot", exerciseBuildParameterSnapshot},
+      {"ReloadDuringSeeding", exerciseReloadDuringSeeding},
+      {"TypedProjectDefaults", exerciseTypedProjectDefaults},
+      {"FilesystemProjects", exerciseFilesystemProjects},
+      {"DiskRepairDuringFallback", exerciseDiskRepairDuringFallback},
+      {"EngineAndWorker", +[] { return exerciseEngineAndWorker() == 0; }},
+  };
+  return test::runCases(argc, argv, cases);
 }

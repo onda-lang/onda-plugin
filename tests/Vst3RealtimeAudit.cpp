@@ -33,9 +33,9 @@ extern "C" void onda_vst3_audit_begin() noexcept {
   enabled = true;
 }
 
-extern "C" Vst3RealtimeCounts onda_vst3_audit_end() noexcept {
+extern "C" void onda_vst3_audit_end(Vst3RealtimeCounts *result) noexcept {
   enabled = false;
-  return counts;
+  *result = counts;
 }
 
 extern "C" int pthread_mutex_lock(pthread_mutex_t *mutex) noexcept {

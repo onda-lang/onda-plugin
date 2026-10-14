@@ -52,10 +52,16 @@ bool checkCounts(const char *name, const Vst3RealtimeCounts actual,
   return false;
 }
 
+Vst3RealtimeCounts endAudit() noexcept {
+  Vst3RealtimeCounts counts;
+  onda_vst3_audit_end(&counts);
+  return counts;
+}
+
 template <typename Operation> Vst3RealtimeCounts measure(Operation operation) {
   onda_vst3_audit_begin();
   operation();
-  return onda_vst3_audit_end();
+  return endAudit();
 }
 
 bool checkAllocations() {
@@ -188,12 +194,12 @@ bool checkIntervals() {
                      "An extra mutex escaped the callback budget");
   succeeded &=
       checkCounts("null free", measure([] { std::free(nullptr); }), {});
-  const auto disabled = onda_vst3_audit_end();
+  const auto disabled = endAudit();
   auto *const pointer = std::malloc(128);
   std::free(pointer);
   lockAndUnlock();
   succeeded &=
-      checkCounts("disabled interval", onda_vst3_audit_end(), disabled);
+      checkCounts("disabled interval", endAudit(), disabled);
   succeeded &= checkCounts("fresh interval", measure([] {}), {});
   return succeeded;
 }
@@ -213,7 +219,7 @@ bool checkThreadIsolation() {
         auto *const pointer = std::malloc(128);
         std::free(pointer);
       }
-      results[index] = onda_vst3_audit_end();
+      onda_vst3_audit_end(&results[index]);
       done.fetch_add(1);
     });
   while (ready.load() != 2)

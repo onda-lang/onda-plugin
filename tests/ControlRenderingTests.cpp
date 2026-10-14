@@ -1,5 +1,4 @@
 #include "ControlRenderingTests.h"
-#include "LinearInterpolation.h"
 #include "ParameterAutomation.h"
 #include "ParameterRamp.h"
 #include "TestAutomationQueue.h"
@@ -22,38 +21,27 @@ bool sameSample(const float actual, const float expected) {
          std::bit_cast<std::uint32_t>(expected);
 }
 
-bool interpolationPrecision() {
-  constexpr auto largest = std::numeric_limits<double>::max();
-  constexpr auto smallest = std::numeric_limits<double>::denorm_min();
-  const std::array endpoints{
-      std::array{0.0, 1.0},          std::array{1.0, 0.0},
-      std::array{-0.0, 0.0},         std::array{0.0, -0.0},
-      std::array{-0.0, -0.0},        std::array{smallest, 1.0},
-      std::array{1.0, smallest},     std::array{-smallest, smallest},
-      std::array{1.0, largest},      std::array{largest, 1.0},
-      std::array{-largest, -1.0},    std::array{-1.0, -largest},
-      std::array{-largest, largest}, std::array{largest, -largest},
-      std::array{1.0e20, 1.0},       std::array{1.0, 1.0e20},
-      std::array{-1.0e20, 1.0},      std::array{-1.0, 1.0e20}};
-  const std::array weights{0.0,
-                           smallest,
-                           std::nextafter(0.5, 0.0),
-                           0.5,
-                           std::nextafter(0.5, 1.0),
-                           std::nextafter(1.0, 0.0),
-                           1.0};
-  for (const auto range : endpoints) {
-    bool matches = true;
-    detail::withLinearInterpolation(
-        range[0], range[1], [&](const auto interpolate) {
-          for (const auto weight : weights)
-            matches &= std::bit_cast<std::uint64_t>(interpolate(weight)) ==
-                       std::bit_cast<std::uint64_t>(
-                           std::lerp(range[0], range[1], weight));
-        });
-    if (!matches) {
-      std::cerr << "Prepared interpolation changed rounding or an endpoint\n";
-      return false;
+bool rampEndpointPrecision() {
+  // One sample below a long ramp's endpoint exposes fused/non-fused rounding
+  // differences in real rendered output, rather than testing a lerp replica.
+  constexpr auto duration = std::uint64_t{1} << 53U;
+  for (const auto start : {1.0e20, -1.0e20}) {
+    ParameterRamp batched;
+    batched.setDuration(duration);
+    batched.reset(start);
+    batched.setTarget(std::copysign(1.0, start));
+    static_cast<void>(batched.advance(duration - 2U, false));
+    auto scalar = batched;
+    std::array<float, 2> output;
+    batched.render(output.data(), static_cast<int>(output.size()));
+    for (const auto actual : output) {
+      const auto expected = static_cast<float>(scalar.advance(1U, true));
+      if (!sameSample(actual, expected)) {
+        std::cerr << std::hexfloat << "Ramp endpoint mismatch: start " << start
+                  << ", actual " << actual << ", expected " << expected
+                  << std::defaultfloat << '\n';
+        return false;
+      }
     }
   }
   return true;
@@ -213,5 +201,5 @@ bool automationPrecision() {
 } // namespace
 
 bool exerciseControlRendering() {
-  return interpolationPrecision() && rampPrecision() && automationPrecision();
+  return rampEndpointPrecision() && rampPrecision() && automationPrecision();
 }

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
-import { readFile, mkdtemp, rm } from "node:fs/promises";
+import { readFile, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -23,6 +23,11 @@ window.__JUCE__ = { backend: {
 const checks = `
 (async () => {
   try {
+    // An active element in an inactive window receives no focus/blur events.
+    // Wait for the native window before exercising the shipped edit handlers.
+    if (!document.hasFocus()) {
+      await new Promise(resolve => window.addEventListener("focus", resolve, { once: true }));
+    }
     const equal = (actual, expected, message) => {
       if (actual !== expected) throw new Error(message + ": " + actual + ", expected " + expected);
     };
@@ -38,6 +43,12 @@ const checks = `
     });
     const number = (bank = "params") => document.querySelector("#" +
       (bank === "params" ? "params" : "input-controls") + " .param-number");
+    const focus = (bank = "params") => {
+      const input = number(bank);
+      input.focus();
+      equal(document.activeElement, input, "Number input must have focus");
+      equal(input.readOnly, false, "Focus must enable numeric editing");
+    };
     const writes = () => window.__parameterCommands.filter(command =>
       command.type === "setParam" || command.type === "setInputControl");
     for (const layout of ["sliders", "knobs"]) {
@@ -47,7 +58,7 @@ const checks = `
       send(parameter);
       equal(number().value, "440", "Host publication must preserve an out-of-range default");
       const before = writes().length;
-      number().focus();
+      focus();
       number().blur();
       equal(number().value, "440", "Unedited blur must preserve an authored default");
       equal(writes().length, before, "Unedited blur must not write to DSP");
@@ -59,13 +70,13 @@ const checks = `
         equal(number().value, value, "Initial exact i64 default");
         send(integer);
         equal(number().value, value, "Published exact i64 default");
-        number().focus();
+        focus();
         equal(number().value, value, "Focused exact i64 default");
         number().blur();
         equal(number().value, value, "Unedited exact i64 default");
       }
       send(parameter);
-      number().focus();
+      focus();
       number().value = "0.75";
       number().dispatchEvent(new Event("input", { bubbles: true }));
       // Host updates must retain the focused draft.
@@ -73,23 +84,26 @@ const checks = `
       equal(number().value, "0.75", "Host update replaced a focused draft");
       number().dispatchEvent(new Event("change", { bubbles: true }));
       number().blur();
-      equal(writes().at(-1).value, 0.75, "Edits must retain normalized conversion");
+      equal(writes().length, before + 1, "Editing must emit one parameter write");
+      equal(writes().at(-1)?.value, 0.75, "Edits must retain normalized conversion");
       send(parameter);
-      number().focus();
+      focus();
       number().value = "999";
       number().dispatchEvent(new Event("input", { bubbles: true }));
       number().dispatchEvent(new Event("change", { bubbles: true }));
       number().blur();
       equal(number().value, "1", "Edits must respect the fallback range");
-      equal(writes().at(-1).value, 1, "Out-of-range edit must be clamped");
+      equal(writes().at(-1)?.value, 1, "Out-of-range edit must be clamped");
     }
     const control = { ...parameter, name: "Input 1 -> cv", value: 0.1234567,
       default: 0.1234567, normalizedValue: 0.1234567, enabled: true };
     send(control, "inputControls");
     send(control, "inputControls");
     equal(number("inputControls").value, "0.1235", "Control display formatting changed");
-    number("inputControls").focus();
+    const beforeControl = writes().length;
+    focus("inputControls");
     number("inputControls").blur();
+    equal(writes().length, beforeControl, "Unedited input control must not write to DSP");
     await fetch("/result", { method: "POST", body: JSON.stringify({ ok: true }) });
   } catch (error) {
     await fetch("/result", { method: "POST", body: JSON.stringify({ error: String(error), stack: error.stack }) });
@@ -122,6 +136,8 @@ const profile = await mkdtemp(join(tmpdir(), "onda-parameter-view-"));
 let browser;
 let deadline;
 try {
+  // The same focus preference used by geckodriver, scoped to this profile.
+  await writeFile(join(profile, "user.js"), 'user_pref("focusmanager.testmode", true);\n');
   server.listen(0, "127.0.0.1");
   await once(server, "listening");
   browser = spawn(firefox, ["--headless", "--no-remote", "--profile", profile,

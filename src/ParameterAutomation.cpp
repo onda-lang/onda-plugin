@@ -1,5 +1,4 @@
 #include "ParameterAutomation.h"
-#include "LinearInterpolation.h"
 
 #include <algorithm>
 #include <cassert>
@@ -76,42 +75,31 @@ void AutomationCurve::render(float *destination, int offset, int frames,
   if (frames <= 0)
     return;
   assert(continuous_);
-  detail::withLinearInterpolation(
-      minimum, maximum, [&](const auto scale) noexcept {
-        while (frames > 0) {
-          advance(offset);
-          const auto count =
-              hasRight_ ? std::min(frames, right_.offset - offset) : frames;
-          if (!hasRight_ || left_.value == right_.value || minimum == maximum) {
-            std::fill_n(destination, count,
-                        static_cast<float>(scale(left_.value)));
-          } else if (count == 1 && offset == left_.offset) {
-            // An exact host point needs no span preparation. Keep the
-            // zero-weight lerp to preserve its signed-zero arithmetic.
-            destination[0] = static_cast<float>(
-                scale(std::lerp(left_.value, right_.value, 0.0)));
-          } else {
-            // The reciprocal is cached once per pair of host points. Absolute
-            // offsets give identical samples across segment splits.
-            const auto firstOffset = offset - left_.offset;
-            detail::withLinearInterpolation(
-                left_.value, right_.value,
-                [&](const auto interpolate) noexcept {
-                  for (int frame = 0; frame < count; ++frame) {
-                    const auto weight =
-                        static_cast<double>(firstOffset + frame) * inverseSpan_;
-                    // Interpolate before scaling to preserve wide bipolar
-                    // zero crossings and small asymmetric endpoints.
-                    destination[frame] =
-                        static_cast<float>(scale(interpolate(weight)));
-                  }
-                });
-          }
-          destination += count;
-          offset += count;
-          frames -= count;
-        }
-      });
+  while (frames > 0) {
+    advance(offset);
+    const auto count =
+        hasRight_ ? std::min(frames, right_.offset - offset) : frames;
+    if (!hasRight_ || left_.value == right_.value || minimum == maximum) {
+      std::fill_n(destination, count,
+                  static_cast<float>(std::lerp(minimum, maximum, left_.value)));
+    } else {
+      // The reciprocal is cached once per pair of host points. Absolute
+      // offsets give identical samples across segment splits.
+      const auto firstOffset = offset - left_.offset;
+      for (int frame = 0; frame < count; ++frame) {
+        const auto weight =
+            static_cast<double>(firstOffset + frame) * inverseSpan_;
+        // Match valueAt() before scaling, retaining wide bipolar zero
+        // crossings, signed-zero arithmetic and the library's fused rounding.
+        const auto normalized = std::lerp(left_.value, right_.value, weight);
+        destination[frame] =
+            static_cast<float>(std::lerp(minimum, maximum, normalized));
+      }
+    }
+    destination += count;
+    offset += count;
+    frames -= count;
+  }
 }
 
 } // namespace onda::plugin

@@ -1,7 +1,5 @@
 #pragma once
 
-#include "LinearInterpolation.h"
-
 #include <algorithm>
 #include <cmath>
 #include <compare>
@@ -64,17 +62,15 @@ public:
       const auto finishes = static_cast<std::uint64_t>(count) == remaining;
       const auto interpolated = count - (finishes ? 1 : 0);
       const auto duration = static_cast<double>(samples_);
-      detail::withLinearInterpolation(
-          start_, target_, [&](const auto interpolate) noexcept {
-            for (int frame = 0; frame < interpolated; ++frame) {
-              const auto position =
-                  elapsed_ + static_cast<std::uint64_t>(frame) + 1U;
-              // Division preserves the rounding of scalar advance(). Absolute
-              // positions keep output independent of render segment sizes.
-              const auto weight = static_cast<double>(position) / duration;
-              destination[frame] = static_cast<float>(interpolate(weight));
-            }
-          });
+      for (int frame = 0; frame < interpolated; ++frame) {
+        const auto position =
+            elapsed_ + static_cast<std::uint64_t>(frame) + 1U;
+        // Match scalar advance(), including the standard library's fused
+        // arithmetic. Absolute positions keep segment sizes from affecting it.
+        const auto weight = static_cast<double>(position) / duration;
+        destination[frame] =
+            static_cast<float>(std::lerp(start_, target_, weight));
+      }
       if (finishes)
         destination[count - 1] = static_cast<float>(target_);
       elapsed_ += static_cast<std::uint64_t>(count);

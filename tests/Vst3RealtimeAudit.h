@@ -15,5 +15,5 @@ struct Vst3RealtimeCounts {
 
 extern "C" {
 void onda_vst3_audit_begin() noexcept;
-Vst3RealtimeCounts onda_vst3_audit_end() noexcept;
+void onda_vst3_audit_end(Vst3RealtimeCounts *result) noexcept;
 }

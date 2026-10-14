@@ -14,14 +14,20 @@ save/restore/resave of both banks while unloaded, restoring over an existing
 engine, repeated unload, and subsequent loading with host values preserved.
 They require exact values in initializers and rendered controls, and check that
 newer identical float writes invalidate restored precision and scalar defaults.
-Processor cases print their names before running. To isolate one scenario:
+Engine and processor cases flush their names before running and report caught
+exceptions, including exceptions terminating a worker thread. To isolate one
+scenario:
 
 ```sh
 ./build/onda_processor_tests IncompleteBufferStateRestore
 ./build/onda_processor_tests MessageThreadDelivery
+./build/onda_plugin_tests NativeFilesystemWatcher
+./build/onda_plugin_tests MovedSourceAncestor
 ```
 
 Use `build/Release/onda_processor_tests.exe` for a Windows multi-config build.
+Failed CI jobs retain CTest logs and Windows test executables as diagnostic
+artifacts.
 
 ## Coverage
 
@@ -210,6 +216,8 @@ the `ControlInputs` processor case alongside the VST3 smoke test and validators.
 - Portable project-image paths use `/`, independent of native filesystem separators.
 - Floating-point checks reject NaN and infinity. Audio-file expectations account
   for the fixture's FLAC quantization rather than requiring bit-identical floats.
+  Batched interpolation uses the platform's `std::lerp`, matching scalar
+  sampling even when the standard library uses fused arithmetic.
 - Aligned-allocation tests cover small and over-aligned requests and zero sizes.
   C++ allocation/deallocation auditing runs on all platforms; C allocation/free and mutex-lock
   interception use Linux linker wrapping. Passing on macOS or Windows does not
@@ -218,6 +226,10 @@ the `ControlInputs` processor case alongside the VST3 smoke test and validators.
   The desktop WebView2 handshake is checked on Windows; macOS and Linux exercise
   editor ownership, dimensions, preferences, and automation without requiring that
   browser handshake. VST3 validation does not replace testing in a real DAW.
+- The Firefox DOM test uses geckodriver's `focusmanager.testmode` preference in
+  its temporary profile and waits for native window focus before testing edits.
+  It requires focus to make the number input editable and checks emitted writes;
+  an active DOM element alone does not establish a functioning edit session.
 
 Linux success cannot establish macOS or Windows success. The release workflow runs
 the suite independently on all three platforms.

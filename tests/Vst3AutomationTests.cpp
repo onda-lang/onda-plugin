@@ -37,7 +37,8 @@ tresult processRealtime(Vst::IAudioProcessor &processor,
   if (begin != nullptr && end != nullptr) {
     begin();
     const auto result = processor.process(data);
-    const auto counts = end();
+    Vst3RealtimeCounts counts;
+    end(&counts);
     // JUCE retains one callback mutex. Managed automation must add no locks,
     // allocations or frees, including queue flushes and MIDI segment splits.
     if (counts.hasViolations(1)) {

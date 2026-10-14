@@ -1,5 +1,6 @@
 #include "TemporaryDirectory.h"
 #include "TestNumeric.h"
+#include "TestRunner.h"
 
 #include "AudioFile.h"
 #include "EditorTestSupport.h"
@@ -447,8 +448,10 @@ bool waitForActiveRevision(onda::plugin::Processor &processor,
                            const std::uint64_t previousRevision) {
   return test::waitUntil(
       [&] {
-        test::service(processor);
         const auto status = processor.workerStatus();
+        // Observe publication before servicing its message-thread updates. A
+        // build completing between service() and status() leaves metadata stale.
+        test::service(processor);
         return status.revision > previousRevision && status.active &&
                !status.compiling && status.message == "Active";
       },
@@ -4639,11 +4642,7 @@ int main(const int argc, const char *const *argv) {
   std::signal(SIGPIPE, SIG_IGN);
 #endif
   juce::ScopedJuceInitialiser_GUI juceInitialiser;
-  struct Case {
-    std::string_view name;
-    bool (*run)();
-  };
-  const Case cases[]{
+  const test::Case cases[]{
       {"RealtimeAuditInstrumentation", test::exerciseRealtimeAuditInstrumentation},
       {"AlignedAllocation", exerciseAlignedAllocation},
       {"NewControlDefaults", exerciseNewControlDefaults},
@@ -4723,31 +4722,5 @@ int main(const int argc, const char *const *argv) {
       {"ReplacementDuringSeeding", exerciseReplacementDuringSeeding},
       {"ConcurrentInstances", exerciseConcurrentInstances},
   };
-  if (argc > 2) {
-    std::cerr << "usage: onda_processor_tests [case-name]\n";
-    return 2;
-  }
-  bool selected{};
-  for (const auto &testCase : cases) {
-    if (argc == 2 && testCase.name != argv[1])
-      continue;
-    selected = true;
-    std::cout << "[ RUN      ] " << testCase.name << std::endl;
-    bool passed{};
-    try {
-      passed = testCase.run();
-    } catch (const std::exception &error) {
-      std::cerr << error.what() << '\n';
-    }
-    if (!passed) {
-      std::cerr << "[  FAILED  ] " << testCase.name << std::endl;
-      return 1;
-    }
-    std::cout << "[       OK ] " << testCase.name << std::endl;
-  }
-  if (!selected) {
-    std::cerr << "unknown processor test case\n";
-    return 2;
-  }
-  return 0;
+  return test::runCases(argc, argv, cases);
 }

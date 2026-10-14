@@ -461,7 +461,6 @@ add_library(onda_plugin_engine STATIC
     src/OndaSdk.h
     src/Primitive.h
     src/ParameterRamp.h
-    src/LinearInterpolation.h
     src/ProjectExport.cpp
     src/ProjectExport.h
     src/Product.h
