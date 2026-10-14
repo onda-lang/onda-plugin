@@ -57,44 +57,17 @@ loaded program's parameter names and units. Slots remain stable when the
 program is recompiled.
 
 Scalar numeric parameters without a declared range appear in **Params** and map to
-DAW slots using a plugin-owned 0–1 control range. This adds no range to the Onda
-declaration and preserves authored defaults. Declare an explicit range when
+DAW slots using a plugin-owned 0–1 control range. Declare an explicit range when
 controls should cover other values, for example `frequency = 440.0 {20.0, 20000.0}`.
-Integer controls use whole-number steps; boolean controls use toggles.
 
 Continuous `params` automation follows the DAW's normalized linear curve,
 sampled at the start of each Onda block. Discrete parameters hold the latest
-point at that boundary. Automation points and MIDI events do not create extra
-Onda blocks.
+point at that boundary. 
 
-**Smooth**, in the Params header, smooths continuous float parameter changes
-made in the editor. It defaults to 30 ms; set it to 0 to disable it. Integer,
-boolean, and stepped parameters are not smoothed. Transitions are linear in
-plain units and update once per Onda block. A duration of one configured block
-or less applies immediately.
+**Onda Block Size** controls how often params automation updates.
 
-DAW automation normally bypasses smoothing. While an editor transition is
-pending, a DAW automation queue whose points all match the editor target is
-treated as feedback, preserving the transition. Genuine automation with the
-same values is indistinguishable from that feedback and also preserves the
-transition.
-
-Bypass transitions use a 5 ms crossfade to the main audio input in OndaFX and
-silence in OndaSynth. DSP, MIDI, and automation keep advancing during bypass.
-
-Choose an **Onda Block Size** before loading a program. **Host** follows the
-DAW's configured buffer size; shorter DAW buffers are always respected.
-Smaller blocks update `params` automation and editor smoothing more frequently
-and use more CPU. Control input automation remains sample-accurate
-at every block size. Smoothing and block-size settings are saved with your DAW
-project.
-
-The final Onda block in a DAW callback can be shorter than the configured size.
-Onda's `BLOCK_SIZE` (`BS`) still reports the configured size, so authored clocks,
-smoothers, and block-rate oscillators such as `std::osc::KSine` can run ahead if
-they advance time by `BS`. Use per-sample timing for those algorithms when short
-callbacks are possible. The plugin's editor smoothing uses the actual sample
-count. See [the architecture notes](docs/architecture.md) for the SDK follow-up.
+The **Smooth** value only affects changes made in the UI editor. 
+DAW automation normally bypasses smoothing. 
 
 ## Audio inputs and outputs
 
@@ -104,34 +77,16 @@ as individual `f32` ports or `f32[N]` arrays, where `N` is the channel count.
 ## Control inputs
 
 The default build provides 16 optional mono control inputs. In the stereo
-layout, declare the two main input channels first; subsequent inputs map to
+layout, declare the two main input channels first; subsequent `ins` map to
 `Control 1`, `Control 2`, and so on. See
 [external_control.onda](examples/effects/external_control.onda) for an example.
 
-Each control appears as a named, automatable DAW parameter. Its bus starts
-disabled, and parameter automation supplies its value at every sample. To use
-an external signal, enable and route the corresponding bus through your DAW's
-sidechain or auxiliary inputs. The routed signal takes precedence; disabling
-the bus returns to the latest parameter value, including automation received
-while the bus was enabled. Control input automation and routed signals bypass
-the **Smooth** setting.
-
-The editor's **Input Controls** section shows the controls declared by the
-loaded program. It has independent **Sliders/Knobs**, **Smooth**, and **Reset**
-controls. Its Smooth setting defaults to 30 ms and smooths manual edits in plain
-units at every sample; set it to 0 to disable it. Reset restores input defaults
-without resetting Params. With an external bus enabled, its editors are disabled
-and show **External input**. Layout and smoothing settings are saved in the DAW
-project.
+Each control appears as a named, automatable DAW parameter. Unlike `params`, control input automation is sample-accurate. 
+To supply an external signal, enable and route the corresponding bus through your DAW’s sidechain or auxiliary inputs. 
+The routed signal takes precedence over the parameter value.
 
 Controls start at their declared input default, or zero. Declare an input range
 to set the values covered by automation, which maps linearly to that range.
-Routed signals are passed directly to Onda. Use scalar control inputs when you
-need defaults; control arrays must omit defaults.
-
-For different scaling or quantization, apply the conversion explicitly in the
-`sample` block. Additional input-control metadata is
-[deferred](docs/architecture.md#deferred-input-control-metadata).
 
 ## Audio buffers
 
