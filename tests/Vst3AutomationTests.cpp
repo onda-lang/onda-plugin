@@ -40,7 +40,7 @@ tresult processRealtime(Vst::IAudioProcessor &processor,
     const auto counts = end();
     // JUCE retains one callback mutex. Managed automation must add no locks,
     // allocations or frees, including queue flushes and MIDI segment splits.
-    if (counts.locks > 1U || counts.allocations != 0U || counts.frees != 0U) {
+    if (counts.hasViolations(1)) {
       std::cerr << "VST3 realtime audit: " << counts.locks << " locks, "
                 << counts.allocations << " allocations, " << counts.frees
                 << " frees\n";

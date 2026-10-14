@@ -625,6 +625,8 @@ if(BUILD_TESTING AND ONDA_PLUGIN_BUILD_TESTS)
 
     add_executable(onda_processor_tests
         tests/ProcessorTests.cpp
+        tests/RealtimeAudit.cpp
+        tests/RealtimeAuditTests.cpp
         tests/BypassTests.cpp
         tests/BlockProcessingTests.cpp
         tests/AutomationSeedingTests.cpp
@@ -649,6 +651,10 @@ if(BUILD_TESTING AND ONDA_PLUGIN_BUILD_TESTS)
         src/SpscQueue.h
     )
     target_compile_features(onda_processor_tests PRIVATE cxx_std_20)
+    if(NOT MSVC)
+        set_source_files_properties(tests/RealtimeAuditTests.cpp PROPERTIES
+            COMPILE_OPTIONS "-fno-builtin;$<$<CXX_COMPILER_ID:Clang,AppleClang>:-fsized-deallocation>")
+    endif()
     target_link_libraries(onda_processor_tests PRIVATE
         onda_plugin_engine
         onda_run_resources
@@ -675,7 +681,10 @@ if(BUILD_TESTING AND ONDA_PLUGIN_BUILD_TESTS)
             juce::pkgconfig_JUCE_BROWSER_LINUX_DEPS)
         target_link_options(onda_processor_tests PRIVATE
             "-Wl,--wrap=pthread_mutex_lock"
-            "-Wl,--wrap=malloc,--wrap=calloc,--wrap=realloc,--wrap=free")
+            "-Wl,--wrap=malloc,--wrap=calloc,--wrap=realloc,--wrap=free"
+            "-Wl,--wrap=aligned_alloc,--wrap=posix_memalign,--wrap=memalign,--wrap=valloc,--wrap=pvalloc"
+            "-Wl,--wrap=reallocarray,--wrap=strdup,--wrap=strndup"
+            "-Wl,--wrap=free_sized,--wrap=free_aligned_sized")
         juce_link_with_embedded_linux_subprocess(onda_processor_tests)
     endif()
     if(MSVC)
@@ -694,6 +703,8 @@ if(BUILD_TESTING AND ONDA_PLUGIN_BUILD_TESTS)
             ONDA_PLUGIN_OUTPUT_CHANNELS EQUAL 2)
         add_test(NAME onda_processor_tests COMMAND onda_processor_tests)
     else()
+        add_test(NAME onda_realtime_audit_instrumentation_tests
+            COMMAND onda_processor_tests RealtimeAuditInstrumentation)
         add_test(NAME onda_bypass_transition_tests COMMAND onda_processor_tests BypassTransitions)
         add_test(NAME onda_callback_processing_tests COMMAND onda_processor_tests CallbackProcessing)
         add_test(NAME onda_callback_smoothing_tests COMMAND onda_processor_tests CallbackSmoothing)
@@ -753,19 +764,44 @@ if(BUILD_TESTING AND ONDA_PLUGIN_BUILD_TESTS)
         OndaSynth_VST3
         OndaFX_VST3
     )
-    add_test(
-        NAME onda_vst3_smoke
-        COMMAND onda_vst3_smoke
-            "$<TARGET_FILE:OndaSynth_VST3>"
-            "$<TARGET_FILE:OndaFX_VST3>"
+    set(onda_vst3_smoke_command
+        onda_vst3_smoke
+        "$<TARGET_FILE:OndaSynth_VST3>"
+        "$<TARGET_FILE:OndaFX_VST3>"
     )
+    add_test(NAME onda_vst3_smoke COMMAND ${onda_vst3_smoke_command})
+    set_tests_properties(onda_vst3_smoke PROPERTIES ENVIRONMENT_MODIFICATION
+        "LD_PRELOAD=unset:;ONDA_REQUIRE_VST3_AUDIT=unset:")
 
     if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
         add_library(onda_vst3_realtime_audit SHARED tests/Vst3RealtimeAudit.cpp)
         target_compile_features(onda_vst3_realtime_audit PRIVATE cxx_std_20)
+        # This library is preloaded. Access its TLS without re-entering the
+        # loader, which can call our allocation interceptors while updating TLS.
+        target_compile_options(onda_vst3_realtime_audit PRIVATE
+            -ftls-model=initial-exec -Wall -Wextra -Wpedantic -Wconversion -Wsign-conversion)
         target_link_libraries(onda_vst3_realtime_audit PRIVATE ${CMAKE_DL_LIBS})
-        add_dependencies(onda_vst3_smoke onda_vst3_realtime_audit)
-        set_tests_properties(onda_vst3_smoke PROPERTIES ENVIRONMENT
+        add_executable(onda_vst3_realtime_audit_tests tests/Vst3RealtimeAuditTests.cpp)
+        target_compile_features(onda_vst3_realtime_audit_tests PRIVATE cxx_std_20)
+        # These tests deliberately observe allocator calls, including pairs
+        # that the compiler could otherwise eliminate as unused allocations.
+        target_compile_options(onda_vst3_realtime_audit_tests PRIVATE
+            -fno-builtin $<$<CXX_COMPILER_ID:Clang,AppleClang>:-fsized-deallocation>
+            -Wall -Wextra -Wpedantic -Wconversion -Wsign-conversion)
+        target_link_libraries(onda_vst3_realtime_audit_tests PRIVATE
+            onda_vst3_realtime_audit Threads::Threads ${CMAKE_DL_LIBS})
+        add_dependencies(onda_vst3_realtime_audit_tests OndaSynth_VST3)
+        add_dependencies(onda_vst3_smoke onda_vst3_realtime_audit_tests)
+        add_test(NAME onda_vst3_realtime_audit_tests
+            COMMAND onda_vst3_realtime_audit_tests "$<TARGET_FILE:OndaSynth_VST3>")
+        add_test(NAME onda_vst3_realtime COMMAND ${onda_vst3_smoke_command})
+        # Validate the measuring tool first. A broken auditor must fail its own
+        # test and prevent a misleading verdict about plugin callbacks.
+        set_tests_properties(onda_vst3_realtime_audit_tests PROPERTIES
+            FIXTURES_SETUP onda_vst3_auditor)
+        set_tests_properties(onda_vst3_realtime PROPERTIES
+            FIXTURES_REQUIRED onda_vst3_auditor)
+        set_tests_properties(onda_vst3_realtime onda_vst3_realtime_audit_tests PROPERTIES ENVIRONMENT
             "LD_PRELOAD=$<TARGET_FILE:onda_vst3_realtime_audit>;ONDA_REQUIRE_VST3_AUDIT=1")
     endif()
 

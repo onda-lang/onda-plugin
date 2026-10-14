@@ -1,17 +1,10 @@
 #pragma once
+#include "AuditCounters.h"
 #include "Processor.h"
-#include <atomic>
-#include <cstdint>
 
-namespace allocation_audit {
-extern thread_local bool enabled;
-extern std::atomic<std::uint64_t> count;
-} // namespace allocation_audit
-namespace lock_audit {
-extern thread_local bool enabled;
-extern std::atomic<std::uint64_t> count;
-} // namespace lock_audit
 namespace test {
+bool exerciseRealtimeAuditInstrumentation();
+
 template <typename Callback> bool auditRealtime(Callback callback) {
   allocation_audit::count.store(0, std::memory_order_relaxed);
   lock_audit::count.store(0, std::memory_order_relaxed);

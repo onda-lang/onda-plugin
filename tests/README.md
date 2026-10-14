@@ -31,6 +31,8 @@ Use `build/Release/onda_processor_tests.exe` for a Windows multi-config build.
 | `onda_plugin_tests` | SDK ownership, DSP and MIDI behavior, buffer decoding, portable checkpoints, project export, worker replacement, file watching, and compiler serialization. |
 | `onda_processor_tests` | Host preparation, state persistence, defaults and automation, block-rate parameter smoothing, notifications, failure recovery, realtime callbacks, logs, scope/event adapters, editor lifecycle, and concurrent instances. |
 | `onda_vst3_smoke` | Built bundles expose the expected metadata and parameters, instantiate independently, and render through JUCE's VST3 host. Bundle lookup also exercises the Windows layout on other platforms. |
+| `onda_vst3_realtime_audit_tests` | Linux auditor startup, plugin loading, positive allocation/free/mutex detection, allocator semantics, callback budgets, and independent concurrent audit intervals. |
+| `onda_vst3_realtime` | The exported VST3 behavior checks with Linux allocation and mutex interception enabled, after the auditor's own tests pass. |
 | `onda_editor_bridge_tests` | The injected bridge ends cancelled parameter gestures without writing stale values, retains gestures across automation updates, and stamps events with the exact rendered generation. Registered when Node.js is available. |
 | `onda_run_view_parameter_tests` | The actual run view and injected bridge preserve out-of-range and full-width integer defaults across publications and unedited focus/blur, retain focused drafts, and clamp actual edits. Registered when Node.js and Firefox are available. |
 | VST3 validators | Steinberg's interface/protocol checks for both products. These complement the behavior checked by the smoke host. |
@@ -101,10 +103,30 @@ host sends real queues to both products, checking curve values at the chosen
 block rate without extra `block` executions. It also covers implicit
 prior-callback endpoints, logarithmic `f64` values, discrete controls, constant
 callbacks, and MIDI offsets within the block.
-On Linux, CTest preloads a glibc allocation/mutex auditor around the exported
-VST3 callbacks. Managed automation must add no allocations, frees, or locks
-beyond JUCE's existing callback mutex. This checks the actual wrapper path,
-complementing the processor's allocation and lock audit.
+`onda_vst3_smoke` clears the audit preload and runs the functional checks by
+themselves. On Linux, `onda_vst3_realtime` repeats those checks with a glibc
+allocation/mutex auditor preloaded. Its measured VST3 callbacks must make no
+allocator calls or non-null frees, and at most one `pthread_mutex_lock` call
+for JUCE's existing callback mutex. This checks the exported wrapper path,
+complementing the processor's audit.
+
+CTest first runs `onda_vst3_realtime_audit_tests` as a required fixture. It
+deliberately allocates and frees in separate intervals through every intercepted
+heap entry point and all replaceable C++ allocation/deallocation forms. The
+checks include aligned and page-aligned allocation, libc allocation helpers,
+failed requests, alignment validation, `calloc` clearing, `realloc` preservation,
+free's preservation of `errno`, disabled/reset intervals, and concurrent threads.
+It also takes a mutex before shared-library constructors and loads an actual
+plugin to exercise loader TLS updates. A failing auditor test prevents an
+instrumented plugin verdict; the ordinary smoke test remains independent.
+
+The processor's `RealtimeAuditInstrumentation` case uses the same allocation
+fixtures to verify its linker wrappers and C++ hooks before testing callbacks.
+Allocator counters record entry-point calls, including failed attempts; they
+are not outstanding-allocation counts. These audits cover the documented heap
+and mutex interfaces on the measured threads. They do not measure custom memory
+mapping, other synchronization interfaces, I/O, or execution deadlines.
+The preloaded auditor follows [glibc's allocator interposition requirements](https://sourceware.org/glibc/manual/latest/html_node/Replacing-malloc.html), including its initial-exec TLS requirement.
 
 ## Scheduling
 
@@ -189,7 +211,7 @@ the `ControlInputs` processor case alongside the VST3 smoke test and validators.
 - Floating-point checks reject NaN and infinity. Audio-file expectations account
   for the fixture's FLAC quantization rather than requiring bit-identical floats.
 - Aligned-allocation tests cover small and over-aligned requests and zero sizes.
-  C++ allocation auditing runs on all platforms; C allocation/free and mutex-lock
+  C++ allocation/deallocation auditing runs on all platforms; C allocation/free and mutex-lock
   interception use Linux linker wrapping. Passing on macOS or Windows does not
   establish the same interception coverage.
 - Editor lifecycle tests do not establish that every native browser renders the UI.

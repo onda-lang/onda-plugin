@@ -77,14 +77,23 @@ string(REPLACE "${onda_vst3_controller_edit_anchor}"
     "            if (! onda::plugin::vst3IsHostParameterNotification (audioProcessor->getParamForVSTParamID (vstParamId)))\n                performEdit (vstParamId, newValue);"
     onda_vst3_source "${onda_vst3_source}")
 string(PREPEND onda_vst3_source "#include \"Vst3Automation.h\"\n")
-set(onda_vst3_generated "${CMAKE_CURRENT_BINARY_DIR}/generated/juce_audio_plugin_client_VST3.cpp")
+# JUCE uses an Objective-C++ compilation unit on macOS that includes the C++
+# wrapper. Preserve its language when replacing it with the patched source.
+set(onda_vst3_extension cpp)
+if(APPLE)
+    set(onda_vst3_extension mm)
+endif()
+set(onda_vst3_compilation_unit
+    "${ONDA_JUCE_SOURCE_DIR}/modules/juce_audio_plugin_client/juce_audio_plugin_client_VST3.${onda_vst3_extension}")
+set(onda_vst3_generated
+    "${CMAKE_CURRENT_BINARY_DIR}/generated/juce_audio_plugin_client_VST3.${onda_vst3_extension}")
 file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/generated")
 file(CONFIGURE OUTPUT "${onda_vst3_generated}" CONTENT "${onda_vst3_source}" @ONLY)
 get_target_property(onda_vst3_sources juce_audio_plugin_client_VST3 INTERFACE_SOURCES)
-list(FIND onda_vst3_sources "${onda_vst3_original}" onda_vst3_index)
+list(FIND onda_vst3_sources "${onda_vst3_compilation_unit}" onda_vst3_index)
 if(onda_vst3_index LESS 0)
     message(FATAL_ERROR "Could not find JUCE's VST3 wrapper compilation unit")
 endif()
-list(REMOVE_ITEM onda_vst3_sources "${onda_vst3_original}")
+list(REMOVE_ITEM onda_vst3_sources "${onda_vst3_compilation_unit}")
 list(APPEND onda_vst3_sources "${onda_vst3_generated}")
 set_property(TARGET juce_audio_plugin_client_VST3 PROPERTY INTERFACE_SOURCES "${onda_vst3_sources}")
