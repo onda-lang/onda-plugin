@@ -58,7 +58,6 @@ jobs:
 
     env:
       BUILD_PATH: ${{ github.workspace }}/build
-      ONDA_EDITOR_DIAGNOSTICS: ${{ inputs.tests == 'native' && '1' || '0' }}
 
     steps:
       - name: Select tests

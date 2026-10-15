@@ -1,0 +1,39 @@
+--- a/run.html
++++ b/run.html
+@@ -2231,6 +2231,9 @@
+       new ResizeObserver(updateHeaderLayout).observe(heroIdentityNode);
+       const settingsButton = document.getElementById("settings-toggle");
+       const settingsPopover = document.getElementById("settings-popover");
++      const deviceSettingsOpen = () =>
++        CSS.supports("selector(:popover-open)")
++          && settingsPopover.matches(":popover-open");
+       const positionDeviceSettings = () => {
+         const anchor = settingsButton.getBoundingClientRect();
+         const bounds = settingsPopover.getBoundingClientRect();
+@@ -2240,7 +2243,7 @@
+           window.innerHeight - bounds.height - 12)) + "px";
+       };
+       const closeDeviceSettings = () => {
+-        if (settingsPopover.matches(":popover-open")) settingsPopover.hidePopover();
++        if (deviceSettingsOpen()) settingsPopover.hidePopover();
+       };
+       settingsPopover.addEventListener("toggle", event => {
+         const open = event.newState === "open";
+@@ -2252,7 +2255,7 @@
+         }
+       });
+       window.addEventListener("resize", () => {
+-        if (settingsPopover.matches(":popover-open")) positionDeviceSettings();
++        if (deviceSettingsOpen()) positionDeviceSettings();
+       });
+       scrollNode.addEventListener("scroll", closeDeviceSettings);
+       const pathNode = document.getElementById("path");
+@@ -4511,7 +4514,7 @@
+         );
+         const showMidiKeyboard = state.midi?.noteOn === true;
+         midiKeyboardNode.hidden = !showMidiKeyboard;
+-        if (settingsPopover.matches(":popover-open")) positionDeviceSettings();
++        if (deviceSettingsOpen()) positionDeviceSettings();
+         const monitorOnly = state.midiKeyboardInteractive === false;
+         midiKeyboardNode.classList.toggle("monitor-only", monitorOnly);
+         setSectionOpen("midi", sectionState.midi);

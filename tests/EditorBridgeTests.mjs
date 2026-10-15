@@ -196,23 +196,3 @@ for (const value of ["9007199254740993", "-9007199254740993",
   state([{ ...first, type: "i64", value, default: value, step: 1, stepCount: 1 }]);
   assert.equal(renderedState.params[0].value, value, "Exact i64 defaults survive bridge conversion");
 }
-
-const diagnosticScript = source.match(/constexpr auto juceEditorDiagnosticScript = R"JS\(([\s\S]*?)\)JS";/)?.[1];
-assert.ok(diagnosticScript, "Could not locate the opt-in startup diagnostics");
-const diagnosticEvents = new Map();
-const diagnostics = [];
-runInNewContext(diagnosticScript, { window: {
-  addEventListener: (name, callback) => diagnosticEvents.set(name, callback),
-  __JUCE__: { backend: { emitEvent(name, message) {
-    assert.equal(name, "ondaCommand");
-    assert.equal(message.type, "editorDiagnostic");
-    diagnostics.push(message.message);
-  } } },
-} });
-diagnosticEvents.get("error")({ error: { stack: "startup exception" } });
-diagnosticEvents.get("error")({ target: { src: "juce://juce.backend/number-input.js" } });
-diagnosticEvents.get("unhandledrejection")({ reason: { stack: "startup rejection" } });
-assert.deepEqual(diagnostics, [
-  "JavaScript initialization script started", "startup exception",
-  "Resource failed: juce://juce.backend/number-input.js", "startup rejection",
-]);

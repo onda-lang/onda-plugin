@@ -173,6 +173,47 @@ try {
     activeNotes: document.querySelectorAll(".piano-key.active").length,
   })), { scroll: 50, logLines: 0, activeNotes: 0 });
   assert.deepEqual(errors, [], "The shipped view raised a browser error");
+  await page.close();
+  page = await browser.newPage();
+  page.setDefaultTimeout(5000);
+  page.on("pageerror", error => errors.push(String(error)));
+  await page.addInitScript(() => {
+    // REAPER's macOS webview rejects this selector even though standalone
+    // WebKit supports popovers. Replay that feature boundary at the DOM seam.
+    const supports = CSS.supports.bind(CSS);
+    CSS.supports = (...args) => args[0] === "selector(:popover-open)"
+      ? false : supports(...args);
+    const matches = Element.prototype.matches;
+    Element.prototype.matches = function (selector) {
+      if (selector === ":popover-open")
+        throw new DOMException("Unsupported :popover-open selector", "SyntaxError");
+      return matches.call(this, selector);
+    };
+    HTMLElement.prototype.showPopover = undefined;
+    HTMLElement.prototype.hidePopover = undefined;
+  });
+  await page.goto(`http://127.0.0.1:${server.address().port}/`);
+  await page.evaluate(() => window.__receiveParameters({ type: "state", state: {
+    supportsSourceSelection: true, supportsViewState: true,
+    status: "No Onda file loaded", viewState: { reset: true, readyId: 1 },
+  } }));
+  await page.waitForFunction(() => window.__parameterCommands.some(command =>
+    command.type === "runViewReady" && command.readyId === 1));
+  assert.equal(await page.locator("#choose-onda-file").isVisible(), true,
+    "The fresh editor must become visible without popover support");
+  await page.setViewportSize({ width: 720, height: 800 });
+  await page.evaluate(() => {
+    document.querySelector(".shell").dispatchEvent(new Event("scroll"));
+    window.__receiveParameters({ type: "state", state: {
+      path: "defaults.onda", params: [{ name: "gain", label: "Gain", type: "f32", scalar: true,
+        hostValueDomain: "normalized", normalizedValue: 0.5, value: 0.5, default: 0.5,
+        rangeMin: 0, rangeMax: 1, scale: "linear", curve: null, unit: "",
+        step: null, stepCount: null }],
+    } });
+  });
+  assert.equal(await page.locator("#params .param-number").isVisible(), true,
+    "Loaded controls must render without popover support");
+  assert.deepEqual(errors, [], "Unsupported popovers must not interrupt the editor");
   console.log("Run view defaults, editing, log, MIDI monitor and scroll restoration passed");
 } catch (error) {
   try {

@@ -8,7 +8,6 @@
 #include <algorithm>
 #include <charconv>
 #include <cmath>
-#include <iostream>
 #include <optional>
 #include <string_view>
 #include <system_error>
@@ -22,32 +21,6 @@ namespace {
 
 const auto editorBackground = juce::Colour::fromRGB(13, 25, 41);
 const auto editorMutedText = juce::Colour::fromRGB(146, 168, 191);
-
-bool editorDiagnosticsEnabled() {
-  static const auto enabled = juce::SystemStats::getEnvironmentVariable(
-                                  "ONDA_EDITOR_DIAGNOSTICS", {}) == "1";
-  return enabled;
-}
-
-void traceEditorStartup(const juce::String &message) {
-  if (editorDiagnosticsEnabled())
-    std::cerr << ("[DEBUG-onda-editor] " + message + "\n").toStdString();
-}
-
-constexpr auto juceEditorDiagnosticScript = R"JS(
-(() => {
-  const report = message => window.__JUCE__.backend.emitEvent("ondaCommand", {
-    type: "editorDiagnostic", message: String(message),
-  });
-  window.addEventListener("error", event => {
-    report(event.error?.stack || event.message || `Resource failed: ${event.target?.src}`);
-  }, true);
-  window.addEventListener("unhandledrejection", event => {
-    report(event.reason?.stack || event.reason);
-  });
-  report("JavaScript initialization script started");
-})();
-)JS";
 
 constexpr auto juceHostBridgeScript = R"JS(
 (() => {
@@ -321,8 +294,6 @@ bool hasBuffer(const WorkerStatus &status, const std::string_view name) {
 
 juce::WebBrowserComponent::Options browserOptions() {
   juce::WebBrowserComponent::Options options;
-  if (editorDiagnosticsEnabled())
-    options = options.withUserScript(juceEditorDiagnosticScript);
   options = options.withUserScript(juceHostBridgeScript);
 #if JUCE_WINDOWS
   const auto dataFolder =
@@ -351,7 +322,6 @@ public:
                                      owner.handleCommand(command);
                                    })
                 .withResourceProvider([](const juce::String &path) {
-                  traceEditorStartup("Resource requested: " + path);
                   return runViewResource(path);
                 })),
         owner_(owner) {}
@@ -372,68 +342,25 @@ public:
   }
 
   bool pageAboutToLoad(const juce::String &url) override {
-    traceEditorStartup("Navigation: " + url);
     return url.startsWith(getResourceProviderRoot());
-  }
-
-  void pageFinishedLoading(const juce::String &url) override {
-    traceEditorStartup("Page loaded: " + url);
   }
 
   void newWindowAttemptingToLoad(const juce::String &) override {}
 
   bool pageLoadHadNetworkError(const juce::String &error) override {
-    traceEditorStartup("Navigation failed: " + error);
     owner_.loadingOverlay_.setText("Could not load the Onda editor: " + error,
                                    juce::dontSendNotification);
     owner_.loadingOverlay_.setVisible(true);
     return false;
   }
 
-  void checkStartupDiagnostics() {
-    if (!editorDiagnosticsEnabled() || diagnosticSnapshotTaken_ ||
-        juce::Time::getMillisecondCounterHiRes() - createdAt_ < 5000.0)
-      return;
-    diagnosticSnapshotTaken_ = true;
-    traceEditorStartup("Editor showing=" + juce::String(owner_.isShowing() ? "true" : "false") +
-                       " browserReady=" + juce::String(owner_.browserReady_ ? "true" : "false") +
-                       " overlay=" + juce::String(owner_.loadingOverlay_.isVisible() ? "true" : "false") +
-                       " readyId=" + juce::String(owner_.publishedReadyId_) +
-                       " browser bounds=" + getBounds().toString());
-    evaluateJavascript(R"JS(
-      JSON.stringify({
-        url: location.href, documentReady: document.readyState,
-        visibility: document.visibilityState,
-        hostHandler: typeof window._onHostMessage,
-        numberInput: typeof window.__ONDA_NUMBER_INPUT__,
-        paramControl: typeof window.__ONDA_PARAM_CONTROL_V2__,
-        pending: document.documentElement.hasAttribute("data-run-view-pending"),
-        shell: document.querySelector(".shell")?.getBoundingClientRect().toJSON(),
-        shellVisibility: document.querySelector(".shell")
-          ? getComputedStyle(document.querySelector(".shell")).visibility : null,
-        hostState: typeof state === "object" ? {
-          supportsSourceSelection: state.supportsSourceSelection,
-          supportsViewState: state.supportsViewState, status: state.status,
-        } : null,
-      })
-    )JS", [](auto evaluation) {
-      if (const auto *value = evaluation.getResult())
-        traceEditorStartup("DOM snapshot: " + value->toString());
-      if (const auto *error = evaluation.getError())
-        traceEditorStartup("DOM evaluation failed: " + error->message);
-    });
-  }
-
 private:
   Editor &owner_;
-  const double createdAt_{juce::Time::getMillisecondCounterHiRes()};
-  bool diagnosticSnapshotTaken_{};
 };
 
 Editor::Editor(Processor &owner)
     : AudioProcessorEditor(owner), processor_(owner),
       browser_(std::make_unique<Browser>(*this)) {
-  traceEditorStartup("Editor constructed: " + processor_.getName());
   const auto [width, height] = processor_.editorSize();
   setOpaque(true);
   addAndMakeVisible(*browser_);
@@ -484,7 +411,6 @@ void Editor::resized() {
 }
 
 void Editor::timerCallback() {
-  browser_->checkStartupDiagnostics();
   const auto showing = browserReady_ && isShowing() && browser_->isVisible();
   if (scopeCaptureActive_ != showing) {
     scopeCaptureActive_ = showing;
@@ -593,8 +519,6 @@ void Editor::publishState(const bool force) {
       viewState.getDynamicObject()->setProperty("reset", true);
     }
     viewState.getDynamicObject()->setProperty("readyId", ++publishedReadyId_);
-    traceEditorStartup("Publishing initial state, readyId=" +
-                       juce::String(publishedReadyId_));
     state.getDynamicObject()->setProperty("viewState", std::move(viewState));
   }
   browser_->emitEventIfBrowserIsVisible("ondaState", message);
@@ -621,7 +545,6 @@ void Editor::handleCommand(const juce::var &command) {
   const auto type = input->getProperty("type").toString();
 
   if (type == "webviewReady") {
-    traceEditorStartup("Received webviewReady");
     for (std::size_t index = 0; index < activeGestures_.size(); ++index)
       endParameterGesture(index);
     browserReady_ = true;
@@ -633,13 +556,9 @@ void Editor::handleCommand(const juce::var &command) {
     publishScope(true);
   } else if (type == "runViewReady") {
     const auto readyId = input->getProperty("readyId");
-    traceEditorStartup("Received runViewReady=" + readyId.toString() +
-                       " expected=" + juce::String(publishedReadyId_));
     if (browserReady_ && (readyId.isInt() || readyId.isInt64()) &&
         static_cast<juce::int64>(readyId) == publishedReadyId_)
       loadingOverlay_.setVisible(false);
-  } else if (type == "editorDiagnostic") {
-    traceEditorStartup("JavaScript: " + input->getProperty("message").toString());
   } else if (type == "viewState") {
     processor_.setViewState(input->getProperty("state"));
   } else if (type == "midiNote") {
