@@ -151,6 +151,16 @@ sample { if enabled { out1 = 1.0 } else { out1 = 0.0 } }
       }
       if (!evaluate(*browser, R"(
         (() => {
+          if (document.querySelector('#settings-popover').getClientRects().length)
+            throw new Error('Unavailable device panel is visible');
+          for (const button of document.querySelectorAll('#params-section [data-param-layout]')) {
+            const box = button.getBoundingClientRect();
+            const range = document.createRange();
+            range.selectNodeContents(button);
+            const text = range.getBoundingClientRect();
+            if (Math.abs(text.left + text.right - box.left - box.right) > 1)
+              throw new Error(button.textContent + ' layout label is not centered');
+          }
           const input = document.querySelector('#params input[type=checkbox]');
           if (!input || input.disabled) throw new Error('Missing editable checkbox');
           if (getComputedStyle(input).visibility !== 'visible'

@@ -123,7 +123,7 @@ artifacts.
 | `onda_vst3_realtime_audit_tests` | Linux auditor startup, plugin loading, positive allocation/free/mutex detection, allocator semantics, callback budgets, and independent concurrent audit intervals. |
 | `onda_vst3_realtime` | The exported VST3 behavior checks with Linux allocation and mutex interception enabled, after the auditor's own tests pass. |
 | `onda_editor_bridge_tests` | The injected bridge ends cancelled parameter gestures without writing stale values, retains gestures across automation updates, and stamps events with the exact rendered generation. Enabled with browser tests. |
-| `onda_run_view_parameter_tests` | The shipped view and bridge preserve exact defaults across publications and focus/blur, retain focused drafts, clamp edits, render/clear logs, display monitored MIDI notes, and save/restore scroll position. Startup, loaded controls, resizing and scrolling also work when the webview rejects popover selectors. Enabled with browser tests. |
+| `onda_run_view_parameter_tests` | The shipped view and bridge preserve exact defaults across publications and focus/blur, retain focused drafts, clamp edits, render/clear logs, display monitored MIDI notes, and save/restore scroll position. Layout labels stay centered at narrow and wide editor sizes. Startup, loaded controls, resizing and scrolling also work when the webview rejects popover selectors and does not hide popovers automatically. Enabled with browser tests. |
 | VST3 validators | Steinberg's interface/protocol checks for both products. These complement the behavior checked by the smoke host. |
 
 Run bridge tests directly with `node tests/EditorBridgeTests.mjs`. The

@@ -28,7 +28,15 @@
        });
        scrollNode.addEventListener("scroll", closeDeviceSettings);
        const pathNode = document.getElementById("path");
-@@ -4511,7 +4514,7 @@
+@@ -4487,6 +4490,7 @@
+         outputDeviceNode.closest(".param-setting").hidden = !supportsDeviceSelection;
+         midiInputSettingNode.hidden = !supportsMidiInput;
+         settingsButton.hidden = !supportsDeviceSelection && !supportsMidiInput;
++        settingsPopover.hidden = settingsButton.hidden;
+         utilityActionsNode.hidden = settingsButton.hidden && saveProjectButton.hidden && unloadButton.hidden;
+         if (runHeaderNode.hidden || settingsButton.hidden) closeDeviceSettings();
+         heroControlsNode.classList.toggle("has-transport", supportsTransport);
+@@ -4511,7 +4515,7 @@
          );
          const showMidiKeyboard = state.midi?.noteOn === true;
          midiKeyboardNode.hidden = !showMidiKeyboard;

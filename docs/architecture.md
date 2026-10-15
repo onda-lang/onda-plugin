@@ -158,8 +158,10 @@ without applying the editor's range or step grid. Exact `i64` defaults cross
 the bridge as decimal text, preserving all 64 bits through display and focus.
 User edits still apply the control domain before normalized host conversion.
 Device-popover queries check selector support because REAPER's embedded WebKit
-can disable popovers. An unavailable device panel must not interrupt rendering
-or prevent the editor from acknowledging startup and becoming visible.
+can disable popovers. Unavailable device panels are hidden in their entirety,
+so an inert popover cannot appear as an empty floating panel. Layout toggle
+buttons center their labels explicitly, including when text exceeds the padded
+content width.
 Worker failures are reported explicitly, independently of their status text.
 Waiting and retrying states leave the view's error empty, so restoration retains
 saved event arguments until their compiled schema arrives.

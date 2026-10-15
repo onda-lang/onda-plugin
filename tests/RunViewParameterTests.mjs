@@ -173,6 +173,20 @@ try {
     activeNotes: document.querySelectorAll(".piano-key.active").length,
   })), { scroll: 50, logLines: 0, activeNotes: 0 });
   assert.deepEqual(errors, [], "The shipped view raised a browser error");
+  for (const width of [360, 480, 720]) {
+    await page.setViewportSize({ width, height: 480 });
+    const labels = await page.locator("[data-param-layout]").evaluateAll(buttons =>
+      buttons.map(button => {
+        const box = button.getBoundingClientRect();
+        const range = document.createRange();
+        range.selectNodeContents(button);
+        const text = range.getBoundingClientRect();
+        return { label: button.textContent,
+          offset: (text.left + text.right - box.left - box.right) / 2 };
+      }));
+    for (const { label, offset } of labels)
+      assert.ok(Math.abs(offset) <= 0.5, `${label} text is off-center by ${offset}px`);
+  }
   await page.close();
   page = await browser.newPage();
   page.setDefaultTimeout(5000);
@@ -191,6 +205,10 @@ try {
     };
     HTMLElement.prototype.showPopover = undefined;
     HTMLElement.prototype.hidePopover = undefined;
+    document.addEventListener("DOMContentLoaded", () => {
+      // Without popover support the attribute does not hide the element.
+      document.querySelectorAll("[popover]").forEach(node => node.removeAttribute("popover"));
+    });
   });
   await page.goto(`http://127.0.0.1:${server.address().port}/`);
   await page.evaluate(() => window.__receiveParameters({ type: "state", state: {
@@ -201,6 +219,8 @@ try {
     command.type === "runViewReady" && command.readyId === 1));
   assert.equal(await page.locator("#choose-onda-file").isVisible(), true,
     "The fresh editor must become visible without popover support");
+  assert.equal(await page.locator("#settings-popover").isVisible(), false,
+    "The unavailable device panel must not leave an empty floating capsule");
   await page.setViewportSize({ width: 720, height: 800 });
   await page.evaluate(() => {
     document.querySelector(".shell").dispatchEvent(new Event("scroll"));
@@ -213,6 +233,8 @@ try {
   });
   assert.equal(await page.locator("#params .param-number").isVisible(), true,
     "Loaded controls must render without popover support");
+  assert.equal(await page.locator("#settings-popover").isVisible(), false,
+    "Loaded editors must not show an empty floating device panel");
   assert.deepEqual(errors, [], "Unsupported popovers must not interrupt the editor");
   console.log("Run view defaults, editing, log, MIDI monitor and scroll restoration passed");
 } catch (error) {

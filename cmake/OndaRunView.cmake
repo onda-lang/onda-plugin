@@ -4,7 +4,8 @@ find_package(Git REQUIRED)
 set(onda_run_view_source "${ONDA_RELEASE_SOURCE_DIR}/ui/run/run.html")
 set(onda_run_view_patches
     "${CMAKE_CURRENT_SOURCE_DIR}/patches/onda-run-view-parameter-values.patch"
-    "${CMAKE_CURRENT_SOURCE_DIR}/patches/onda-run-view-device-popover.patch")
+    "${CMAKE_CURRENT_SOURCE_DIR}/patches/onda-run-view-device-popover.patch"
+    "${CMAKE_CURRENT_SOURCE_DIR}/patches/onda-run-view-layout.patch")
 set(onda_run_view_directory "${CMAKE_CURRENT_BINARY_DIR}/generated/onda-run-view")
 set(onda_run_view_html "${onda_run_view_directory}/run.html")
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS

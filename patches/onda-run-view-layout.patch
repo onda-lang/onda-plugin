@@ -1,0 +1,12 @@
+--- a/run.html
++++ b/run.html
+@@ -659,6 +659,9 @@
+       }
+ 
+       .param-layout-toggle button {
++        display: flex;
++        align-items: center;
++        justify-content: center;
+         min-width: 0;
+         flex: 1;
+         min-height: 0;
