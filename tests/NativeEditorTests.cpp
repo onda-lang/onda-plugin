@@ -67,6 +67,23 @@ bool evaluate(juce::WebBrowserComponent &browser, const juce::String &script,
   return true;
 }
 
+juce::WebBrowserComponent *readyBrowser(juce::AudioProcessorEditor &editor) {
+  const auto *overlay = dynamic_cast<juce::Label *>(
+      editor.findChildWithID("onda-loading-overlay"));
+  if (!overlay ||
+      !test::waitForMessage([&] { return !overlay->isVisible(); },
+                            std::chrono::seconds(30))) {
+    std::cerr << "Native editor did not acknowledge its initial state: "
+              << (overlay ? overlay->getText() : "missing loading overlay")
+              << '\n';
+    return nullptr;
+  }
+  for (auto *child : editor.getChildren())
+    if (auto *browser = dynamic_cast<juce::WebBrowserComponent *>(child))
+      return browser;
+  return nullptr;
+}
+
 } // namespace
 
 bool exerciseNativeEditor() {
@@ -85,6 +102,22 @@ sample { if enabled { out1 = 1.0 } else { out1 = 0.0 } }
   for (const auto product : {Product::effect, Product::instrument}) {
     Processor processor(product);
     processor.setNonRealtime(true);
+    {
+      EditorWindow host(processor);
+      auto *browser = readyBrowser(host.editor());
+      if (!browser || !evaluate(*browser, R"(
+        (() => {
+          const picker = document.querySelector('#file-picker');
+          const button = document.querySelector('#choose-onda-file');
+          return !document.documentElement.hasAttribute('data-run-view-pending')
+            && picker !== null && !picker.hidden
+            && getComputedStyle(picker).visibility === 'visible'
+            && button !== null && !button.disabled
+            && button.getBoundingClientRect().width > 0;
+        })()
+      )", true))
+        return false;
+    }
     processor.loadFile(source);
     processor.prepareToPlay(48'000.0, 64);
     if (!processor.workerStatus().active)
@@ -109,28 +142,20 @@ sample { if enabled { out1 = 1.0 } else { out1 = 0.0 } }
             << "Native editor test host could not create a desktop window\n";
         return false;
       }
-      const auto *overlay = dynamic_cast<juce::Label *>(
-          editor.findChildWithID("onda-loading-overlay"));
-      if (!overlay ||
-          !test::waitForMessage([&] { return !overlay->isVisible(); },
-                                std::chrono::seconds(30))) {
-        std::cerr << "Native editor did not acknowledge its initial state: "
-                  << (overlay ? overlay->getText() : "missing loading overlay")
-                  << '\n';
+      auto *browser = readyBrowser(editor);
+      if (!browser)
         return false;
-      }
       if (!renders(reopened ? 1.0F : 0.0F)) {
         std::cerr << "Native editor started with incorrect DSP state\n";
         return false;
       }
-      juce::WebBrowserComponent *browser{};
-      for (auto *child : editor.getChildren())
-        if (auto *candidate = dynamic_cast<juce::WebBrowserComponent *>(child))
-          browser = candidate;
-      if (!browser || !evaluate(*browser, R"(
+      if (!evaluate(*browser, R"(
         (() => {
           const input = document.querySelector('#params input[type=checkbox]');
           if (!input || input.disabled) throw new Error('Missing editable checkbox');
+          if (getComputedStyle(input).visibility !== 'visible'
+              || input.getBoundingClientRect().width <= 0)
+            throw new Error('Checkbox is not visible');
           const checked = input.checked;
           input.click();
           return checked;
