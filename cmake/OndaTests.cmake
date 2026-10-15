@@ -53,7 +53,10 @@ if(ONDA_PLUGIN_INPUT_CHANNELS EQUAL 2 AND
     onda_add_test(onda_filesystem_extended_tests extended onda_plugin_tests --group extended)
 endif()
 
-add_executable(onda_processor_tests
+juce_add_console_app(onda_processor_tests)
+set_target_properties(onda_processor_tests PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}")
+target_sources(onda_processor_tests PRIVATE
     tests/ProcessorTests.cpp
     tests/NativeEditorTests.cpp
     tests/RealtimeAudit.cpp

@@ -7,9 +7,9 @@ ctest --test-dir build -C Release --output-on-failure -L '^(core|native)$'
 ```
 
 Native editor checks require a desktop. Linux CI supplies an X11 display with
-`xvfb-run -a`; a local desktop also works. The processor executable is a JUCE
-application, so its message loop and WebKit subprocess use normal application
-startup rather than treating the executable as an embedded plugin.
+`xvfb-run -a`; a local desktop also works. The processor executable uses
+`juce_add_console_app` for the Windows console entry point and normal JUCE
+message-loop and WebKit subprocess startup.
 
 | CTest label | Placement and purpose |
 | --- | --- |
@@ -273,6 +273,8 @@ the `ControlInputs` processor case alongside the VST3 smoke test and validators.
   edit a real DOM control through the native bridge. Exported editor tests check
   `IPlugView` return values for platform support, attachment, and removal. These
   checks complement each other; VST3 validation does not replace real DAW testing.
+  Linux builds guard JUCE's deferred XEmbed resize callback after its embedded
+  window is destroyed. The exported editor reopening test exercises this lifetime.
 - Detailed focus/blur and DOM behavior runs in pinned Playwright/Chromium once.
   It asserts that focus enables editing rather than waiting for OS window focus.
   Failures retain a screenshot, DOM snapshot and command/scroll diagnostics.

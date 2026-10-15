@@ -330,6 +330,7 @@ if(NOT MSVC)
 endif()
 
 include(cmake/OndaVst3Automation.cmake)
+include(cmake/OndaJuceXEmbed.cmake)
 if(MSVC)
     # MSVC /O2 and /Ox can break JUCE's WebView2 COM callbacks. Source options
     # follow target options, so only this JUCE compilation unit uses /O1 and
