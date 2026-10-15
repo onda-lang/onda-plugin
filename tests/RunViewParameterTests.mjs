@@ -1,13 +1,11 @@
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
 import { once } from "node:events";
-import { readFile, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chromium } from "playwright";
+import { readFile, mkdir, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 
-const [htmlPath, numberPath, domainPath, firefox] = process.argv.slice(2);
-assert.ok(firefox, "Expected run view, number input, parameter domain and Firefox paths");
+const [htmlPath, numberPath, domainPath] = process.argv.slice(2);
+assert.ok(domainPath, "Expected run view, number input and parameter domain paths");
 const editor = await readFile(new URL("../src/Editor.cpp", import.meta.url), "utf8");
 const bridge = editor.match(/constexpr auto juceHostBridgeScript = R"JS\(([\s\S]*?)\)JS";/)?.[1];
 assert.ok(bridge, "Could not locate the editor's injected host bridge");
@@ -23,11 +21,6 @@ window.__JUCE__ = { backend: {
 const checks = `
 (async () => {
   try {
-    // An active element in an inactive window receives no focus/blur events.
-    // Wait for the native window before exercising the shipped edit handlers.
-    if (!document.hasFocus()) {
-      await new Promise(resolve => window.addEventListener("focus", resolve, { once: true }));
-    }
     const equal = (actual, expected, message) => {
       if (actual !== expected) throw new Error(message + ": " + actual + ", expected " + expected);
     };
@@ -104,62 +97,101 @@ const checks = `
     focus("inputControls");
     number("inputControls").blur();
     equal(writes().length, beforeControl, "Unedited input control must not write to DSP");
-    await fetch("/result", { method: "POST", body: JSON.stringify({ ok: true }) });
+    return { ok: true };
   } catch (error) {
-    await fetch("/result", { method: "POST", body: JSON.stringify({ error: String(error), stack: error.stack }) });
+    return { error: String(error), stack: error.stack };
   }
 })();
 `;
 const html = (await readFile(htmlPath, "utf8"))
-  .replace("<head>", `<head><script>${transport}${bridge}</script>`)
-  .replace("</body>", `<script>${checks}</script></body>`);
+  .replace("<head>", `<head><script>${transport}${bridge}</script>`);
 const routes = new Map([
   ["/", ["text/html", html]],
   ["/number-input.js", ["text/javascript", await readFile(numberPath, "utf8")]],
   ["/param-control.js", ["text/javascript", await readFile(domainPath, "utf8")]],
 ]);
-let report;
-const completed = new Promise(resolve => { report = resolve; });
-const server = createServer(async (request, response) => {
-  if (request.url === "/result") {
-    let body = "";
-    for await (const chunk of request) body += chunk;
-    response.end();
-    report(JSON.parse(body));
-    return;
-  }
+const server = createServer((request, response) => {
   const route = routes.get(request.url);
   response.writeHead(route ? 200 : 404, { "Content-Type": route?.[0] ?? "text/plain" });
   response.end(route?.[1] ?? "");
 });
-const profile = await mkdtemp(join(tmpdir(), "onda-parameter-view-"));
 let browser;
-let deadline;
+let page;
 try {
-  // The same focus preference used by geckodriver, scoped to this profile.
-  await writeFile(join(profile, "user.js"), 'user_pref("focusmanager.testmode", true);\n');
   server.listen(0, "127.0.0.1");
   await once(server, "listening");
-  browser = spawn(firefox, ["--headless", "--no-remote", "--profile", profile,
-    `http://127.0.0.1:${server.address().port}/`], { stdio: "ignore" });
-  const result = await Promise.race([
-    completed,
-    new Promise((_, reject) => {
-      deadline = setTimeout(() => reject(new Error("Parameter view test timed out")), 30000);
-      browser.once("error", reject);
-      browser.once("exit", code => reject(new Error(`Firefox exited before reporting (${code})`)));
-    }),
-  ]);
+  browser = await chromium.launch();
+  page = await browser.newPage({ viewport: { width: 480, height: 480 } });
+  page.setDefaultTimeout(5000);
+  const errors = [];
+  page.on("pageerror", error => errors.push(String(error)));
+  await page.goto(`http://127.0.0.1:${server.address().port}/`);
+  await page.bringToFront();
+  const result = await page.evaluate(checks);
   assert.equal(result.error, undefined, result.stack ?? result.error);
   assert.equal(result.ok, true);
-  console.log("Run view exact defaults, publication, focus and editing passed");
-} finally {
-  clearTimeout(deadline);
-  if (browser && browser.exitCode === null && browser.signalCode === null) {
-    const exited = once(browser, "exit");
-    browser.kill();
-    await exited;
+  const capabilities = await page.evaluate(() => {
+    window.__receiveParameters({ type: "state", state: {
+      supportsViewState: true,
+      logText: "Native log message\n",
+      logEntries: [{ source: { file: "fixture.onda", line: 7 } }],
+      delegateOverflowCount: 2,
+      midi: { available: true, noteOn: true, noteOff: true },
+      midiKeyboardInteractive: false,
+    } });
+    document.querySelector("#clear-log").click();
+    window.__receiveParameters({ type: "midiActivity", activeNotes: [60] });
+    return {
+      message: document.querySelector(".log-message")?.textContent,
+      source: document.querySelector(".log-context")?.textContent,
+      loss: document.querySelector("#log-loss")?.textContent,
+      cleared: window.__parameterCommands.some(command => command.type === "clearLog"),
+      monitored: document.querySelector('[aria-label="MIDI note 60"]')?.classList.contains("active"),
+    };
+  });
+  assert.deepEqual(capabilities, {
+    message: "Native log message", source: "fixture.onda:7",
+    loss: "delegates: 2 generated overflow · 0 transport drops", cleared: true, monitored: true,
+  });
+  await page.evaluate(() => {
+    window.__receiveParameters({ type: "midiActivity", activeNotes: [] });
+    window.__receiveParameters({ type: "state", state: { logText: "", logEntries: [] } });
+    const scroll = document.querySelector(".shell");
+    scroll.scrollTop = 100;
+    scroll.dispatchEvent(new Event("scroll"));
+  });
+  await page.waitForFunction(() => window.__parameterCommands.some(command =>
+    command.type === "viewState" && command.state.scrollY === 100));
+  await page.evaluate(() => window.__receiveParameters({ type: "viewState", state: {
+    path: "defaults.onda", scrollY: 50, readyId: 42,
+  } }));
+  await page.waitForFunction(() => window.__parameterCommands.some(command =>
+    command.type === "runViewReady" && command.readyId === 42));
+  assert.deepEqual(await page.evaluate(() => ({
+    scroll: document.querySelector(".shell").scrollTop,
+    logLines: document.querySelectorAll(".log-line").length,
+    activeNotes: document.querySelectorAll(".piano-key.active").length,
+  })), { scroll: 50, logLines: 0, activeNotes: 0 });
+  assert.deepEqual(errors, [], "The shipped view raised a browser error");
+  console.log("Run view defaults, editing, log, MIDI monitor and scroll restoration passed");
+} catch (error) {
+  try {
+    if (page) {
+      await mkdir("test-artifacts", { recursive: true });
+      await page.screenshot({ path: "test-artifacts/run-view.png", fullPage: true });
+      await writeFile("test-artifacts/run-view.html", await page.content());
+      await writeFile("test-artifacts/run-view.json", JSON.stringify(await page.evaluate(() => ({
+        commands: window.__parameterCommands,
+        scrollTop: document.querySelector(".shell")?.scrollTop,
+        scrollHeight: document.querySelector(".shell")?.scrollHeight,
+        clientHeight: document.querySelector(".shell")?.clientHeight,
+      })), null, 2));
+    }
+  } catch (diagnosticError) {
+    console.error("Could not collect browser diagnostics:", diagnosticError);
   }
+  throw error;
+} finally {
+  await browser?.close();
   await new Promise(resolve => server.close(resolve));
-  await rm(profile, { recursive: true, force: true });
 }

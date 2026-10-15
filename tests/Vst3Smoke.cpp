@@ -31,18 +31,6 @@ struct ProductExpectation {
   const char *controllerCid;
 };
 
-[[nodiscard]] juce::File bundleForModule(const juce::File &module) {
-  auto candidate = module;
-  for (;;) {
-    if (candidate.isDirectory() && candidate.hasFileExtension("vst3"))
-      return candidate;
-    const auto parent = candidate.getParentDirectory();
-    if (parent == candidate)
-      return {};
-    candidate = parent;
-  }
-}
-
 [[nodiscard]] bool check(const bool condition, const juce::String &message) {
   if (condition)
     return true;
@@ -59,8 +47,8 @@ struct ProductExpectation {
              "Could not create the Windows bundle lookup fixture"))
     return false;
   return check(
-      bundleForModule(module) == bundle && bundleForModule(bundle) == bundle &&
-          bundleForModule(root.getChildFile("missing.bin")) == juce::File{},
+      vst3BundleForModule(module) == bundle && vst3BundleForModule(bundle) == bundle &&
+          vst3BundleForModule(root.getChildFile("missing.bin")) == juce::File{},
       "VST3 bundle lookup did not resolve the bundle directory");
 }
 
@@ -232,10 +220,75 @@ struct ProductExpectation {
   return test::checkUnusedControlInputs(instance, render);
 }
 
+bool smokeSavedProject(juce::VST3PluginFormatHeadless &format,
+                       const juce::PluginDescription &description,
+                       juce::AudioPluginInstance &instance) {
+  const juce::File root{onda::plugin::pathToJuce(testTemporaryRoot())};
+  const auto project = root.getChildFile("saved-project-" + description.name);
+  const auto source = project.getChildFile("main.onda");
+  if (!project.createDirectory().wasOk() ||
+      !project.getChildFile("dependency.onda")
+           .replaceWithText("def saved_gain() { return 0.375 }\n") ||
+      !source.replaceWithText(
+          "import dependency\nouts { out1 }\n"
+          "event note_on(id: i32, channel: i32, key: i32, velocity: f32) {}\n"
+          "event note_off(id: i32, channel: i32, key: i32, velocity: f32) {}\n"
+          "sample { out1 = saved_gain() }\n")) {
+    std::cerr << "Could not write the saved-project fixture\n";
+    return false;
+  }
+  const auto renders = [](juce::AudioPluginInstance &target) {
+    target.setNonRealtime(true);
+    target.prepareToPlay(48'000.0, 64);
+    juce::AudioBuffer<float> audio(
+        std::max(ONDA_PLUGIN_INPUT_CHANNELS, ONDA_PLUGIN_OUTPUT_CHANNELS), 64);
+    audio.clear();
+    juce::MidiBuffer midi;
+    target.processBlock(audio, midi);
+    const auto correct =
+        std::all_of(audio.getReadPointer(0), audio.getReadPointer(0) + 64,
+                    [](float sample) {
+                      return test::withinTolerance(sample - 0.375F, 1.0e-6F);
+                    });
+    if (!correct)
+      std::cerr << target.getName()
+                << " saved-project output: " << audio.getSample(0, 0)
+                << ", expected 0.375\n";
+    target.releaseResources();
+    return correct;
+  };
+  setOndaProgram(instance, source);
+  if (!check(renders(instance),
+             description.name + " could not render the project before saving"))
+    return false;
+  juce::MemoryBlock saved;
+  instance.getStateInformation(saved);
+  if (!check(!saved.isEmpty(),
+             description.name + " returned an empty saved project") ||
+      !check(project.deleteRecursively(),
+             "Could not delete the saved project's original files"))
+    return false;
+  juce::String error;
+  auto restored =
+      format.createInstanceFromDescription(description, 48'000.0, 64, error);
+  if (!restored) {
+    std::cerr << error << '\n';
+    return false;
+  }
+  restored->setStateInformation(saved.getData(),
+                                static_cast<int>(saved.getSize()));
+  return check(renders(*restored),
+               description.name + " did not restore its saved program and "
+                                  "imports without the original files");
+}
+
 [[nodiscard]] bool smokeProduct(juce::VST3PluginFormatHeadless &format,
                                 const juce::File &module,
                                 const ProductExpectation expected) {
-  const auto bundle = bundleForModule(module);
+  if (!check(module.existsAsFile(),
+             "Expected a VST3 module binary: " + module.getFullPathName()))
+    return false;
+  const auto bundle = vst3BundleForModule(module);
   if (!check(bundle.isDirectory(),
              "VST3 bundle not found for " + module.getFullPathName()))
     return false;
@@ -385,17 +438,29 @@ struct ProductExpectation {
                 " produced an unsafe fallback with two concurrent instances");
   instance->releaseResources();
   secondInstance->releaseResources();
-  succeeded &= smokeLoadedProgram(*instance);
-  succeeded &= smokeAutomation(*instance);
-  succeeded &= smokeCallbackProcessing(*instance);
-  succeeded &= smokeParameterDefaults(*instance);
-  succeeded &= smokeControlAutomation(*instance);
-  succeeded &= smokeParameterConversions(format, description, module);
-  succeeded &= smokeAutomationNotifications(format, description, module);
-  succeeded &= smokeOfflineAutomationNotifications(format, description, module);
+  succeeded &= check(smokeLoadedProgram(*instance),
+                     description.name + " smokeLoadedProgram failed");
+  succeeded &= check(smokeSavedProject(format, description, *instance),
+                     description.name + " saved-project restoration failed");
+  succeeded &= check(smokeAutomation(*instance),
+                     description.name + " smokeAutomation failed");
+  succeeded &= check(smokeCallbackProcessing(*instance),
+                     description.name + " smokeCallbackProcessing failed");
+  succeeded &= check(smokeParameterDefaults(*instance),
+                     description.name + " smokeParameterDefaults failed");
+  succeeded &= check(smokeControlAutomation(*instance),
+                     description.name + " smokeControlAutomation failed");
+  succeeded &= check(smokeParameterConversions(format, description, module),
+                     description.name + " smokeParameterConversions failed");
+  succeeded &= check(smokeAutomationNotifications(format, description, module),
+                     description.name + " smokeAutomationNotifications failed");
+  succeeded &=
+      check(smokeOfflineAutomationNotifications(format, description, module),
+            description.name + " smokeOfflineAutomationNotifications failed");
   succeeded &= check(smokeControlInputs(*instance),
                      instance->getName() + " control input smoke failed");
-  succeeded &= smokeBypassTransitions(*instance);
+  succeeded &= check(smokeBypassTransitions(*instance),
+                     description.name + " smokeBypassTransitions failed");
 
   return succeeded;
 }

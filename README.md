@@ -119,8 +119,11 @@ cmake --build build
 To run tests:
 
 ```sh
-ctest --test-dir build --output-on-failure
+ctest --test-dir build --output-on-failure -L '^(core|native)$'
 ```
+
+Native editor tests require a desktop; Linux CI uses `xvfb-run -a`.
+See [test placement and browser setup](tests/README.md) for development and extended checks.
 
 Custom builds can change the fixed input, control, and output channel counts:
 

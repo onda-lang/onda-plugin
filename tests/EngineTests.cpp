@@ -739,10 +739,12 @@ bool exerciseExportRelinkConflicts(const onda::plugin::ProjectImage &image,
 bool exerciseBuildParameterSnapshot() {
   using namespace onda::plugin;
   TemporarySource source;
+  source.writeDependency("def snapshot_offset() { return 0.0 }\n");
   source.writeText(R"(
+import onda_plugin_dependency_test
 outs { out1, out2 }
-params { gain = 0.5 { 0.0, 1.0 } }
-init { pin held = gain }
+params { gain = 0.5 { 0.0, 1.0 }; balance = 0.5 { 0.0, 1.0 } }
+init { pin held = gain - balance + snapshot_offset() }
 sample { out1 = held; out2 = held }
 )");
   const auto initial =
@@ -754,15 +756,45 @@ sample { out1 = held; out2 = held }
     SpscSlot<PreparedEngine *> replacements;
     SpscSlot<PreparedEngine *> retirements;
     std::atomic<bool> deactivate{};
-    std::atomic<int> snapshotReads{};
-    Worker worker(Product::effect, replacements, retirements, deactivate, {},
-                  nullptr, [&] {
-                    ParameterValues values;
-                    values.fill(0.5F);
-                    // Model automation changing between host-value reads.
-                    values[0] = snapshotReads.fetch_add(1) == 0 ? 0.25F : 0.75F;
-                    return HostParameterValues{.parameters = values, .controls = {}};
-                  });
+    int snapshotReads{};
+    int attempts{};
+    bool coherent = true;
+    ParameterValues snapshot{};
+    const auto checkSnapshot =
+        [&](const std::optional<ParameterValues> &values) {
+          // Retries may capture newer automation. Each attempt must use exactly
+          // one complete snapshot, including the saved-image fallback.
+          coherent &= ++attempts == snapshotReads && values &&
+                      std::ranges::equal(
+                          *values, snapshot, [](const auto &a, const auto &b) {
+                            return a.normalized == b.normalized &&
+                                   !a.scalarDefault && !b.scalarDefault;
+                          });
+        };
+    Worker::BuildFunction build;
+    if (!fromImage)
+      build = [&](const std::filesystem::path &path, Product product,
+                  double rate, int block,
+                  std::span<const BufferFileBinding> bindings,
+                  const std::optional<ParameterValues> &values) {
+        checkSnapshot(values);
+        return PreparedEngine::build(path, product, rate, block, bindings,
+                                     values);
+      };
+    Worker worker(
+        Product::effect, replacements, retirements, deactivate,
+        std::move(build), nullptr,
+        [&] {
+          snapshot.fill(0.5F);
+          snapshot[0] = ++snapshotReads % 2 == 1 ? 0.25F : 0.75F;
+          snapshot[1] = 1.0 - snapshot[0].normalized;
+          return HostParameterValues{.parameters = snapshot, .controls = {}};
+        },
+        [&](const ProjectImage &image, Product product, double rate, int block,
+            const std::optional<ParameterValues> &values) {
+          checkSnapshot(values);
+          return PreparedEngine::build(image, product, rate, block, values);
+        });
     worker.configure(48'000.0, 8);
     if (fromImage)
       worker.restore({}, initial.projectImage, {});
@@ -770,12 +802,13 @@ sample { out1 = held; out2 = held }
       worker.load(source.path(), false);
     static_cast<void>(worker.waitForPreparation());
     std::unique_ptr<PreparedEngine> engine{replacements.tryPop()};
-    if (!engine || snapshotReads.load() != 1 ||
+    if (!engine || !coherent || attempts < (fromImage ? 1 : 2) ||
         worker.status().usingProjectImage != fromImage ||
-        !produces(*engine, 0.25F)) {
+        !produces(*engine, static_cast<float>(snapshot[0].normalized -
+                                              snapshot[1].normalized))) {
       std::cerr << "build did not initialize from one parameter snapshot "
-                << "(saved image " << fromImage << ", reads "
-                << snapshotReads.load() << ")\n";
+                << "(saved image " << fromImage << ", reads " << snapshotReads
+                << ", attempts " << attempts << ")\n";
       return false;
     }
   }
@@ -1025,13 +1058,19 @@ bool exerciseFilesystemProjects() {
                      static_cast<std::streamsize>(asset.size()));
       }
       auto disk = PreparedEngine::build(project, Product::effect, 48'000.0, 8);
-      if (!disk.engine || !disk.projectImage.valid() ||
-          std::ranges::find(disk.watchPaths, dependency) ==
-              disk.watchPaths.end() ||
+      const auto watchesDependency = std::ranges::any_of(
+          disk.watchPaths, [&](const std::filesystem::path &path) {
+            std::error_code error;
+            return std::filesystem::equivalent(path, dependency, error);
+          });
+      if (!disk.engine || !disk.projectImage.valid() || !watchesDependency ||
           !produces(*disk.engine, 0.75F)) {
         std::cerr << "filesystem project failed (" << extension
                   << ", external import " << externalImport
-                  << "): " << disk.diagnostic.message << '\n';
+                  << ", engine " << bool(disk.engine) << ", checkpoint "
+                  << disk.projectImage.valid() << ", dependency watched "
+                  << watchesDependency << "): " << disk.diagnostic.message
+                  << '\n';
         return false;
       }
       // Restore and export must use the complete checkpoint, including imports
@@ -2529,9 +2568,9 @@ sample { out1 = in1; out2 = in2 }
 int main(const int argc, char **argv) {
   const test::Case cases[]{
       {"DiagnosticOwnership", exerciseDiagnosticOwnership},
-      {"NativeFilesystemWatcher", exerciseNativeFilesystemWatcher},
-      {"MovedSourceAncestor", exerciseMovedSourceAncestor},
-      {"SymlinkedBufferDirectory", exerciseSymlinkedBufferDirectory},
+      {"NativeFilesystemWatcher", exerciseNativeFilesystemWatcher, "native"},
+      {"MovedSourceAncestor", exerciseMovedSourceAncestor, "extended"},
+      {"SymlinkedBufferDirectory", exerciseSymlinkedBufferDirectory, "extended"},
       {"BuildParameterSnapshot", exerciseBuildParameterSnapshot},
       {"ReloadDuringSeeding", exerciseReloadDuringSeeding},
       {"TypedProjectDefaults", exerciseTypedProjectDefaults},

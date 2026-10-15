@@ -7,6 +7,17 @@
 
 #include <juce_audio_processors_headless/juce_audio_processors_headless.h>
 
+inline juce::File vst3BundleForModule(juce::File module) {
+  for (;;) {
+    if (module.isDirectory() && module.hasFileExtension("vst3"))
+      return module;
+    const auto parent = module.getParentDirectory();
+    if (parent == module)
+      return {};
+    module = parent;
+  }
+}
+
 inline void
 setOndaProgram(juce::AudioPluginInstance &instance, const juce::File &source,
                const float normalized = 0.5F, const int blockSamples = 0,

@@ -1,6 +1,42 @@
 # Test contracts
 
-Run the suite with `ctest --test-dir build -C Release --output-on-failure`.
+Run the release contracts with:
+
+```sh
+ctest --test-dir build -C Release --output-on-failure -L '^(core|native)$'
+```
+
+Native editor checks require a desktop. Linux CI supplies an X11 display with
+`xvfb-run -a`; a local desktop also works. The processor executable is a JUCE
+application, so its message loop and WebKit subprocess use normal application
+startup rather than treating the executable as an embedded plugin.
+
+| CTest label | Placement and purpose |
+| --- | --- |
+| `core` | All three toolchains: deterministic C++ DSP, state, automation and worker behavior; examples; exported VST3 behavior and protocol validation. |
+| `native` | All three platforms: filesystem notifications, native browser readiness and UI-to-DSP communication, and exported editor attachment/removal. |
+| `browser` | One Linux development job: the injected bridge and detailed DOM behavior in pinned Playwright/Chromium. |
+| `audit` | One Linux development job: exported callback interception, gated by the auditor's positive self-tests. |
+| `extended` | Manually requested: ancestor moves, symlink permutations and concurrent state/log stress. |
+
+`ci.yml` validates main-branch pushes and pull requests before release preparation.
+A manually requested extended run also builds zero-main-input, mono/no-control, and
+wider channel configurations. `release.yml` reuses the same build job, runs
+`core`/`native`, and smoke-tests and validates the staged bundles before packaging.
+Custom configurations, browser tooling and the Linux auditor are not publishing
+prerequisites for the default artifacts. Extended failures remain visible CI
+failures; they are not ignored or turned into successful tests.
+Release configuration disables `ONDA_PLUGIN_BUILD_VST3_AUDIT` so the preload
+auditor is not built as part of publishing either.
+
+To include the portable browser checks locally:
+
+```sh
+npm ci --prefix tests
+npm exec --prefix tests -- playwright install chromium --only-shell
+cmake -S . -B build -DONDA_PLUGIN_BUILD_BROWSER_TESTS=ON
+ctest --test-dir build --output-on-failure -L '^browser$'
+```
 
 `NewControlDefaults` reloads programs with newly declared controls before and
 after selection seeding. Both products retain existing controls and parameters,
@@ -23,6 +59,7 @@ scenario:
 ./build/onda_processor_tests MessageThreadDelivery
 ./build/onda_plugin_tests NativeFilesystemWatcher
 ./build/onda_plugin_tests MovedSourceAncestor
+./build/onda_processor_tests --group native
 ```
 
 Use `build/Release/onda_processor_tests.exe` for a Windows multi-config build.
@@ -34,13 +71,14 @@ artifacts.
 | Test | Contract |
 | --- | --- |
 | `onda_example_tests` | Shipped examples compile and render finite, meaningful output. |
-| `onda_plugin_tests` | SDK ownership, DSP and MIDI behavior, buffer decoding, portable checkpoints, project export, worker replacement, file watching, and compiler serialization. |
+| `onda_plugin_tests` | SDK ownership, DSP and MIDI behavior, buffer decoding, portable checkpoints, project export, worker replacement, file watching, and compiler serialization. Extended watcher permutations run separately. |
 | `onda_processor_tests` | Host preparation, state persistence, defaults and automation, block-rate parameter smoothing, notifications, failure recovery, realtime callbacks, logs, scope/event adapters, editor lifecycle, and concurrent instances. |
-| `onda_vst3_smoke` | Built bundles expose the expected metadata and parameters, instantiate independently, and render through JUCE's VST3 host. Bundle lookup also exercises the Windows layout on other platforms. |
+| `onda_native_editor_tests` | Both products: actual native browser handshake, DOM checkbox edits reaching DSP, retained state on reopening, and exported `IPlugView` platform support, attachment and removal. |
+| `onda_vst3_smoke` | Built bundles expose expected metadata and parameters, instantiate independently, render through JUCE's VST3 host, and restore a saved program with imports after deleting its original files. Bundle lookup also exercises the Windows layout on other platforms. |
 | `onda_vst3_realtime_audit_tests` | Linux auditor startup, plugin loading, positive allocation/free/mutex detection, allocator semantics, callback budgets, and independent concurrent audit intervals. |
 | `onda_vst3_realtime` | The exported VST3 behavior checks with Linux allocation and mutex interception enabled, after the auditor's own tests pass. |
-| `onda_editor_bridge_tests` | The injected bridge ends cancelled parameter gestures without writing stale values, retains gestures across automation updates, and stamps events with the exact rendered generation. Registered when Node.js is available. |
-| `onda_run_view_parameter_tests` | The actual run view and injected bridge preserve out-of-range and full-width integer defaults across publications and unedited focus/blur, retain focused drafts, and clamp actual edits. Registered when Node.js and Firefox are available. |
+| `onda_editor_bridge_tests` | The injected bridge ends cancelled parameter gestures without writing stale values, retains gestures across automation updates, and stamps events with the exact rendered generation. Enabled with browser tests. |
+| `onda_run_view_parameter_tests` | The shipped view and bridge preserve exact defaults across publications and focus/blur, retain focused drafts, clamp edits, render/clear logs, display monitored MIDI notes, and save/restore scroll position. Enabled with browser tests. |
 | VST3 validators | Steinberg's interface/protocol checks for both products. These complement the behavior checked by the smoke host. |
 
 Run bridge tests directly with `node tests/EditorBridgeTests.mjs`. The
@@ -175,7 +213,8 @@ not required to take exactly one compiler call. Both standalone and imported-sou
 fixtures require no additional compilation for a timestamp-only edit and exactly
 one additional compilation for each tested content edit, including equal-size
 edits that preserve the modification time. Pinned-initializer coverage checks
-that disk preparation and saved-image fallback each capture host values once.
+that each preparation attempt uses one coherent host snapshot, including saved-image
+fallback. Source-discovery retries may capture newer host values.
 Pending-seed regressions cover explicit reloads, native source edits, host
 re-specialization, and acknowledgment during a gated build. Project-default cases
 render all five Onda primitive types through disk loading, filesystem-free image
@@ -222,17 +261,18 @@ the `ControlInputs` processor case alongside the VST3 smoke test and validators.
   C++ allocation/deallocation auditing runs on all platforms; C allocation/free and mutex-lock
   interception use Linux linker wrapping. Passing on macOS or Windows does not
   establish the same interception coverage.
-- Editor lifecycle tests do not establish that every native browser renders the UI.
-  The desktop WebView2 handshake is checked on Windows; macOS and Linux exercise
-  editor ownership, dimensions, preferences, and automation without requiring that
-  browser handshake. VST3 validation does not replace testing in a real DAW.
-- The Firefox DOM test uses geckodriver's `focusmanager.testmode` preference in
-  its temporary profile and waits for native window focus before testing edits.
-  It requires focus to make the number input editable and checks emitted writes;
-  an active DOM element alone does not establish a functioning edit session.
+- Native editor tests wait for the shipped view's readiness acknowledgment and
+  edit a real DOM control through the native bridge. Exported editor tests check
+  `IPlugView` return values for platform support, attachment, and removal. These
+  checks complement each other; VST3 validation does not replace real DAW testing.
+- Detailed focus/blur and DOM behavior runs in pinned Playwright/Chromium once.
+  It asserts that focus enables editing rather than waiting for OS window focus.
+  Failures retain a screenshot, DOM snapshot and command/scroll diagnostics.
 
-Linux success cannot establish macOS or Windows success. The release workflow runs
-the suite independently on all three platforms.
+The `MovedSourceAncestor` extended test has an unresolved Windows failure:
+[0.1.27 CI](https://github.com/onda-lang/onda-plugin/actions/runs/38620616719/job/116046876382)
+reported `Access is denied` when renaming the watched project's directory.
+Rerun `build/Release/onda_plugin_tests.exe MovedSourceAncestor` on Windows to verify.
 
 `ControlAutomation` compares continuous and discrete cursor values and rendered
 samples against an independent reference that scans points afresh per sample

@@ -12,6 +12,7 @@ namespace test {
 struct Case {
   std::string_view name;
   bool (*run)();
+  std::string_view group{"core"};
 };
 
 inline void reportException() noexcept {
@@ -31,8 +32,9 @@ inline void reportException() noexcept {
 
 inline int runCases(const int argc, const char *const *argv,
                     const std::span<const Case> cases) {
-  if (argc > 2) {
-    std::cerr << "usage: " << argv[0] << " [case-name]\n";
+  const auto byGroup = argc == 3 && std::string_view{argv[1]} == "--group";
+  if (argc > 1 && argc != 2 && !byGroup) {
+    std::cerr << "usage: " << argv[0] << " [case-name | --group group]\n";
     return 2;
   }
   // Uncaught worker-thread and noexcept exceptions bypass the case's catch.
@@ -45,7 +47,8 @@ inline int runCases(const int argc, const char *const *argv,
   bool selected{};
   bool succeeded = true;
   for (const auto &testCase : cases) {
-    if (argc == 2 && testCase.name != argv[1])
+    if ((byGroup && testCase.group != argv[2]) ||
+        (argc == 2 && testCase.name != argv[1]))
       continue;
     selected = true;
     // Flush before entering native code, including code that can abort.
@@ -56,12 +59,12 @@ inline int runCases(const int argc, const char *const *argv,
     } catch (...) {
       reportException();
     }
-    std::cout << (passed ? "[       OK ] " : "[  FAILED  ] ")
-              << testCase.name << std::endl;
+    std::cout << (passed ? "[       OK ] " : "[  FAILED  ] ") << testCase.name
+              << std::endl;
     succeeded &= passed;
   }
   if (!selected) {
-    std::cerr << "unknown test case\n";
+    std::cerr << "unknown test case or group\n";
     return 2;
   }
   return succeeded ? 0 : 1;

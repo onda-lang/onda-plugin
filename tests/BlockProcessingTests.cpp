@@ -14,60 +14,69 @@ bool exerciseCallbackSmoothing() {
   using namespace onda::plugin;
   const juce::File source{
       pathToJuce(testTemporaryRoot() / "callback-smoothing.onda")};
-  if (!source.replaceWithText(R"(
-outs { out1, out2 }
+  for (const auto doublePrecision : {false, true}) {
+    const auto expression = doublePrecision ? "f32(b)" : "a";
+    const auto program = juce::String{R"(
+outs { out1 }
 params { single = 0.0 {0.0, 1.0}; double: f64 = 0.0 {0.0, 1.0} }
 event note_on(id: i32, channel: i32, key: i32, velocity: f32) {}
 event note_off(id: i32, channel: i32, key: i32, velocity: f32) {}
 block {
   a = single; b = double
-  sample { out1 = a; out2 = f32(b) }
+  sample { out1 = )"} + expression +
+                         R"( }
 }
-)"))
-    return false;
-  for (const auto product : {Product::effect, Product::instrument})
-    for (const auto block : {3, 8}) {
-      Processor processor(product);
-      processor.prepareToPlay(1000.0, 8);
-      if (!processor.setPreferredBlockSize(block) ||
-          !processor.setParamSmoothingSeconds(0.016))
-        return false;
-      processor.loadFile(source, false);
-      processor.prepareToPlay(1000.0, 8);
-      if (!processor.workerStatus().active) {
-        std::cerr << processor.workerStatus().message << '\n';
-        return false;
-      }
-      processor.getParameters()[0]->setValueNotifyingHost(0.0F);
-      processor.getParameters()[1]->setValueNotifyingHost(0.0F);
-      juce::MidiBuffer empty;
-      juce::AudioBuffer<float> initial(2, 8);
-      if (!test::processRealtime(processor, initial, empty))
-        return false;
-      processor.setSlotValue(0, 1.0F);
-      processor.setSlotValue(1, 1.0F);
-      int elapsed{};
-      for (const auto frames : {0, 6, 0, 2, 3, 5}) {
-        juce::AudioBuffer<float> audio(2, frames);
-        juce::MidiBuffer midi;
-        midi.addEvent(juce::MidiMessage::noteOn(1, 60, 1.0F), frames / 2);
-        if (!test::processRealtime(processor, audio, midi))
+)";
+    if (!source.replaceWithText(program))
+      return false;
+    for (const auto product : {Product::effect, Product::instrument})
+      for (const auto block : {3, 8}) {
+        Processor processor(product);
+        processor.prepareToPlay(1000.0, 8);
+        if (!processor.setPreferredBlockSize(block) ||
+            !processor.setParamSmoothingSeconds(0.016))
           return false;
-        for (int frame = 0; frame < frames; ++frame) {
-          const auto chunkEnd = std::min((frame / block + 1) * block, frames);
-          const auto expected = static_cast<float>(elapsed + chunkEnd) / 16.0F;
-          for (int channel = 0; channel < 2; ++channel)
-            if (!test::withinTolerance(
-                    audio.getSample(channel, frame) - expected, 1.0e-6F)) {
+        processor.loadFile(source, false);
+        processor.prepareToPlay(1000.0, 8);
+        if (!processor.workerStatus().active) {
+          std::cerr << processor.workerStatus().message << '\n';
+          return false;
+        }
+        processor.getParameters()[0]->setValueNotifyingHost(0.0F);
+        processor.getParameters()[1]->setValueNotifyingHost(0.0F);
+        juce::MidiBuffer empty;
+        const auto channels =
+            std::max(pluginInputChannels, pluginOutputChannels);
+        juce::AudioBuffer<float> initial(channels, 8);
+        initial.clear();
+        if (!test::processRealtime(processor, initial, empty))
+          return false;
+        processor.setSlotValue(0, 1.0F);
+        processor.setSlotValue(1, 1.0F);
+        int elapsed{};
+        for (const auto frames : {0, 6, 0, 2, 3, 5}) {
+          juce::AudioBuffer<float> audio(channels, frames);
+          audio.clear();
+          juce::MidiBuffer midi;
+          midi.addEvent(juce::MidiMessage::noteOn(1, 60, 1.0F), frames / 2);
+          if (!test::processRealtime(processor, audio, midi))
+            return false;
+          for (int frame = 0; frame < frames; ++frame) {
+            const auto chunkEnd = std::min((frame / block + 1) * block, frames);
+            const auto expected =
+                static_cast<float>(elapsed + chunkEnd) / 16.0F;
+            if (!test::withinTolerance(audio.getSample(0, frame) - expected,
+                                       1.0e-6F)) {
               std::cerr << "Short callback smoothing: "
-                        << audio.getSample(channel, frame) << " expected "
-                        << expected << '\n';
+                        << audio.getSample(0, frame) << " expected " << expected
+                        << '\n';
               return false;
             }
+          }
+          elapsed += frames;
         }
-        elapsed += frames;
       }
-    }
+  }
   return true;
 }
 

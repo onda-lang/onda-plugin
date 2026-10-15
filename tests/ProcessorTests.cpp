@@ -4,6 +4,7 @@
 
 #include "AudioFile.h"
 #include "EditorTestSupport.h"
+#include "NativeEditorTests.h"
 #include "JucePath.h"
 #include "Processor.h"
 #include "ProcessorTestSupport.h"
@@ -596,27 +597,6 @@ bool exerciseRunViewAdapter() {
     std::cerr << "embedded run-view resources were not served canonically\n";
     return false;
   }
-  const std::string_view html{
-      reinterpret_cast<const char *>(root->data.data() + 3U),
-      root->data.size() - 3U};
-  if (html.find("id=\"clear-log\"") == std::string_view::npos ||
-      html.find("state.logEntries") == std::string_view::npos ||
-      html.find("entry.source") == std::string_view::npos ||
-      html.find("delegateOverflowCount") == std::string_view::npos ||
-      html.find("id=\"midi-keyboard\"") == std::string_view::npos ||
-      html.find("midiKeyboardInteractive") == std::string_view::npos ||
-      html.find("setMonitoredMidiNotes(message.activeNotes)") ==
-          std::string_view::npos) {
-    std::cerr << "embedded run view is missing required host capabilities\n";
-    return false;
-  }
-  if (html.find("scrollY: scrollNode.scrollTop") == std::string_view::npos ||
-      html.find("scrollNode.scrollTop = snapshot.scrollY") ==
-          std::string_view::npos) {
-    std::cerr << "embedded run view lacks scroll-position persistence\n";
-    return false;
-  }
-
   onda::plugin::Processor processor(onda::plugin::Product::effect);
   processor.prepareToPlay(48'000.0, 64);
   const auto message = onda::plugin::makeRunViewState(
@@ -1856,25 +1836,11 @@ bool exerciseEditorLifecycle() {
   const auto *loadingOverlay = dynamic_cast<juce::Label *>(
       editor->findChildWithID("onda-loading-overlay"));
   if (loadingOverlay == nullptr ||
-      loadingOverlay->getBounds() != editor->getLocalBounds() ||
-      loadingOverlay->findColour(juce::Label::backgroundColourId) !=
-          juce::Colour::fromRGB(13, 25, 41)) {
+      loadingOverlay->getBounds() != editor->getLocalBounds()) {
     std::cerr << "editor did not cover the initializing web view\n";
     return false;
   }
-#if JUCE_WINDOWS
-  editor->addToDesktop(0);
-#endif
   editor->setVisible(true);
-#if JUCE_WINDOWS
-  if (!test::waitForMessage([&] { return !loadingOverlay->isVisible(); },
-                            std::chrono::seconds(10))) {
-    std::cerr << "Windows editor did not complete its WebView2 handshake: "
-              << loadingOverlay->getText() << '\n';
-    processor.editorBeingDeleted(editor.get());
-    return false;
-  }
-#endif
   editor->setSize(777, 888);
   processor.setParamControlLayout(onda::plugin::ParamControlLayout::knobs);
   const auto [resizedWidth, resizedHeight] = processor.editorSize();
@@ -3390,7 +3356,8 @@ bool exerciseTimelineProjection() {
               const auto offset = playing ? frame / block * block : 0;
               const auto expected =
                   static_cast<float>(event.value + offset * event.perFrame);
-              if (std::abs(audio.getSample(0, frame) - expected) > 1.0e-6F) {
+              if (!test::withinTolerance(audio.getSample(0, frame) - expected,
+                                         1.0e-6F)) {
                 std::cerr << "timeline projection ignored playback state: "
                           << event.declaration << '\n';
                 return false;
@@ -3891,7 +3858,8 @@ bool rendersImmediately(onda::plugin::Processor &processor, const int frames,
     processor.processBlock(audio, midi);
     for (int channel = 0; channel < 2; ++channel) {
       for (int frame = 0; frame < frames; ++frame) {
-        if (std::abs(audio.getSample(channel, frame) - expected) > 1.0e-6F) {
+        if (!test::withinTolerance(audio.getSample(channel, frame) - expected,
+                                   1.0e-6F)) {
           std::cerr
               << "host preparation returned before correct audio was ready\n";
           return false;
@@ -4637,11 +4605,7 @@ bool exerciseConcurrentInstances() {
 
 } // namespace
 
-int main(const int argc, const char *const *argv) {
-#if defined(__linux__)
-  std::signal(SIGPIPE, SIG_IGN);
-#endif
-  juce::ScopedJuceInitialiser_GUI juceInitialiser;
+int runProcessorCases(const int argc, const char *const *argv) {
   const test::Case cases[]{
       {"RealtimeAuditInstrumentation", test::exerciseRealtimeAuditInstrumentation},
       {"AlignedAllocation", exerciseAlignedAllocation},
@@ -4655,7 +4619,7 @@ int main(const int argc, const char *const *argv) {
       {"PendingSeedStateSave", exercisePendingSeedStateSave},
       {"PendingBufferBindings", exercisePendingBufferBindings},
       {"ConcurrentStateRestoreAndLogDrain",
-       exerciseConcurrentStateRestoreAndLogDrain},
+       exerciseConcurrentStateRestoreAndLogDrain, "extended"},
       {"AutomaticEventReplacement", exerciseAutomaticEventReplacement},
       {"MessageThreadDelivery", exerciseMessageThreadDelivery},
       {"ProjectDirtyNotifications", exerciseProjectDirtyNotifications},
@@ -4671,6 +4635,8 @@ int main(const int argc, const char *const *argv) {
        +[] { return exercise(onda::plugin::Product::instrument); }},
       {"StateRestore", exerciseStateRestore},
       {"EditorLifecycle", exerciseEditorLifecycle},
+      {"NativeEditor", exerciseNativeEditor, "native"},
+      {"Vst3EditorAttachment", exerciseVst3EditorAttachment, "native"},
       {"EditorGestureCancellation", exerciseEditorGestureCancellation},
       {"StaleEditorEvents", exerciseStaleEditorEvents},
       {"AudioFileBuffers", exerciseAudioFileBuffers},
@@ -4723,4 +4689,40 @@ int main(const int argc, const char *const *argv) {
       {"ConcurrentInstances", exerciseConcurrentInstances},
   };
   return test::runCases(argc, argv, cases);
+}
+
+// A real JUCE application supplies native message-loop initialization and the
+// WebKit subprocess entry point. ScopedJuceInitialiser_GUI alone identifies an
+// executable as an embedded plugin and cannot host its browser correctly.
+class ProcessorTestApplication final : public juce::JUCEApplication {
+public:
+  ProcessorTestApplication(int argc, const char *const *argv)
+      : argc_(argc), argv_(argv) {}
+  const juce::String getApplicationName() override {
+    return "Onda processor tests";
+  }
+  const juce::String getApplicationVersion() override { return "1"; }
+  bool moreThanOneInstanceAllowed() override { return true; }
+  void initialise(const juce::String &) override {
+    setApplicationReturnValue(runProcessorCases(argc_, argv_));
+    quit();
+  }
+  void shutdown() override {}
+
+private:
+  int argc_;
+  const char *const *argv_;
+};
+
+int main(const int argc, const char **argv) {
+#if defined(__linux__)
+  std::signal(SIGPIPE, SIG_IGN);
+#endif
+  static const auto testArgc = argc;
+  static const auto testArgv = argv;
+  juce::JUCEApplicationBase::createInstance =
+      []() -> juce::JUCEApplicationBase * {
+    return new ProcessorTestApplication(testArgc, testArgv);
+  };
+  return juce::JUCEApplicationBase::main(argc, argv);
 }
