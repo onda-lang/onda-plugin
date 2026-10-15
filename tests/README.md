@@ -23,15 +23,20 @@ Automatic runs of `release.yml` start only on version tags (`vX.Y.Z` or
 `X.Y.Z`) matching `plugin-version`. They build once per platform, run
 `core`/`native`, and smoke-test and validate the staged bundles before packaging
 and publishing. Ordinary branch pushes and pull requests do not start builds.
-The same workflow also supports manual optional checks against an existing tag.
+The same workflow also supports manual optional checks against a tag, branch,
+or full commit SHA.
 Release configuration disables `ONDA_PLUGIN_BUILD_VST3_AUDIT` so the preload
 auditor is not built as part of publishing either.
 
 To run optional checks in CI, open **Actions → Build Onda VST3 → Run workflow**.
-Use the `main` branch for the workflow definition, enter the version tag to test
-(for example, `0.1.30`), and choose a test selection and platform. The workflow
-checks out that tag and verifies it matches `plugin-version`. Manual runs have
-read-only repository permissions and do not package or publish releases.
+Use the `main` branch for the workflow definition, choose a source ref to test
+(default `main`), and choose a test selection and platform. The source ref can be
+a branch such as `main`, a tag such as `0.1.30`, or a full 40-character commit SHA.
+The workflow checks out that source ref, including its tests, and reads
+`plugin-version` from that checkout. Use `main` to test changes since a release;
+an old tag still uses its original tests. Tag/version matching is required for
+automatic releases. Manual runs have read-only repository permissions and do
+not package or publish releases.
 The manual trigger becomes available after this workflow is on the default
 branch, as described in [GitHub's manual workflow documentation](https://docs.github.com/en/actions/how-tos/manage-workflow-runs/manually-run-a-workflow).
 
@@ -49,12 +54,15 @@ before dependencies are installed or plugins are built. Validator tooling is
 built only for release runs and Linux channel checks. Failures retain CTest logs,
 browser diagnostics and Windows test executables where available.
 
-The equivalent CLI command is:
+For example, to check the Windows test changes on `main`:
 
 ```sh
 gh workflow run release.yml --ref main \
-  -f tag=0.1.30 -f tests=browser-audit -f platform=linux-x64
+  -f source_ref=main -f tests=extended -f platform=windows-x64
 ```
+
+Here `--ref main` selects the workflow definition; `source_ref` selects the
+code and tests to check out. No new version tag or plugin release is needed.
 
 To include the portable browser checks locally:
 

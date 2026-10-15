@@ -1,5 +1,5 @@
 name: Build Onda VST3
-run-name: ${{ github.event_name == 'workflow_dispatch' && format('Optional {0} tests — {1} — {2}', inputs.tests, inputs.tag, inputs.platform) || format('Release {0}', github.ref_name) }}
+run-name: ${{ github.event_name == 'workflow_dispatch' && format('Optional {0} tests — {1} — {2}', inputs.tests, inputs.source_ref, inputs.platform) || format('Release {0}', github.ref_name) }}
 
 on:
   push:
@@ -8,10 +8,11 @@ on:
       - "[0-9]*.[0-9]*.[0-9]*"
   workflow_dispatch:
     inputs:
-      tag:
-        description: Existing version tag to test (for example, 0.1.30)
+      source_ref:
+        description: Source tag, branch, or full commit SHA to test
         required: true
         type: string
+        default: main
       tests:
         description: Optional tests (all includes three extra Linux channel builds)
         type: choice
@@ -37,7 +38,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event_name }}-${{ inputs.tag || github.ref }}-${{ inputs.tests || 'release' }}-${{ inputs.platform || 'all' }}
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ inputs.source_ref || github.ref }}-${{ inputs.tests || 'release' }}-${{ inputs.platform || 'all' }}
   cancel-in-progress: true
 
 env:
@@ -62,11 +63,16 @@ jobs:
         shell: bash
         env:
           TEST_SELECTION: ${{ github.event_name == 'push' && 'release' || inputs.tests }}
-          TARGET_TAG: ${{ github.event_name == 'push' && github.ref_name || inputs.tag }}
+          SOURCE_REF: ${{ github.event_name == 'push' && github.sha || inputs.source_ref }}
+          RELEASE_TAG: ${{ github.event_name == 'push' && github.ref_name || '' }}
           TARGET_PLATFORM: ${{ github.event_name == 'push' && 'all' || inputs.platform }}
         run: |
-          if [[ ! "$TARGET_TAG" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "expected an existing version tag, got $TARGET_TAG" >&2
+          if ! git check-ref-format --allow-onelevel "$SOURCE_REF"; then
+            echo "expected a source tag, branch, or full commit SHA, got $SOURCE_REF" >&2
+            exit 1
+          fi
+          if [[ -n "$RELEASE_TAG" && ! "$RELEASE_TAG" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "expected a version tag, got $RELEASE_TAG" >&2
             exit 1
           fi
           case "$TARGET_PLATFORM" in
@@ -117,20 +123,21 @@ jobs:
             if [[ "${#targets[@]}" -gt 0 ]]; then build=true; fi
           fi
           if [[ -n "$labels" ]]; then labels="^($labels)$"; fi
-          printf '%s\n' "tag=$TARGET_TAG" "browser=$browser" "audit=$audit" \
+          printf '%s\n' "source_ref=$SOURCE_REF" "release_tag=$RELEASE_TAG" \
+            "browser=$browser" "audit=$audit" \
             "channels=$channels" "build=$build" "validator=$validator" \
             "labels=$labels" "targets=${targets[*]}" >> "$GITHUB_OUTPUT"
 
       - name: Checkout repository
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', inputs.tag) || github.sha }}
+          ref: ${{ steps.tests.outputs.source_ref }}
 
       - name: Read and validate version
         id: version
         shell: bash
         env:
-          TARGET_TAG: ${{ steps.tests.outputs.tag }}
+          RELEASE_TAG: ${{ steps.tests.outputs.release_tag }}
           PACKAGE_PLATFORM: ${{ matrix.platform }}
         run: |
           version="$(tr -d '\r\n' < plugin-version)"
@@ -139,10 +146,12 @@ jobs:
             exit 1
           fi
 
-          tag_version="${TARGET_TAG#v}"
-          if [[ "$tag_version" != "$version" ]]; then
-            echo "tag $TARGET_TAG does not match plugin-version $version" >&2
-            exit 1
+          if [[ -n "$RELEASE_TAG" ]]; then
+            tag_version="${RELEASE_TAG#v}"
+            if [[ "$tag_version" != "$version" ]]; then
+              echo "tag $RELEASE_TAG does not match plugin-version $version" >&2
+              exit 1
+            fi
           fi
 
           package_name="Onda-VST3-$version-$PACKAGE_PLATFORM"
