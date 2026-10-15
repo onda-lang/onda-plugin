@@ -1,5 +1,5 @@
-# Test placement is explicit: release uses core/native; development also runs
-# browser/audit, and manually requested checks add extended cases and channel layouts.
+# Releases run core/native; browser/audit, extended cases and channel layouts
+# are available locally.
 function(onda_add_test name group)
     add_test(NAME ${name} COMMAND ${ARGN})
     set_tests_properties(${name} PROPERTIES LABELS "${group}" TIMEOUT 180)

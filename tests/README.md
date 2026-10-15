@@ -15,17 +15,15 @@ startup rather than treating the executable as an embedded plugin.
 | --- | --- |
 | `core` | All three toolchains: deterministic C++ DSP, state, automation and worker behavior; examples; exported VST3 behavior and protocol validation. |
 | `native` | All three platforms: filesystem notifications, native browser readiness and UI-to-DSP communication, and exported editor attachment/removal. |
-| `browser` | One Linux development job: the injected bridge and detailed DOM behavior in pinned Playwright/Chromium. |
-| `audit` | One Linux development job: exported callback interception, gated by the auditor's positive self-tests. |
-| `extended` | Manually requested: ancestor moves, symlink permutations and concurrent state/log stress. |
+| `browser` | Local opt-in: the injected bridge and detailed DOM behavior in pinned Playwright/Chromium. |
+| `audit` | Local Linux checks: exported callback interception, gated by the auditor's positive self-tests. |
+| `extended` | Local checks: ancestor moves, symlink permutations and concurrent state/log stress. |
 
-`ci.yml` validates main-branch pushes and pull requests before release preparation.
-A manually requested extended run also builds zero-main-input, mono/no-control, and
-wider channel configurations. `release.yml` reuses the same build job, runs
-`core`/`native`, and smoke-tests and validates the staged bundles before packaging.
-Custom configurations, browser tooling and the Linux auditor are not publishing
-prerequisites for the default artifacts. Extended failures remain visible CI
-failures; they are not ignored or turned into successful tests.
+The single `release.yml` workflow runs only on version tags (`vX.Y.Z` or
+`X.Y.Z`) matching `plugin-version`. It builds once per platform, runs
+`core`/`native`, and smoke-tests and validates the staged bundles before packaging
+and publishing. Ordinary branch pushes and pull requests do not start builds.
+Browser, auditor, extended and custom channel checks remain available locally.
 Release configuration disables `ONDA_PLUGIN_BUILD_VST3_AUDIT` so the preload
 auditor is not built as part of publishing either.
 
@@ -37,6 +35,16 @@ npm exec --prefix tests -- playwright install chromium --only-shell
 cmake -S . -B build -DONDA_PLUGIN_BUILD_BROWSER_TESTS=ON
 ctest --test-dir build --output-on-failure -L '^browser$'
 ```
+
+Run extended cases with:
+
+```sh
+ctest --test-dir build -C Release --output-on-failure -L '^extended$'
+```
+
+Plain `ctest` runs every registered group. On Linux,
+`bash scripts/check-channel-layouts.sh build` builds and validates control-only,
+mono/no-control, and wider channel configurations.
 
 `NewControlDefaults` reloads programs with newly declared controls before and
 after selection seeding. Both products retain existing controls and parameters,
