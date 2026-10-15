@@ -1,16 +1,43 @@
 name: Build Onda VST3
+run-name: ${{ github.event_name == 'workflow_dispatch' && format('Optional {0} tests — {1} — {2}', inputs.tests, inputs.tag, inputs.platform) || format('Release {0}', github.ref_name) }}
 
 on:
   push:
     tags:
       - "v*"
       - "[0-9]*.[0-9]*.[0-9]*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing version tag to test (for example, 0.1.30)
+        required: true
+        type: string
+      tests:
+        description: Optional tests (all includes three extra Linux channel builds)
+        type: choice
+        default: browser-audit
+        options:
+          - browser-audit
+          - browser
+          - audit
+          - extended
+          - channels
+          - all
+      platform:
+        description: Platform (browser, audit and channels require linux-x64)
+        type: choice
+        default: linux-x64
+        options:
+          - linux-x64
+          - windows-x64
+          - macos-arm64
+          - all
 
 permissions:
   contents: read
 
 concurrency:
-  group: release-${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ inputs.tag || github.ref }}-${{ inputs.tests || 'release' }}-${{ inputs.platform || 'all' }}
   cancel-in-progress: true
 
 env:
@@ -19,29 +46,92 @@ env:
 
 jobs:
   build:
-    name: ${{ matrix.name }}
-    runs-on: ${{ matrix.runner }}
+    name: ${{ matrix.platform }}
+    runs-on: ${{ matrix.platform == 'linux-x64' && 'ubuntu-24.04' || matrix.platform == 'windows-x64' && 'windows-latest' || 'macos-latest' }}
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - name: linux-x64
-            runner: ubuntu-24.04
-          - name: windows-x64
-            runner: windows-latest
-          - name: macos-arm64
-            runner: macos-latest
+        platform: ${{ fromJSON((github.event_name == 'push' || inputs.platform == 'all') && '["linux-x64","windows-x64","macos-arm64"]' || format('["{0}"]', inputs.platform)) }}
 
     env:
       BUILD_PATH: ${{ github.workspace }}/build
 
     steps:
+      - name: Select tests
+        id: tests
+        shell: bash
+        env:
+          TEST_SELECTION: ${{ github.event_name == 'push' && 'release' || inputs.tests }}
+          TARGET_TAG: ${{ github.event_name == 'push' && github.ref_name || inputs.tag }}
+          TARGET_PLATFORM: ${{ github.event_name == 'push' && 'all' || inputs.platform }}
+        run: |
+          if [[ ! "$TARGET_TAG" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "expected an existing version tag, got $TARGET_TAG" >&2
+            exit 1
+          fi
+          case "$TARGET_PLATFORM" in
+            linux-x64|windows-x64|macos-arm64|all) ;;
+            *) echo "unknown platform: $TARGET_PLATFORM" >&2; exit 1 ;;
+          esac
+
+          browser=false
+          audit=false
+          extended=false
+          channels=false
+          build=false
+          validator=false
+          labels=''
+          targets=()
+          case "$TEST_SELECTION" in
+            release) labels='core|native'; build=true; validator=true ;;
+            browser-audit) browser=true; audit=true ;;
+            browser) browser=true ;;
+            audit) audit=true ;;
+            extended) extended=true ;;
+            channels) channels=true ;;
+            all) browser=true; audit=true; extended=true; channels=true ;;
+            *) echo "unknown test selection: $TEST_SELECTION" >&2; exit 1 ;;
+          esac
+
+          if [[ "$TEST_SELECTION" != release ]]; then
+            if [[ "$TARGET_PLATFORM" != linux-x64 && "$TEST_SELECTION" != extended && "$TEST_SELECTION" != all ]]; then
+              echo "$TEST_SELECTION requires platform linux-x64; use extended or all for other platforms" >&2
+              exit 1
+            fi
+            if [[ "$RUNNER_OS" != Linux ]]; then
+              browser=false
+              audit=false
+              channels=false
+            fi
+            if [[ "$browser" == true ]]; then labels+='browser|'; fi
+            if [[ "$audit" == true ]]; then
+              labels+='audit|'
+              targets+=(onda_vst3_realtime_audit_tests onda_vst3_smoke)
+            fi
+            if [[ "$extended" == true ]]; then
+              labels+='extended|'
+              targets+=(onda_plugin_tests onda_processor_tests)
+            fi
+            labels="${labels%|}"
+            validator="$channels"
+            if [[ "${#targets[@]}" -gt 0 ]]; then build=true; fi
+          fi
+          if [[ -n "$labels" ]]; then labels="^($labels)$"; fi
+          printf '%s\n' "tag=$TARGET_TAG" "browser=$browser" "audit=$audit" \
+            "channels=$channels" "build=$build" "validator=$validator" \
+            "labels=$labels" "targets=${targets[*]}" >> "$GITHUB_OUTPUT"
+
       - name: Checkout repository
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', inputs.tag) || github.sha }}
 
       - name: Read and validate version
         id: version
         shell: bash
+        env:
+          TARGET_TAG: ${{ steps.tests.outputs.tag }}
+          PACKAGE_PLATFORM: ${{ matrix.platform }}
         run: |
           version="$(tr -d '\r\n' < plugin-version)"
           if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
@@ -49,15 +139,13 @@ jobs:
             exit 1
           fi
 
-          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
-            tag_version="${GITHUB_REF_NAME#v}"
-            if [[ "$tag_version" != "$version" ]]; then
-              echo "tag $GITHUB_REF_NAME does not match plugin-version $version" >&2
-              exit 1
-            fi
+          tag_version="${TARGET_TAG#v}"
+          if [[ "$tag_version" != "$version" ]]; then
+            echo "tag $TARGET_TAG does not match plugin-version $version" >&2
+            exit 1
           fi
 
-          package_name="Onda-VST3-$version-${{ matrix.name }}"
+          package_name="Onda-VST3-$version-$PACKAGE_PLATFORM"
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "package_name=$package_name" >> "$GITHUB_OUTPUT"
 
@@ -82,6 +170,7 @@ jobs:
             libxrender-dev
 
       - name: Checkout VST3 validator SDK
+        if: steps.tests.outputs.validator == 'true'
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           repository: steinbergmedia/vst3sdk
@@ -90,6 +179,7 @@ jobs:
           persist-credentials: false
 
       - name: Build VST3 validator
+        if: steps.tests.outputs.validator == 'true'
         shell: bash
         run: |
           git -C build-validator-sdk submodule update --init --depth 1 \
@@ -106,6 +196,21 @@ jobs:
           fi
           test -f "$validator"
           echo "ONDA_VST3_VALIDATOR=$validator" >> "$GITHUB_ENV"
+
+      - name: Set up browser test tooling
+        if: steps.tests.outputs.browser == 'true'
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: tests/package-lock.json
+
+      - name: Install controlled browser
+        if: steps.tests.outputs.browser == 'true'
+        shell: bash
+        run: |
+          npm ci --prefix tests
+          npm exec --prefix tests -- playwright install --with-deps chromium --only-shell
 
       - name: Configure CMake on Windows
         if: runner.os == 'Windows'
@@ -128,34 +233,50 @@ jobs:
         run: >
           cmake -S . -B "$BUILD_PATH"
           -DCMAKE_BUILD_TYPE=Release
-          -DONDA_VST3_VALIDATOR="$ONDA_VST3_VALIDATOR"
-          -DONDA_PLUGIN_BUILD_BROWSER_TESTS=OFF
-          -DONDA_PLUGIN_BUILD_VST3_AUDIT=OFF
+          -DONDA_VST3_VALIDATOR="${ONDA_VST3_VALIDATOR:-}"
+          -DONDA_PLUGIN_BUILD_BROWSER_TESTS=${{ steps.tests.outputs.browser == 'true' && 'ON' || 'OFF' }}
+          -DONDA_PLUGIN_BUILD_VST3_AUDIT=${{ steps.tests.outputs.audit == 'true' && 'ON' || 'OFF' }}
 
       - name: Build
+        if: steps.tests.outputs.build == 'true'
         shell: bash
         env:
           CMAKE_BUILD_PARALLEL_LEVEL: 2
-        run: cmake --build "$BUILD_PATH" --config Release
+          BUILD_TARGETS: ${{ steps.tests.outputs.targets }}
+        run: |
+          read -r -a targets <<< "$BUILD_TARGETS"
+          build_args=()
+          if [[ "${#targets[@]}" -gt 0 ]]; then build_args=(--target "${targets[@]}"); fi
+          cmake --build "$BUILD_PATH" --config Release "${build_args[@]}"
 
-      - name: Test release contracts
+      - name: Test selected groups
+        if: steps.tests.outputs.labels != ''
         shell: bash
+        env:
+          TEST_LABELS: ${{ steps.tests.outputs.labels }}
         run: |
           if [[ "$RUNNER_OS" == "Linux" ]]; then
             xvfb-run -a ctest --test-dir "$BUILD_PATH" -C Release \
-              --output-on-failure --no-tests=error -L '^(core|native)$'
+              --output-on-failure --no-tests=error -L "$TEST_LABELS"
           else
             ctest --test-dir "$BUILD_PATH" -C Release \
-              --output-on-failure --no-tests=error -L '^(core|native)$'
+              --output-on-failure --no-tests=error -L "$TEST_LABELS"
           fi
+
+      - name: Test channel layouts
+        if: steps.tests.outputs.channels == 'true'
+        shell: bash
+        run: xvfb-run -a bash scripts/check-channel-layouts.sh "$BUILD_PATH"
 
       - name: Upload test failure diagnostics
         if: failure()
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
-          name: test-failure-${{ matrix.name }}
+          name: test-failure-${{ matrix.platform }}
           path: |
             build/Testing/Temporary/
+            build/test-artifacts/
+            build-layout-*/Testing/Temporary/
             build/Release/onda_plugin_tests.exe
             build/Release/onda_processor_tests.exe
             build/Release/*.pdb
@@ -163,7 +284,7 @@ jobs:
           retention-days: 7
 
       - name: Verify macOS deployment targets
-        if: runner.os == 'macOS'
+        if: github.event_name == 'push' && runner.os == 'macOS'
         shell: bash
         run: |
           bash scripts/check-macos-deployment-target.sh \
@@ -172,7 +293,7 @@ jobs:
             "$BUILD_PATH/OndaFX_artefacts/Release/VST3/OndaFX.vst3/Contents/MacOS/OndaFX"
 
       - name: Package Unix bundles
-        if: runner.os != 'Windows'
+        if: github.event_name == 'push' && runner.os != 'Windows'
         shell: bash
         env:
           PACKAGE_NAME: ${{ steps.version.outputs.package_name }}
@@ -203,7 +324,7 @@ jobs:
           cmake -E tar cf "$archive" --format=zip "$PACKAGE_NAME"
 
       - name: Package Windows bundles
-        if: runner.os == 'Windows'
+        if: github.event_name == 'push' && runner.os == 'Windows'
         shell: pwsh
         env:
           PACKAGE_NAME: ${{ steps.version.outputs.package_name }}
@@ -240,6 +361,7 @@ jobs:
           Compress-Archive -Path $packageRoot -DestinationPath $archive -Force
 
       - name: Upload build artifact
+        if: github.event_name == 'push'
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: ${{ steps.version.outputs.package_name }}
@@ -250,6 +372,7 @@ jobs:
 
   publish:
     name: Publish release
+    if: github.event_name == 'push'
     needs: build
     runs-on: ubuntu-24.04
     permissions:

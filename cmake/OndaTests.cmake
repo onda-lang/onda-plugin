@@ -1,5 +1,5 @@
-# Releases run core/native; browser/audit, extended cases and channel layouts
-# are available locally.
+# Releases run core/native; optional groups and channel layouts are available
+# through manual CI runs and locally.
 function(onda_add_test name group)
     add_test(NAME ${name} COMMAND ${ARGN})
     set_tests_properties(${name} PROPERTIES LABELS "${group}" TIMEOUT 180)

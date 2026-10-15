@@ -123,7 +123,7 @@ ctest --test-dir build --output-on-failure -L '^(core|native)$'
 ```
 
 Native editor tests require a desktop; Linux CI uses `xvfb-run -a`.
-See [test placement and browser setup](tests/README.md) for additional local checks.
+See [test placement and browser setup](tests/README.md) for manual CI and local checks.
 
 Custom builds can change the fixed input, control, and output channel counts:
 

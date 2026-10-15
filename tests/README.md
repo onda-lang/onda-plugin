@@ -15,17 +15,46 @@ message-loop and WebKit subprocess startup.
 | --- | --- |
 | `core` | All three toolchains: deterministic C++ DSP, state, automation and worker behavior; examples; exported VST3 behavior and protocol validation. |
 | `native` | All three platforms: filesystem notifications, native browser readiness and UI-to-DSP communication, and exported editor attachment/removal. |
-| `browser` | Local opt-in: the injected bridge and detailed DOM behavior in pinned Playwright/Chromium. |
-| `audit` | Local Linux checks: exported callback interception, gated by the auditor's positive self-tests. |
-| `extended` | Local checks: ancestor moves, symlink permutations and concurrent state/log stress. |
+| `browser` | Manual Linux CI or local checks: the injected bridge and detailed DOM behavior in pinned Playwright/Chromium. |
+| `audit` | Manual Linux CI or local Linux checks: exported callback interception, gated by the auditor's positive self-tests. |
+| `extended` | Manual CI or local checks: ancestor moves, symlink permutations and concurrent state/log stress. |
 
-The single `release.yml` workflow runs only on version tags (`vX.Y.Z` or
-`X.Y.Z`) matching `plugin-version`. It builds once per platform, runs
-`core`/`native`, and smoke-tests and validates the staged bundles before packaging
+Automatic runs of `release.yml` start only on version tags (`vX.Y.Z` or
+`X.Y.Z`) matching `plugin-version`. They build once per platform, run
+`core`/`native`, and smoke-test and validate the staged bundles before packaging
 and publishing. Ordinary branch pushes and pull requests do not start builds.
-Browser, auditor, extended and custom channel checks remain available locally.
+The same workflow also supports manual optional checks against an existing tag.
 Release configuration disables `ONDA_PLUGIN_BUILD_VST3_AUDIT` so the preload
 auditor is not built as part of publishing either.
+
+To run optional checks in CI, open **Actions → Build Onda VST3 → Run workflow**.
+Use the `main` branch for the workflow definition, enter the version tag to test
+(for example, `0.1.30`), and choose a test selection and platform. The workflow
+checks out that tag and verifies it matches `plugin-version`. Manual runs have
+read-only repository permissions and do not package or publish releases.
+The manual trigger becomes available after this workflow is on the default
+branch, as described in [GitHub's manual workflow documentation](https://docs.github.com/en/actions/how-tos/manage-workflow-runs/manually-run-a-workflow).
+
+| Test selection | Platforms | Work performed |
+| --- | --- | --- |
+| `browser-audit` (default) | `linux-x64` | Browser and exported callback audit checks, sharing one plugin build. |
+| `browser` | `linux-x64` | Browser checks; skips plugin compilation. |
+| `audit` | `linux-x64` | Exported callback audit and its instrumentation self-tests. |
+| `extended` | Any one platform, or `all` | Extended filesystem and concurrency cases. |
+| `channels` | `linux-x64` | Builds and validates three additional channel configurations; skips the default plugin build. |
+| `all` | Any one platform, or `all` | All applicable optional checks; Linux includes the three channel builds. |
+
+The default platform is `linux-x64`. Unsupported test/platform combinations fail
+before dependencies are installed or plugins are built. Validator tooling is
+built only for release runs and Linux channel checks. Failures retain CTest logs,
+browser diagnostics and Windows test executables where available.
+
+The equivalent CLI command is:
+
+```sh
+gh workflow run release.yml --ref main \
+  -f tag=0.1.30 -f tests=browser-audit -f platform=linux-x64
+```
 
 To include the portable browser checks locally:
 
