@@ -17,7 +17,7 @@ message-loop and WebKit subprocess startup.
 | `native` | All three platforms: filesystem notifications, native browser readiness and UI-to-DSP communication, and exported editor attachment/removal. |
 | `browser` | Manual Linux CI or local checks: the injected bridge and detailed DOM behavior in pinned Playwright/Chromium. |
 | `audit` | Manual Linux CI or local Linux checks: exported callback interception, gated by the auditor's positive self-tests. |
-| `extended` | Manual CI or local checks: ancestor moves, symlink permutations and concurrent state/log stress. |
+| `extended` | Manual CI or local checks: ancestor moves and symlink permutations on Linux/macOS; concurrent state/log stress on all three platforms. |
 
 Automatic runs of `release.yml` start only on version tags (`vX.Y.Z` or
 `X.Y.Z`) matching `plugin-version`. They build once per platform, run
@@ -308,10 +308,23 @@ the `ControlInputs` processor case alongside the VST3 smoke test and validators.
   It asserts that focus enables editing rather than waiting for OS window focus.
   Failures retain a screenshot, DOM snapshot and command/scroll diagnostics.
 
-The `MovedSourceAncestor` extended test has an unresolved Windows failure:
-[0.1.27 CI](https://github.com/onda-lang/onda-plugin/actions/runs/38620616719/job/116046876382)
-reported `Access is denied` when renaming the watched project's directory.
-Rerun `build/Release/onda_plugin_tests.exe MovedSourceAncestor` on Windows to verify.
+`MovedSourceAncestor` is disabled on Windows. Its directory watcher holds open
+handles that can prevent moving a containing folder, even with delete sharing,
+consistent with [Windows' directory rename restrictions](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntifs/ns-ntifs-_file_rename_information#remarks).
+The [optional run against 0.1.30](https://github.com/onda-lang/onda-plugin/actions/runs/38711294778/job/116343037842)
+failed at the rename with `Access is denied`, before its recovery assertions.
+Moving folders containing loaded linked files is an unsupported Windows operation;
+unload affected programs in every plugin instance before moving those folders.
+The failure is returned to the application attempting the move, while Onda keeps
+running with the files still in place.
+
+The test remains enabled on Linux and macOS, where it checks the missing-path
+error, retained audio and recovery after restoring the original path.
+`SymlinkedBufferDirectory` also runs only on Linux/macOS because its fixture uses
+POSIX directory-symlink replacement. Both cases are excluded from the Windows
+registry, and the empty `onda_filesystem_extended_tests` group is not registered
+there. Windows still runs `NativeFilesystemWatcher`, the core source/import edit
+and reload checks, and the extended concurrent state/log stress test.
 
 `ControlAutomation` compares continuous and discrete cursor values and rendered
 samples against an independent reference that scans points afresh per sample

@@ -50,7 +50,10 @@ if(ONDA_PLUGIN_INPUT_CHANNELS EQUAL 2 AND
         ONDA_PLUGIN_OUTPUT_CHANNELS EQUAL 2)
     onda_add_test(onda_plugin_tests core onda_plugin_tests --group core)
     onda_add_test(onda_filesystem_tests native onda_plugin_tests --group native)
-    onda_add_test(onda_filesystem_extended_tests extended onda_plugin_tests --group extended)
+    # Ancestor moves and POSIX symlink replacement are excluded on Windows.
+    if(NOT WIN32)
+        onda_add_test(onda_filesystem_extended_tests extended onda_plugin_tests --group extended)
+    endif()
 endif()
 
 juce_add_console_app(onda_processor_tests)

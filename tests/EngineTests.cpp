@@ -438,6 +438,9 @@ bool produces(onda::plugin::PreparedEngine &engine, const float expected,
          });
 }
 
+#if !defined(_WIN32)
+// Windows directory watches can block ancestor moves while a program is loaded.
+// This operation is unsupported there; normal edit/reload checks still run.
 bool exerciseMovedSourceAncestor() {
   using namespace onda::plugin;
   const auto directory = testTemporaryRoot() / "linked-project";
@@ -499,8 +502,8 @@ bool exerciseMovedSourceAncestor() {
   return true;
 }
 
+// This fixture uses POSIX directory-symlink replacement semantics.
 bool exerciseSymlinkedBufferDirectory() {
-#if defined(__linux__) || defined(__APPLE__)
   using namespace onda::plugin;
   const auto directory = testTemporaryRoot() / "symlinked-buffer";
   const auto source = directory / "source" / "main.onda";
@@ -596,9 +599,9 @@ bool exerciseSymlinkedBufferDirectory() {
     std::cerr << "atomically retargeting a buffer symlink did not reload it\n";
     return false;
   }
-#endif
   return true;
 }
+#endif
 
 std::vector<onda::plugin::RuntimeLogEntry>
 drain(onda::plugin::RuntimeLogSink &sink) {
@@ -2569,8 +2572,10 @@ int main(const int argc, char **argv) {
   const test::Case cases[]{
       {"DiagnosticOwnership", exerciseDiagnosticOwnership},
       {"NativeFilesystemWatcher", exerciseNativeFilesystemWatcher, "native"},
+#if !defined(_WIN32)
       {"MovedSourceAncestor", exerciseMovedSourceAncestor, "extended"},
       {"SymlinkedBufferDirectory", exerciseSymlinkedBufferDirectory, "extended"},
+#endif
       {"BuildParameterSnapshot", exerciseBuildParameterSnapshot},
       {"ReloadDuringSeeding", exerciseReloadDuringSeeding},
       {"TypedProjectDefaults", exerciseTypedProjectDefaults},
