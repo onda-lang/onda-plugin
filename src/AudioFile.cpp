@@ -154,13 +154,35 @@ AudioFileResult decodeAudioFile(const std::filesystem::path &path) {
   return decode(encodedBytes, path);
 }
 
+const std::vector<std::string> &supportedAudioFileExtensions() {
+  static const auto extensions = [] {
+    juce::AudioFormatManager formats;
+    registerAudioFormats(formats);
+    juce::StringArray names;
+    for (int index = 0; index < formats.getNumKnownFormats(); ++index)
+      names.addArray(formats.getKnownFormat(index)->getFileExtensions());
+    names.add(".ondabuffer");
+    names.trim();
+    names.removeEmptyStrings();
+    for (auto &name : names)
+      if (!name.startsWithChar('.'))
+        name = "." + name;
+    names.removeDuplicates(true);
+    std::vector<std::string> result;
+    for (const auto &name : names)
+      result.push_back(name.toLowerCase().toStdString());
+    return result;
+  }();
+  return extensions;
+}
+
 std::string supportedAudioFileWildcard() {
-  juce::AudioFormatManager formats;
-  registerAudioFormats(formats);
-  auto wildcard = formats.getWildcardForAllFormats().toStdString();
-  if (!wildcard.empty())
-    wildcard += ';';
-  wildcard += "*.ondabuffer";
+  std::string wildcard;
+  for (const auto &extension : supportedAudioFileExtensions()) {
+    if (!wildcard.empty())
+      wildcard += ';';
+    wildcard += '*' + extension;
+  }
   return wildcard;
 }
 

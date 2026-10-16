@@ -11,6 +11,13 @@ static StringArray ondaDraggedFiles (id<NSDraggingInfo> sender)
     return files;
 }
 
+static Point<int> ondaDragPosition (NSView* view, id<NSDraggingInfo> sender)
+{
+    const auto point = [view convertPoint: [sender draggingLocation] fromView: nil];
+    const auto y = [view isFlipped] ? point.y : [view bounds].size.height - point.y;
+    return { roundToInt (point.x), roundToInt (y) };
+}
+
 template <typename Class>
 static void addOndaFileDropMethods (Class& cls)
 {
@@ -20,13 +27,24 @@ static void addOndaFileDropMethods (Class& cls)
                    {
                        auto* browser = getIvar<WebBrowserComponent*> (self, "ondaDropOwner");
                        auto* target = dynamic_cast<FileDragAndDropTarget*> (browser);
-                       return target != nullptr && target->isInterestedInFileDrag (ondaDraggedFiles (sender))
-                           ? NSDragOperationCopy : NSDragOperationNone;
+                       const auto files = ondaDraggedFiles (sender);
+                       if (target == nullptr || !target->isInterestedInFileDrag (files))
+                           return NSDragOperationNone;
+                       const auto point = ondaDragPosition ((NSView*) self, sender);
+                       target->fileDragMove (files, point.x, point.y);
+                       return NSDragOperationCopy;
                    });
     cls.addMethod (@selector (draggingUpdated:),
                    [] (id self, SEL, id<NSDraggingInfo> sender) -> NSDragOperation
                    {
                        return [self draggingEntered: sender];
+                   });
+    cls.addMethod (@selector (draggingExited:),
+                   [] (id self, SEL, id<NSDraggingInfo> sender)
+                   {
+                       auto* browser = getIvar<WebBrowserComponent*> (self, "ondaDropOwner");
+                       if (auto* target = dynamic_cast<FileDragAndDropTarget*> (browser))
+                           target->fileDragExit (ondaDraggedFiles (sender));
                    });
     cls.addMethod (@selector (performDragOperation:),
                    [] (id self, SEL, id<NSDraggingInfo> sender) -> BOOL
@@ -36,7 +54,8 @@ static void addOndaFileDropMethods (Class& cls)
                        const auto files = ondaDraggedFiles (sender);
                        if (target == nullptr || !target->isInterestedInFileDrag (files))
                            return NO;
-                       target->filesDropped (files, 0, 0);
+                       const auto point = ondaDragPosition ((NSView*) self, sender);
+                       target->filesDropped (files, point.x, point.y);
                        return YES;
                    });
 }

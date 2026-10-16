@@ -591,11 +591,14 @@ bool exerciseRunViewAdapter() {
   const auto script = onda::plugin::runViewResource("/param-control.js?v=2");
   const auto numberScript =
       onda::plugin::runViewResource("/number-input.js?v=2");
-  if (!root || !index || !script || !numberScript || root->data.size() <= 3U ||
+  const auto buffersScript = onda::plugin::runViewResource("/buffers.js?v=2");
+  if (!root || !index || !script || !numberScript || !buffersScript ||
+      buffersScript->data.size() <= 3U || root->data.size() <= 3U ||
       index->data != root->data ||
       root->mimeType != "text/html; charset=utf-8" ||
       script->mimeType != "text/javascript; charset=utf-8" ||
       numberScript->mimeType != "text/javascript; charset=utf-8" ||
+      buffersScript->mimeType != "text/javascript; charset=utf-8" ||
       root->data[0] != std::byte{0xef} || root->data[1] != std::byte{0xbb} ||
       root->data[2] != std::byte{0xbf} ||
       onda::plugin::runViewResource("/missing.txt")) {

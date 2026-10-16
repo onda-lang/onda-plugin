@@ -37,10 +37,11 @@ elseif(WIN32)
         "#include \"${CMAKE_CURRENT_LIST_DIR}/juce/BrowserFileDrop_windows.h\"\nclass WebBrowserComponent::Impl::Platform::WebView2 final")
     onda_browser_replace("owner.impl->handleNativeEvent (JSON::fromString (*str));"
         [=[{
-                                                             if (*str == "ondaFilesDropped")
-                                                                 ondaWebViewFilesDropped (owner, args);
+                                                             const auto message = JSON::fromString (*str);
+                                                             if (message["type"].toString() == "ondaFilesDropped")
+                                                                 ondaWebViewFilesDropped (owner, args, message);
                                                              else
-                                                                 owner.impl->handleNativeEvent (JSON::fromString (*str));
+                                                                 owner.impl->handleNativeEvent (message);
                                                          }]=])
 else()
     set(onda_browser_symbols [=[
@@ -71,21 +72,38 @@ else()
         "${onda_browser_bindings}makeSymbolBinding (juce_gtk_main,")
     onda_browser_replace("webview = (WebKitWebView*) webviewWidget;"
         "webview = (WebKitWebView*) webviewWidget;\n#include \"${CMAKE_CURRENT_LIST_DIR}/juce/BrowserFileDrop_linux.h\"")
+    onda_browser_replace("int outChannel = 0;"
+        "int outChannel = 0;\n    Point<int> ondaDragPosition;\n    bool ondaDragActive = false, ondaDropping = false;")
     # CommandReceiver sends UTF-8 JSON; String(char*, size) interprets Latin-1.
     # Decode its bytes explicitly so source paths survive the subprocess hop.
     onda_browser_replace("String (buffer.getData(), lengthsBuffer.getJsonLength())"
         "String::fromUTF8 (buffer.getData(), static_cast<int> (lengthsBuffer.getJsonLength()))")
+    # JavaScriptCore also returns UTF-8 for browser-to-native commands.
+    onda_browser_replace("\"invokeCallback\", var (s));"
+        "\"invokeCallback\", var (String::fromUTF8 (s)));")
     onda_browser_replace("if      (cmd == \"pageAboutToLoad\")"
-        [=[if (cmd == "ondaFilesDropped")
+        [=[if (cmd == "ondaFileDrag")
         {
             if (auto* target = dynamic_cast<FileDragAndDropTarget*> (&browser))
             {
                 StringArray files;
-                if (const auto* paths = params.getArray())
+                if (const auto* paths = params["paths"].getArray())
                     for (const auto& path : *paths)
                         files.add (path.toString());
-                if (target->isInterestedInFileDrag (files))
-                    target->filesDropped (files, 0, 0);
+                const auto phase = params["phase"].toString();
+                const auto x = static_cast<int> (params["x"]);
+                const auto y = static_cast<int> (params["y"]);
+                if (phase == "leave")
+                    target->fileDragExit (files);
+                else if (target->isInterestedInFileDrag (files))
+                {
+                    if (phase == "drop")
+                        target->filesDropped (files, x, y);
+                    else
+                        target->fileDragMove (files, x, y);
+                }
+                else
+                    target->fileDragExit (files);
             }
         }
         else if (cmd == "pageAboutToLoad")]=])

@@ -27,6 +27,9 @@ public:
   void paint(juce::Graphics &graphics) override;
   void resized() override;
   bool isInterestedInFileDrag(const juce::StringArray &files) override;
+  void fileDragEnter(const juce::StringArray &files, int x, int y) override;
+  void fileDragMove(const juce::StringArray &files, int x, int y) override;
+  void fileDragExit(const juce::StringArray &files) override;
   void filesDropped(const juce::StringArray &files, int x, int y) override;
 
 private:
@@ -35,6 +38,8 @@ private:
 
   void timerCallback() override;
   void handleCommand(const juce::var &command);
+  void publishFileDrag(const char *phase, const juce::StringArray &files, int x,
+                       int y);
   void endParameterGesture(std::size_t index);
   void publishState(bool force);
   void publishMidiActivity(bool force = false);

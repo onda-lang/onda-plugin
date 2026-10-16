@@ -31,12 +31,16 @@ constexpr auto juceHostBridgeScript = R"JS(
   let hostBlockSamples = 0;
   let eventDefinitions = [];
   let eventGeneration = "0";
+  const isBufferFile = name => window.__ondaBufferFileExtensions.some(
+    extension => name.toLowerCase().endsWith(extension));
 
   // WebView2 preserves native paths when File objects cross as additional
   // objects. Ordinary JSON messages only retain their names and contents.
   const webview = window.chrome?.webview;
   if (typeof webview?.postMessageWithAdditionalObjects === "function") {
-    document.addEventListener("dragover", (event) => {
+    // Run after the buffer view's document handlers so native source/project
+    // drops stay available throughout the editor, including outside cards.
+    window.addEventListener("dragover", (event) => {
       if (!Array.from(event.dataTransfer?.types || []).includes("Files")) return;
       event.preventDefault();
       event.dataTransfer.dropEffect = "copy";
@@ -44,9 +48,13 @@ constexpr auto juceHostBridgeScript = R"JS(
     document.addEventListener("drop", (event) => {
       if (!Array.from(event.dataTransfer?.types || []).includes("Files")) return;
       event.preventDefault();
-      const files = Array.from(event.dataTransfer.files || [])
-        .filter(file => /\.(?:onda|on|ondaproject)$/i.test(file.name));
-      if (files.length) webview.postMessageWithAdditionalObjects("ondaFilesDropped", files);
+      const files = Array.from(event.dataTransfer.files || []);
+      const sources = files.filter(file => /\.(?:onda|on|ondaproject)$/i.test(file.name));
+      const dropped = sources.length ? sources
+        : files.length === 1 && isBufferFile(files[0].name) ? files : [];
+      if (dropped.length) webview.postMessageWithAdditionalObjects(JSON.stringify({
+        type: "ondaFilesDropped", x: event.clientX, y: event.clientY,
+      }), dropped);
     });
   }
 
@@ -122,7 +130,7 @@ constexpr auto juceHostBridgeScript = R"JS(
     });
   }
 
-  window.__hostBridge = { mode: "wry" };
+  window.__hostBridge = { mode: "wry", isBufferFile };
   window.ipc = {
     postMessage(payload) {
       let message;
@@ -308,9 +316,21 @@ bool hasBuffer(const WorkerStatus &status, const std::string_view name) {
       [name](const BufferMapping &buffer) { return buffer.name == name; });
 }
 
+bool isBufferFile(const juce::File &file) {
+  return std::ranges::any_of(
+      supportedAudioFileExtensions(), [&](const auto &extension) {
+        return file.hasFileExtension(juce::String::fromUTF8(extension.c_str()));
+      });
+}
+
 juce::WebBrowserComponent::Options browserOptions() {
   juce::WebBrowserComponent::Options options;
-  options = options.withUserScript(juceHostBridgeScript);
+  juce::Array<juce::var> extensions;
+  for (const auto &extension : supportedAudioFileExtensions())
+    extensions.add(juce::String::fromUTF8(extension.c_str()));
+  options = options.withUserScript("window.__ondaBufferFileExtensions = " +
+                                   juce::JSON::toString(extensions) + ";\n" +
+                                   juceHostBridgeScript);
 #if JUCE_WINDOWS
   const auto dataFolder =
       juce::File::getSpecialLocation(juce::File::userApplicationDataDirectory)
@@ -366,6 +386,18 @@ public:
 
   bool isInterestedInFileDrag(const juce::StringArray &files) override {
     return owner_.isInterestedInFileDrag(files);
+  }
+
+  void fileDragEnter(const juce::StringArray &files, int x, int y) override {
+    owner_.fileDragEnter(files, x, y);
+  }
+
+  void fileDragMove(const juce::StringArray &files, int x, int y) override {
+    owner_.fileDragMove(files, x, y);
+  }
+
+  void fileDragExit(const juce::StringArray &files) override {
+    owner_.fileDragExit(files);
   }
 
   void filesDropped(const juce::StringArray &files, int x, int y) override {
@@ -430,23 +462,61 @@ void Editor::paint(juce::Graphics &graphics) {
 }
 
 bool Editor::isInterestedInFileDrag(const juce::StringArray &files) {
-  return std::any_of(files.begin(), files.end(), [](const auto &path) {
-    return juce::File::isAbsolutePath(path) &&
-           juce::File(path).hasFileExtension("onda;on;ondaproject");
-  });
+  if (std::any_of(files.begin(), files.end(), [](const auto &path) {
+        return juce::File::isAbsolutePath(path) &&
+               juce::File(path).hasFileExtension("onda;on;ondaproject");
+      }))
+    return true;
+  return files.size() == 1 && juce::File::isAbsolutePath(files[0]) &&
+         isBufferFile(juce::File(files[0])) &&
+         !processor_.workerStatus().bufferChoices().empty();
 }
 
-void Editor::filesDropped(const juce::StringArray &files, int, int) {
+void Editor::publishFileDrag(const char *phase, const juce::StringArray &files,
+                             const int x, const int y) {
+  if (!browserReady_)
+    return;
+  juce::var message{new juce::DynamicObject};
+  auto &object = *message.getDynamicObject();
+  object.setProperty("type", "bufferFileDrag");
+  object.setProperty("phase", phase);
+  juce::Array<juce::var> paths;
+  for (const auto &path : files)
+    paths.add(path);
+  object.setProperty("paths", std::move(paths));
+  juce::var position{new juce::DynamicObject};
+  position.getDynamicObject()->setProperty("x", x);
+  position.getDynamicObject()->setProperty("y", y);
+  object.setProperty("position", std::move(position));
+  browser_->emitEventIfBrowserIsVisible("ondaState", std::move(message));
+}
+
+void Editor::fileDragEnter(const juce::StringArray &files, int x, int y) {
+  publishFileDrag("enter", files, x, y);
+}
+
+void Editor::fileDragMove(const juce::StringArray &files, int x, int y) {
+  publishFileDrag("over", files, x, y);
+}
+
+void Editor::fileDragExit(const juce::StringArray &files) {
+  publishFileDrag("leave", files, 0, 0);
+}
+
+void Editor::filesDropped(const juce::StringArray &files, int x, int y) {
+  fileDragExit(files);
   for (const auto &path : files) {
-    if (!isInterestedInFileDrag({path}))
+    if (!juce::File::isAbsolutePath(path))
       continue;
     const juce::File file(path);
-    if (!file.existsAsFile())
+    if (!file.hasFileExtension("onda;on;ondaproject") || !file.existsAsFile())
       continue;
     actionError_.clear();
     processor_.loadFile(file, true);
     return;
   }
+  if (isInterestedInFileDrag(files))
+    publishFileDrag("drop", files, x, y);
 }
 
 void Editor::resized() {
@@ -749,6 +819,17 @@ void Editor::handleCommand(const juce::var &command) {
             safe->processor_.bindBufferFile(name, file);
           safe->fileChooser_.reset();
         });
+  } else if (type == "bindBufferFile") {
+    const auto name = input->getProperty("name").toString().toStdString();
+    const auto path = input->getProperty("filePath");
+    if (!hasBuffer(processor_.workerStatus(), name) || !path.isString() ||
+        !juce::File::isAbsolutePath(path.toString()))
+      return;
+    const juce::File file{path.toString()};
+    if (isBufferFile(file) && file.existsAsFile()) {
+      actionError_.clear();
+      processor_.bindBufferFile(name, file);
+    }
   } else if (type == "clearBuffer") {
     const auto name = input->getProperty("name").toString().toStdString();
     if (hasBuffer(processor_.workerStatus(), name))

@@ -54,6 +54,8 @@ struct AudioFileResult {
 
 [[nodiscard]] AudioFileResult
 decodeAudioFile(const std::filesystem::path &path);
+// Lowercase filename suffixes, including the leading dot.
+[[nodiscard]] const std::vector<std::string> &supportedAudioFileExtensions();
 [[nodiscard]] std::string supportedAudioFileWildcard();
 
 } // namespace onda::plugin

@@ -19,6 +19,8 @@ const sampleRate = { closest() { return sampleRateRow; } };
 const runSettings = { style: {} };
 const blockSelect = { replaceChildren(...options) { this.options = options; } };
 const window = {
+  __ondaBufferFileExtensions: [".wav", ".aif", ".aiff", ".flac", ".ogg", ".ondabuffer"],
+  addEventListener(type, callback) { documentListeners.set(type, callback); },
   chrome: { webview: {
     postMessageWithAdditionalObjects(message, files) {
       nativeDrops.push({ message, files });
@@ -78,12 +80,23 @@ assert.equal(transfer.dropEffect, "copy");
 drop(event);
 assert.equal(prevented, 2);
 assert.equal(nativeDrops.length, 1);
-assert.equal(nativeDrops[0].message, "ondaFilesDropped");
+assert.deepEqual(JSON.parse(nativeDrops[0].message), { type: "ondaFilesDropped" });
 assert.deepEqual(Array.from(nativeDrops[0].files), transfer.files.slice(1));
 assert.equal(nativeDrops[0].files[0], transfer.files[1], "Keep native File identity");
 dragOver({ dataTransfer: { types: ["text/plain"] }, preventDefault() { assert.fail("Text is not a file drag"); } });
 drop({ dataTransfer: { types: ["Files"], files: [{ name: "ignore.txt" }] }, preventDefault() {} });
 assert.equal(nativeDrops.length, 1, "Ignore unsupported files");
+for (const extension of window.__ondaBufferFileExtensions) {
+  const audio = { name: "clip" + extension.toUpperCase() };
+  drop({ dataTransfer: { types: ["Files"], files: [audio] }, clientX: 123, clientY: 234,
+    preventDefault() {} });
+  assert.deepEqual(JSON.parse(nativeDrops.at(-1).message),
+    { type: "ondaFilesDropped", x: 123, y: 234 });
+  assert.equal(nativeDrops.at(-1).files[0], audio);
+  const count = nativeDrops.length;
+  drop({ dataTransfer: { types: ["Files"], files: [audio, audio] }, preventDefault() {} });
+  assert.equal(nativeDrops.length, count, "Buffer drops require exactly one file");
+}
 documentReady();
 assert.equal(smoothingAttributes["aria-label"], "Editor parameter smoothing duration in milliseconds");
 assert.match(smoothingAttributes.title, /DAW automation updates at block boundaries/);

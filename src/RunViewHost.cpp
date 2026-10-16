@@ -91,6 +91,10 @@ void appendRuntimeLog(juce::var &state, const RuntimeLogSnapshot &runtimeLog) {
 
 std::optional<Resource> runViewResource(const juce::String &request) {
   const auto path = request.upToFirstOccurrenceOf("?", false, false);
+  if (path == "/buffers.js")
+    return utf8Resource(OndaRunResources::buffers_js,
+                        OndaRunResources::buffers_jsSize,
+                        "text/javascript; charset=utf-8");
   if (path == "/" || path == "/index.html") {
     return utf8Resource(OndaRunResources::run_html,
                         OndaRunResources::run_htmlSize,

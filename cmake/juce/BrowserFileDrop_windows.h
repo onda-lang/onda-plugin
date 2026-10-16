@@ -1,7 +1,8 @@
 // WebView2's supported File-object bridge retains the original absolute paths.
 // https://learn.microsoft.com/microsoft-edge/webview2/reference/win32/icorewebview2webmessagereceivedeventargs2
 static void ondaWebViewFilesDropped (WebBrowserComponent& browser,
-                                    ICoreWebView2WebMessageReceivedEventArgs* args)
+                                    ICoreWebView2WebMessageReceivedEventArgs* args,
+                                    const var& message)
 {
     auto* target = dynamic_cast<FileDragAndDropTarget*> (&browser);
     if (target == nullptr)
@@ -38,5 +39,6 @@ static void ondaWebViewFilesDropped (WebBrowserComponent& browser,
             files.add (String (path));
     }
     if (target->isInterestedInFileDrag (files))
-        target->filesDropped (files, 0, 0);
+        target->filesDropped (files, static_cast<int> (message["x"]),
+                              static_cast<int> (message["y"]));
 }

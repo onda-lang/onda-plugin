@@ -34,8 +34,8 @@ Window findDropWindow(Display *display, Window window, Atom aware) {
 
 } // namespace
 
-bool dropNativeFile(juce::WebBrowserComponent &browser,
-                    const juce::File &file) {
+bool dropNativeFile(juce::WebBrowserComponent &browser, const juce::File &file,
+                    juce::Point<int> clientPosition) {
   const std::unique_ptr<Display, decltype(&XCloseDisplay)> display{
       XOpenDisplay(nullptr), XCloseDisplay};
   if (!display || !browser.getPeer())
@@ -75,7 +75,7 @@ bool dropNativeFile(juce::WebBrowserComponent &browser,
     XSendEvent(d, target, False, NoEventMask, &event);
     XFlush(d);
   };
-  const auto position = browser.localPointToGlobal(juce::Point<int>{20, 20});
+  const auto position = browser.localPointToGlobal(clientPosition);
   send(atom("XdndEnter"), 5L << 24, static_cast<long>(uriType), 0, 0);
   send(atom("XdndPosition"), 0,
        (static_cast<long>(position.x) << 16) | position.y, CurrentTime,

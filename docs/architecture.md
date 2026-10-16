@@ -187,12 +187,20 @@ bytes and capability state are tested directly through `RunViewHost`.
 The editor accepts native source/project drops and keeps their original paths
 for imports and live reload. Build copies of JUCE forward macOS webview drops
 and GTK subprocess drops to the browser's `FileDragAndDropTarget`. The GTK IPC
-decoder reads UTF-8 explicitly so filenames survive the subprocess boundary.
+decoder and JavaScriptCore callbacks read UTF-8 explicitly so filenames survive
+both directions of the subprocess boundary.
 Windows accepts DOM file drops through WebView2's additional-object messages,
 then reads their native `ICoreWebView2File` paths. Its native test drives a real
 OLE drop through the browser rather than calling the editor's handler directly.
-The shared run view and number widget are embedded directly from the pinned
-Onda release sources; their fixes and behavior live upstream. Host publications
+Native drag positions and paths reach the shared buffer view as `bufferFileDrag`
+messages. It highlights the card under the cursor and emits `bindBufferFile`
+on a single supported audio or `.ondabuffer` drop. The editor validates the
+named buffer and absolute file path before using the same binding path as the
+file picker. Both use extensions from the registered audio decoders. A build
+adaptation makes the pinned buffer view delegate its format policy to the host,
+which receives that same extension list from native code.
+The shared run view, buffer cards, and number widget are embedded directly from
+the pinned Onda release sources; their fixes and behavior live upstream. Host publications
 and unedited blur retain plain values without applying the editor's range or
 step grid. Exact `i64` defaults cross
 the bridge as decimal text, preserving all 64 bits through display and focus.

@@ -50,8 +50,8 @@ private:
 
 } // namespace
 
-bool dropNativeFile(juce::WebBrowserComponent &browser,
-                    const juce::File &file) {
+bool dropNativeFile(juce::WebBrowserComponent &browser, const juce::File &file,
+                    juce::Point<int> clientPosition) {
   using Microsoft::WRL::ComPtr;
   ComPtr<IShellItem> item;
   const auto path = file.getFullPathName();
@@ -67,18 +67,18 @@ bool dropNativeFile(juce::WebBrowserComponent &browser,
                                   IID_PPV_ARGS(data.GetAddressOf()))))
     return false;
 
-  RECT bounds{};
   const auto *peer = browser.getPeer();
-  if (!peer ||
-      !GetWindowRect(static_cast<HWND>(peer->getNativeHandle()), &bounds))
+  if (!peer)
     return false;
   POINT original{};
   if (!GetCursorPos(&original))
     return false;
   const juce::ScopeGuard restoreCursor{
       [&] { SetCursorPos(original.x, original.y); }};
-  const POINT position{bounds.left + (bounds.right - bounds.left) / 2,
-                       bounds.top + (bounds.bottom - bounds.top) / 2};
+  const auto screen =
+      juce::Desktop::getInstance().getDisplays().logicalToPhysical(
+          browser.localPointToGlobal(clientPosition));
+  const POINT position{screen.x, screen.y};
   if (!SetCursorPos(position.x, position.y))
     return false;
   auto source = Microsoft::WRL::Make<FileDragSource>(position);

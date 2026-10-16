@@ -129,7 +129,7 @@ native file drop and edits its parameter in the real webview.
 | `onda_plugin_tests` | SDK ownership, DSP and MIDI behavior, buffer decoding, portable checkpoints, project export, worker replacement, file watching, and compiler serialization. Extended watcher permutations run separately. |
 | `onda_buffer_cache_tests` | Source/import edits before buffer binding or clearing, and shared buffer-file edits before rebinding. Uses real preparation and DSP with native notifications withheld to make cache invalidation races deterministic, including edits with unchanged size and modification time. |
 | `onda_processor_tests` | Host preparation, state persistence, defaults and automation, block-rate parameter smoothing, notifications, failure recovery, realtime callbacks, logs, scope/event adapters, editor lifecycle, and concurrent instances. |
-| `onda_native_editor_tests` | Both products: actual native browser handshake, visible file picker on fresh startup, visible checkbox edits reaching DSP, retained state on reopening, and exported `IPlugView` platform support, attachment and removal. |
+| `onda_native_editor_tests` | Both products: actual native browser handshake, visible file picker on fresh startup, visible checkbox edits reaching DSP, retained state on reopening, native WAV, AIFF, FLAC, Ogg Vorbis and typed buffer drops reaching the selected card and DSP, and exported `IPlugView` platform support, attachment and removal. |
 | `onda_vst3_smoke` | Built bundles expose expected metadata and parameters, instantiate independently, render through JUCE's VST3 host, and restore a saved program with imports after deleting its original files. Bundle lookup also exercises the Windows layout on other platforms. |
 | `onda_vst3_realtime_audit_tests` | Linux auditor startup, plugin loading, positive allocation/free/mutex detection, allocator semantics, callback budgets, and independent concurrent audit intervals. |
 | `onda_vst3_realtime` | The exported VST3 behavior checks with Linux allocation and mutex interception enabled, after the auditor's own tests pass. |
@@ -138,7 +138,9 @@ native file drop and edits its parameter in the real webview.
 | VST3 validators | Steinberg's interface/protocol checks for both products. These complement the behavior checked by the smoke host. |
 
 Run bridge tests directly with `node tests/EditorBridgeTests.mjs`. The
-`EditorGestureCancellation` processor case checks the native command against
+browser suite also checks buffer-card highlighting, cancellation, selection,
+invalid drops, and WebView2 file identity and cursor coordinates.
+The `EditorGestureCancellation` processor case checks the native command against
 JUCE's actual value and gesture notifications, including cancellation after a
 newer host automation value.
 `StaleEditorEvents` checks that same-name events with a replacement schema

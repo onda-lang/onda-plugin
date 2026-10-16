@@ -4,11 +4,15 @@
 
 @interface OndaFileDropTestInfo : NSObject
 @property(nonatomic, retain) NSPasteboard *pasteboard;
+@property(nonatomic) NSPoint location;
 @end
 
 @implementation OndaFileDropTestInfo
 - (NSPasteboard *)draggingPasteboard {
   return self.pasteboard;
+}
+- (NSPoint)draggingLocation {
+  return self.location;
 }
 - (void)dealloc {
   [_pasteboard release];
@@ -27,8 +31,8 @@ NSView *findNativeView(juce::Component &component) {
 }
 } // namespace
 
-bool dropNativeFile(juce::WebBrowserComponent &browser,
-                    const juce::File &file) {
+bool dropNativeFile(juce::WebBrowserComponent &browser, const juce::File &file,
+                    juce::Point<int> position) {
   @autoreleasepool {
     auto *view = findNativeView(browser);
     if (!view)
@@ -39,6 +43,9 @@ bool dropNativeFile(juce::WebBrowserComponent &browser,
     [pasteboard writeObjects:@[ [NSURL fileURLWithPath:path] ]];
     auto *info = [[OndaFileDropTestInfo alloc] init];
     info.pasteboard = pasteboard;
+    const auto y =
+        [view isFlipped] ? position.y : [view bounds].size.height - position.y;
+    info.location = [view convertPoint:NSMakePoint(position.x, y) toView:nil];
     id<NSDraggingInfo> sender = (id<NSDraggingInfo>)info;
     const auto accepted =
         [view draggingEntered:sender] == NSDragOperationCopy &&

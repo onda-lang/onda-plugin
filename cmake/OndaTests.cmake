@@ -14,7 +14,8 @@ if(ONDA_PLUGIN_BUILD_BROWSER_TESTS)
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/RunViewParameterTests.mjs"
         "${ONDA_RELEASE_SOURCE_DIR}/ui/run/run.html"
         "${ONDA_RELEASE_SOURCE_DIR}/ui/number-input.js"
-        "${ONDA_RELEASE_SOURCE_DIR}/packages/onda_processor_abi/src/param-control.js")
+        "${ONDA_RELEASE_SOURCE_DIR}/packages/onda_processor_abi/src/param-control.js"
+        "${onda_buffers_script}")
 endif()
 
 add_executable(onda_example_tests tests/ExampleTests.cpp)

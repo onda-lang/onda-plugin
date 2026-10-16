@@ -91,7 +91,9 @@ to set the values covered by automation, which maps linearly to that range.
 
 ## Audio buffers
 
-Bind audio files to named buffers in the editor. Supported formats include WAV,
+Drop a single supported audio or `.ondabuffer` file onto a buffer card to bind
+or replace its contents. The target card highlights during the drag. **Bind** and
+**Replace** also open a file picker. Supported formats include WAV,
 AIFF, FLAC, and Ogg Vorbis through JUCE's audio decoders, producing `f32` samples.
 Typed `.ondabuffer` assets preserve `bool`, `i32`, `i64`, `f32`, or `f64` elements,
 including tables. File bindings must be read-only and match the declaration's
