@@ -13,6 +13,7 @@ struct Case {
   std::string_view name;
   bool (*run)();
   std::string_view group{"core"};
+  std::string_view skipReason{};
 };
 
 inline void reportException() noexcept {
@@ -51,6 +52,11 @@ inline int runCases(const int argc, const char *const *argv,
         (argc == 2 && testCase.name != argv[1]))
       continue;
     selected = true;
+    if (!testCase.skipReason.empty()) {
+      std::cout << "[  SKIPPED ] " << testCase.name << ": "
+                << testCase.skipReason << std::endl;
+      continue;
+    }
     // Flush before entering native code, including code that can abort.
     std::cout << "[ RUN      ] " << testCase.name << std::endl;
     bool passed{};

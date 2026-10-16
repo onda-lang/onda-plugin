@@ -13,6 +13,13 @@ assert.ok(bridge, "Could not locate the editor's injected host bridge");
 // Use the shipped view and bridge. Only the native transport is replaced.
 const transport = `
 window.__parameterCommands = [];
+window.__droppedFiles = [];
+window.chrome ??= {};
+window.chrome.webview = {
+  postMessageWithAdditionalObjects: (message, files) => {
+    window.__droppedFiles.push({ message, files });
+  },
+};
 window.__JUCE__ = { backend: {
   emitEvent: (_name, value) => window.__parameterCommands.push(value),
   addEventListener: (_name, receive) => { window.__receiveParameters = receive; },
@@ -135,6 +142,48 @@ try {
   page.on("pageerror", error => errors.push(String(error)));
   await page.goto(`http://127.0.0.1:${server.address().port}/`);
   await page.bringToFront();
+  const dropped = await page.evaluate(() => {
+    const transfer = new DataTransfer();
+    transfer.items.add(new File([""], "ignore.txt"));
+    const file = new File(["outs { out1 }"], "patch.onda");
+    transfer.items.add(file);
+    const enter = new DragEvent("dragover", { dataTransfer: transfer, cancelable: true, bubbles: true });
+    const drop = new DragEvent("drop", { dataTransfer: transfer, cancelable: true, bubbles: true });
+    document.body.dispatchEvent(enter);
+    document.body.dispatchEvent(drop);
+    return { accepted: enter.defaultPrevented, handled: drop.defaultPrevented,
+      count: window.__droppedFiles.length,
+      message: window.__droppedFiles[0]?.message,
+      names: window.__droppedFiles[0]?.files.map(file => file.name),
+      nativeFile: window.__droppedFiles[0]?.files[0] instanceof File,
+      sameFile: window.__droppedFiles[0]?.files[0] === transfer.files[1] };
+  });
+  assert.deepEqual(dropped, { accepted: true, handled: true, count: 1,
+    message: "ondaFilesDropped", names: ["patch.onda"], nativeFile: true, sameFile: true });
+  await page.evaluate(() => window.__receiveParameters({ type: "state", state: {
+    supportsFastMath: true, fastMath: false, supportsSourceSelection: true,
+    supportsRunSettings: true, path: "", hostBlockSamples: 64,
+    canSetBlockSize: true,
+  } }));
+  assert.equal(await page.locator("#run-fast-math").isVisible(), true);
+  const spacing = await page.evaluate(() => {
+    const settings = document.querySelector("#file-picker-settings").getBoundingClientRect();
+    const block = document.querySelector("#run-block-size").getBoundingClientRect();
+    const fastMath = document.querySelector("#file-picker-fast-math").getBoundingClientRect();
+    return { unusedWidth: settings.width - block.width, gap: fastMath.left - block.right };
+  });
+  assert.ok(Math.abs(spacing.unusedWidth) <= 1,
+    `Block settings leave ${spacing.unusedWidth}px of unused space`);
+  assert.ok(Math.abs(spacing.gap - 10) <= 1,
+    `Block size and Fast Math must have the shared 10px gap, got ${spacing.gap}px`);
+  assert.equal(await page.locator("#run-fast-math").isChecked(), false);
+  await page.locator("#run-fast-math").check();
+  assert.deepEqual(await page.evaluate(() => window.__parameterCommands.at(-1)),
+    { type: "setFastMath", enabled: true });
+  await page.evaluate(() => window.__receiveParameters({ type: "state", state: {
+    fastMath: true,
+  } }));
+  assert.equal(await page.locator("#run-fast-math").isChecked(), true);
   const result = await page.evaluate(checks);
   assert.equal(result.error, undefined, result.stack ?? result.error);
   assert.equal(result.ok, true);
@@ -144,6 +193,31 @@ try {
   await decimal.press("ArrowUp");
   await decimal.press("Enter");
   assert.equal(await decimal.inputValue(), "0.6251", "Arrow edits must retain numeric step behavior");
+  await page.evaluate(() => window.__receiveParameters({ type: "state", state: {
+    buffers: [{ name: "clip", type: "buffer<f32[2]>", channelsKind: "static",
+      channelsStatic: 2, loadedPath: "clip.wav", loadedFrames: 257,
+      loadedChannels: 2, loadedSampleRate: 48000,
+      waveform: { minValue: -0.75, maxValue: 0.5,
+        minimums: [-0.75, -0.25, 0], maximums: [0.5, 0.25, 0] } }],
+  } }));
+  const preview = page.locator(".buffer-waveform canvas");
+  await preview.scrollIntoViewIfNeeded();
+  assert.equal(await preview.isVisible(), true, "Loaded buffers must show a waveform");
+  assert.match(await preview.getAttribute("aria-label"), /Minimum: .0.75\nMaximum: 0.5/);
+  const painted = await preview.evaluate(canvas => {
+    const pixels = canvas.getContext("2d").getImageData(0, 0, canvas.width, canvas.height).data;
+    return pixels.some((value, index) => index % 4 === 3 && value > 0);
+  });
+  assert.equal(painted, true, "Waveform canvas must contain painted pixels");
+  await page.getByRole("button", { name: "Clear", exact: true }).click();
+  assert.ok(await page.evaluate(() => window.__parameterCommands.some(command =>
+    command.type === "clearBuffer" && command.name === "clip")));
+  await page.evaluate(() => window.__receiveParameters({ type: "state", state: {
+    buffers: [{ name: "clip", type: "buffer<f32[2]>", channelsKind: "static",
+      channelsStatic: 2, loadedFrames: null, loadedChannels: null, waveform: null }],
+  } }));
+  assert.equal(await preview.count(), 0, "Cleared buffers must remove their waveform");
+  await page.evaluate(() => window.__receiveParameters({ type: "state", state: { buffers: [] } }));
   const capabilities = await page.evaluate(() => {
     window.__receiveParameters({ type: "state", state: {
       supportsViewState: true,
@@ -249,6 +323,29 @@ try {
     "Loaded controls must render without popover support");
   assert.equal(await page.locator("#settings-popover").isVisible(), false,
     "Loaded editors must not show an empty floating device panel");
+  for (const layout of ["sliders", "knobs"]) {
+    await page.evaluate(layout => window.__receiveParameters({ type: "state", state: {
+      paramLayout: layout,
+      params: [0, 1].map(index => ({
+        name: "Slot " + (index + 1) + " -> levels[" + index + "]",
+        label: "levels[" + index + "]", type: "f32", scalar: true,
+        array: { name: "levels", length: 4, index },
+        hostValueDomain: "normalized", normalizedValue: 0.25, value: 0.25, default: 0.25,
+        rangeMin: 0, rangeMax: 1, scale: "linear", curve: null, unit: "",
+        step: null, stepCount: null,
+      })),
+    } }), layout);
+    assert.equal(await page.locator("#params .param-array-heading").textContent(), "levels [4]");
+    const elements = page.locator("#params .param-array .param-number");
+    assert.equal(await elements.count(), 2, "Only exposed array elements must render");
+    await elements.nth(1).focus();
+    await elements.nth(1).fill("0.75");
+    await elements.nth(1).press("Enter");
+    const command = await page.evaluate(() => window.__parameterCommands
+      .filter(command => command.type === "setParam").at(-1));
+    assert.equal(command.name, "Slot 2 -> levels[1]", "Array edits must address the scalar host slot");
+    assert.equal(command.value, 0.75);
+  }
   assert.deepEqual(errors, [], "Unsupported popovers must not interrupt the editor");
   console.log("Run view defaults, editing, log, MIDI monitor and scroll restoration passed");
 } catch (error) {

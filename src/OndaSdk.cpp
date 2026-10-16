@@ -2,10 +2,16 @@
 
 #include "ProjectPath.h"
 
+#include <algorithm>
+#include <charconv>
+#include <juce_core/juce_core.h>
+
 #include <cmath>
 #include <cstring>
 #include <fstream>
 #include <limits>
+#include <optional>
+#include <string_view>
 #include <system_error>
 
 namespace onda::plugin {
@@ -50,9 +56,10 @@ copyWatchPaths(const onda_source_manifest_t *manifest) {
 }
 
 onda_compile_options_t compileOptions(const double sampleRate,
-                                      const int blockSize) {
+                                      const int blockSize,
+                                      const bool fastMath) {
   return {
-      .fast_math = 0,
+      .fast_math = fastMath ? 1 : 0,
       .sample_rate = static_cast<float>(sampleRate),
       .block_size = blockSize,
       .const_inputs = nullptr,
@@ -153,6 +160,48 @@ rawBufferAssets(const std::span<const ProjectBufferAsset> buffers) {
     });
   }
   return result;
+}
+
+// Locate the SDK-generated root buffers object without decoding other fields.
+// JUCE's JSON number parser truncates small decimal constants; those bytes must
+// remain opaque when changing buffer bindings. Strings may contain any braces.
+std::optional<std::pair<std::size_t, std::size_t>>
+bufferBindingsRange(const std::string_view json) {
+  int depth{};
+  bool quoted{}, escaped{};
+  std::size_t stringStart{};
+  std::optional<std::size_t> objectStart;
+  for (std::size_t index = 0; index < json.size(); ++index) {
+    const auto character = json[index];
+    if (quoted) {
+      if (escaped) {
+        escaped = false;
+      } else if (character == '\\') {
+        escaped = true;
+      } else if (character == '"') {
+        quoted = false;
+        if (depth == 1 && json.substr(stringStart, index - stringStart + 1) ==
+                              "\"buffers\"") {
+          auto next = json.find_first_not_of(" \t\r\n", index + 1);
+          if (next != std::string_view::npos && json[next] == ':') {
+            next = json.find_first_not_of(" \t\r\n", next + 1);
+            if (next != std::string_view::npos && json[next] == '{')
+              objectStart = next;
+          }
+        }
+      }
+    } else if (character == '"') {
+      quoted = true;
+      stringStart = index;
+    } else if (character == '{' || character == '[') {
+      ++depth;
+    } else if (character == '}' || character == ']') {
+      --depth;
+      if (objectStart && index >= *objectStart && depth == 1)
+        return std::pair{*objectStart, index + 1};
+    }
+  }
+  return std::nullopt;
 }
 
 ProjectImage loadFilesystemProjectImage(
@@ -289,7 +338,8 @@ Diagnostic OndaDiagnostic::copy() const {
 }
 
 CompileResult compileFile(const std::filesystem::path &path,
-                          const double sampleRate, const int blockSize) {
+                          const double sampleRate, const int blockSize,
+                          const bool fastMath) {
   if (!validCompileConfiguration(sampleRate, blockSize)) {
     CompileResult result;
     result.diagnostic.message = "Invalid host sample rate or block size";
@@ -297,14 +347,18 @@ CompileResult compileFile(const std::filesystem::path &path,
   }
 
   const auto nativePath = pathString(path);
-  const auto options = compileOptions(sampleRate, blockSize);
+  const auto options = compileOptions(sampleRate, blockSize, fastMath);
   onda_source_manifest_t *rawManifest{};
   OndaDiagnostic rawDiagnostic;
   ProgramHandle program{onda_compile_file(nativePath.c_str(), &options,
                                           &rawManifest,
-                                          rawDiagnostic.outParameter())};
+                                          rawDiagnostic.outParameter()),
+                        ProgramDeleter{}};
   ManifestHandle manifest{rawManifest};
   CompileResult result{
+      .sampleRate = sampleRate,
+      .blockSize = blockSize,
+      .fastMath = fastMath,
       .program = std::move(program),
       .manifest = std::move(manifest),
       .watchPaths = copyWatchPaths(rawManifest),
@@ -318,13 +372,22 @@ CompileResult compileFile(const std::filesystem::path &path,
     if (!result.projectImage.valid())
       result.program.reset();
   }
+  if (result.program && !result.projectImage.valid()) {
+    result.projectImage =
+        captureProjectImage(path, result.manifest.get(), {}, result.diagnostic);
+    if (!result.projectImage.valid())
+      result.program.reset();
+  }
   return result;
 }
 
 CompileResult compileProjectImage(const ProjectImage &image,
-                                  const double sampleRate,
-                                  const int blockSize) {
+                                  const double sampleRate, const int blockSize,
+                                  const bool fastMath) {
   CompileResult result;
+  result.sampleRate = sampleRate;
+  result.blockSize = blockSize;
+  result.fastMath = fastMath;
   result.projectImage = image;
   if (!validCompileConfiguration(sampleRate, blockSize)) {
     result.diagnostic.message = "Invalid host sample rate or block size";
@@ -338,10 +401,12 @@ CompileResult compileProjectImage(const ProjectImage &image,
   if (!result.diagnostic.empty())
     return result;
 
-  const auto options = compileOptions(sampleRate, blockSize);
+  const auto options = compileOptions(sampleRate, blockSize, fastMath);
   OndaDiagnostic rawDiagnostic;
-  result.program.reset(onda_project_image_compile(
-      handle.get(), &options, rawDiagnostic.outParameter()));
+  result.program =
+      ProgramHandle{onda_project_image_compile(handle.get(), &options,
+                                               rawDiagnostic.outParameter()),
+                    ProgramDeleter{}};
   result.diagnostic = rawDiagnostic.copy();
   return result;
 }
@@ -450,21 +515,88 @@ bool visitMaterializedProjectFiles(const ProjectImage &image,
   return true;
 }
 
+ProjectImage withoutProjectBuffers(const ProjectImage &image,
+                                   const std::span<const std::string> names,
+                                   Diagnostic &diagnostic) {
+  if (names.empty())
+    return image;
+  // Edit the SDK's public materialization manifest, then let the SDK rebuild
+  // and validate the image. The original image and its defaults stay immutable.
+  std::vector<StoredProjectFile> files;
+  if (!visitMaterializedProjectFiles(
+          image, diagnostic, [&](MaterializedProjectFile &&file) {
+            files.push_back(
+                {pathString(file.relativePath), std::move(file.bytes)});
+            return true;
+          }))
+    return {};
+  const auto manifest =
+      std::ranges::find(files, "project.ondaproject", &StoredProjectFile::path);
+  if (manifest == files.end()) {
+    diagnostic.message = "Onda export omitted the project manifest";
+    return {};
+  }
+  const std::string original(manifest->bytes.begin(), manifest->bytes.end());
+  const auto range = bufferBindingsRange(original);
+  if (!range)
+    return image; // The image already has no asset bindings.
+  auto bindings = juce::JSON::parse(
+      juce::String::fromUTF8(original.data() + range->first,
+                             static_cast<int>(range->second - range->first)));
+  if (auto *object = bindings.getDynamicObject()) {
+    for (const auto &name : names) {
+      const auto bracket = name.find('[');
+      if (bracket == std::string::npos) {
+        object->removeProperty(
+            juce::Identifier{juce::String::fromUTF8(name.c_str())});
+      } else if (name.back() == ']') {
+        int index{};
+        const auto end = name.data() + name.size() - 1;
+        const auto parsed =
+            std::from_chars(name.data() + bracket + 1, end, index);
+        auto elements = object->getProperty(juce::Identifier{
+            juce::String::fromUTF8(name.substr(0, bracket).c_str())});
+        if (parsed.ec == std::errc{} && parsed.ptr == end && index >= 0 &&
+            elements.isArray() && index < elements.size())
+          elements.getArray()->set(index, juce::var{});
+      }
+    }
+  }
+  auto updatedManifest = original;
+  updatedManifest.replace(range->first, range->second - range->first,
+                          juce::JSON::toString(bindings).toStdString());
+  manifest->bytes.assign(updatedManifest.begin(), updatedManifest.end());
+  std::vector<onda_project_file_t> raw;
+  raw.reserve(files.size());
+  for (const auto &file : files)
+    raw.push_back({file.path.c_str(), file.bytes.data(), file.bytes.size()});
+  OndaDiagnostic rawDiagnostic;
+  ProjectImageHandle updated{onda_project_image_load_files(
+      raw.data(), raw.size(), "project.ondaproject",
+      rawDiagnostic.outParameter())};
+  diagnostic = rawDiagnostic.copy();
+  if (!updated) {
+    if (diagnostic.empty())
+      diagnostic.message = "Onda could not clear the project buffer bindings";
+    return {};
+  }
+  return serialize(updated.get(), diagnostic);
+}
+
 std::vector<std::uint8_t>
-encodeF32BufferAsset(const std::span<const float> samples, const int frames,
-                     const int channels, const float sampleRate,
-                     Diagnostic &diagnostic) {
+encodeBufferAsset(const int elementType,
+                  const std::span<const std::byte> samples, const int frames,
+                  const int channels, const float sampleRate,
+                  Diagnostic &diagnostic) {
   if (frames <= 0 || channels <= 0 || !std::isfinite(sampleRate) ||
-      sampleRate <= 0.0F ||
-      samples.size() != static_cast<std::size_t>(frames) *
-                            static_cast<std::size_t>(channels)) {
+      sampleRate <= 0.0F) {
     diagnostic.message = "Cannot encode invalid audio buffer dimensions";
     return {};
   }
   OndaDiagnostic rawDiagnostic;
   const auto sampleBytes = samples.size_bytes();
   const auto required = onda_buffer_asset_encode(
-      ONDA_PRIMITIVE_F32, static_cast<std::uint32_t>(frames),
+      elementType, static_cast<std::uint32_t>(frames),
       static_cast<std::uint32_t>(channels), sampleRate, samples.data(),
       sampleBytes, nullptr, 0, rawDiagnostic.outParameter());
   diagnostic = rawDiagnostic.copy();
@@ -476,7 +608,7 @@ encodeF32BufferAsset(const std::span<const float> samples, const int frames,
   }
   std::vector<std::uint8_t> bytes(static_cast<std::size_t>(required));
   const auto written = onda_buffer_asset_encode(
-      ONDA_PRIMITIVE_F32, static_cast<std::uint32_t>(frames),
+      elementType, static_cast<std::uint32_t>(frames),
       static_cast<std::uint32_t>(channels), sampleRate, samples.data(),
       sampleBytes, bytes.data(), bytes.size(), rawDiagnostic.outParameter());
   diagnostic = rawDiagnostic.copy();
@@ -487,6 +619,14 @@ encodeF32BufferAsset(const std::span<const float> samples, const int frames,
   }
   diagnostic = {};
   return bytes;
+}
+
+std::vector<std::uint8_t> encodeF32BufferAsset(std::span<const float> samples,
+                                               int frames, int channels,
+                                               float sampleRate,
+                                               Diagnostic &diagnostic) {
+  return encodeBufferAsset(ONDA_PRIMITIVE_F32, std::as_bytes(samples), frames,
+                           channels, sampleRate, diagnostic);
 }
 
 } // namespace onda::plugin

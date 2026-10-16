@@ -16,7 +16,11 @@
 
 namespace onda::plugin {
 
-inline constexpr std::size_t slotCount = 32U;
+#ifndef ONDA_PLUGIN_PARAMETER_SLOTS
+#error "ONDA_PLUGIN_PARAMETER_SLOTS must be defined by the build system"
+#endif
+inline constexpr std::size_t slotCount = ONDA_PLUGIN_PARAMETER_SLOTS;
+static_assert(slotCount >= 1U && slotCount <= 64U);
 enum class ParameterReset { all, parameters, controls };
 using ParameterValues = std::array<ScalarValue, slotCount>;
 
@@ -247,8 +251,9 @@ public:
       return std::nullopt;
     ScalarValue value{cached.normalized.load(std::memory_order_acquire)};
     value.scalarDefault = ScalarValue::ScalarDefault{
-        scalarPlainFromBits(cached.plainBits.load(std::memory_order_acquire),
-                            cached.plainIsInteger.load(std::memory_order_acquire)),
+        scalarPlainFromBits(
+            cached.plainBits.load(std::memory_order_acquire),
+            cached.plainIsInteger.load(std::memory_order_acquire)),
         {cached.minimum.load(std::memory_order_acquire),
          cached.maximum.load(std::memory_order_acquire),
          cached.step.load(std::memory_order_acquire),
@@ -269,8 +274,7 @@ private:
   static_assert(std::atomic<bool>::is_always_lock_free);
   struct Default {
     std::atomic<std::uint64_t> revision{}, stamp{}, plainBits{};
-    std::atomic<double> normalized{}, minimum{}, maximum{}, step{},
-        curve{};
+    std::atomic<double> normalized{}, minimum{}, maximum{}, step{}, curve{};
     std::atomic<std::uint32_t> stepCount{};
     std::atomic<ScalarDomain::Type> type{};
     std::atomic<bool> logarithmic{}, hasCurve{}, defaultMayExceedRange{},

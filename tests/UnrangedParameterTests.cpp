@@ -209,8 +209,9 @@ bool fullWidthIntegerDefault(const Product product, const char *literal) {
   processor.prepareToPlay(1000.0, 8);
   test::service(processor);
   const auto status = processor.workerStatus();
-  if (status.mappings.size() != 2U || status.mappings[0].name != "test" ||
-      status.mappings[1].name != "following") {
+  if (status.mappings.size() != std::min(slotCount, std::size_t{2}) ||
+      status.mappings[0].name != "test" ||
+      (slotCount > 1 && status.mappings[1].name != "following")) {
     std::cerr << "Full-width i64 default " << literal
               << " disappeared from the DAW slots\n";
     return false;
@@ -227,9 +228,11 @@ bool fullWidthIntegerDefault(const Product product, const char *literal) {
     std::cerr << "Full-width i64 presentation lost " << literal << '\n';
     return false;
   }
-  processor.getParameters()[1]->setValue(0.75F);
-  if (!render(processor, 0.75F))
-    return false;
+  if constexpr (slotCount > 1) {
+    processor.getParameters()[1]->setValue(0.75F);
+    if (!render(processor, 0.75F))
+      return false;
+  }
 
   // Normalized automation replaces the authored integer with a 0/1 value.
   const std::array points{AutomationPoint{0, 1.0}};

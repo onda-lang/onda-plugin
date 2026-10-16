@@ -2,6 +2,7 @@
 
 #include <onda.h>
 
+#include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <functional>
@@ -28,7 +29,7 @@ struct MaterializationDeleter {
   void operator()(onda_project_materialization_plan_t *value) const noexcept;
 };
 
-using ProgramHandle = std::unique_ptr<onda_program_t, ProgramDeleter>;
+using ProgramHandle = std::shared_ptr<onda_program_t>;
 using InstanceHandle = std::unique_ptr<onda_instance_t, InstanceDeleter>;
 using ManifestHandle = std::unique_ptr<onda_source_manifest_t, ManifestDeleter>;
 using ProjectImageHandle =
@@ -94,6 +95,9 @@ struct MaterializedProjectFile {
 };
 
 struct CompileResult {
+  double sampleRate{};
+  int blockSize{};
+  bool fastMath{};
   ProgramHandle program;
   ManifestHandle manifest;
   std::vector<std::filesystem::path> watchPaths;
@@ -103,10 +107,12 @@ struct CompileResult {
 };
 
 [[nodiscard]] CompileResult compileFile(const std::filesystem::path &path,
-                                        double sampleRate, int blockSize);
+                                        double sampleRate, int blockSize,
+                                        bool fastMath = false);
 [[nodiscard]] CompileResult compileProjectImage(const ProjectImage &image,
                                                 double sampleRate,
-                                                int blockSize);
+                                                int blockSize,
+                                                bool fastMath = false);
 [[nodiscard]] ProjectImage captureProjectImage(
     const std::filesystem::path &entry, const onda_source_manifest_t *manifest,
     std::span<const ProjectBufferAsset> buffers, Diagnostic &diagnostic);
@@ -121,6 +127,14 @@ using MaterializedProjectVisitor =
 [[nodiscard]] bool
 visitMaterializedProjectFiles(const ProjectImage &image, Diagnostic &diagnostic,
                               const MaterializedProjectVisitor &visitor);
+[[nodiscard]] ProjectImage
+withoutProjectBuffers(const ProjectImage &image,
+                      std::span<const std::string> names,
+                      Diagnostic &diagnostic);
+[[nodiscard]] std::vector<std::uint8_t>
+encodeBufferAsset(int elementType, std::span<const std::byte> samples,
+                  int frames, int channels, float sampleRate,
+                  Diagnostic &diagnostic);
 [[nodiscard]] std::vector<std::uint8_t>
 encodeF32BufferAsset(std::span<const float> samples, int frames, int channels,
                      float sampleRate, Diagnostic &diagnostic);

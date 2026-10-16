@@ -46,8 +46,8 @@ branch, as described in [GitHub's manual workflow documentation](https://docs.gi
 | `browser` | `linux-x64` | Browser checks; skips plugin compilation. |
 | `audit` | `linux-x64` | Exported callback audit and its instrumentation self-tests. |
 | `extended` | Any one platform, or `all` | Extended filesystem and concurrency cases. |
-| `channels` | `linux-x64` | Builds and validates three additional channel configurations; skips the default plugin build. |
-| `all` | Any one platform, or `all` | All applicable optional checks; Linux includes the three channel builds. |
+| `channels` | `linux-x64` | Builds and validates four additional channel/parameter configurations; skips the default plugin build. |
+| `all` | Any one platform, or `all` | All applicable optional checks; Linux includes the four custom builds. |
 
 The default platform is `linux-x64`. Unsupported test/platform combinations fail
 before dependencies are installed or plugins are built. Validator tooling is
@@ -80,8 +80,11 @@ ctest --test-dir build -C Release --output-on-failure -L '^extended$'
 ```
 
 Plain `ctest` runs every registered group. On Linux,
-`bash scripts/check-channel-layouts.sh build` builds and validates control-only,
-mono/no-control, and wider channel configurations.
+`bash scripts/check-channel-layouts.sh build` builds and validates the default
+channels with one parameter slot, control-only and mono/no-control layouts,
+and a wider layout with 64 slots. Tests that need two independent parameter slots
+report a skip in the one-slot build. Other fixtures limit host access to the
+configured capacity and keep single-slot DSP, state and automation coverage.
 
 `NewControlDefaults` reloads programs with newly declared controls before and
 after selection seeding. Both products retain existing controls and parameters,
@@ -100,7 +103,8 @@ exceptions, including exceptions terminating a worker thread. To isolate one
 scenario:
 
 ```sh
-./build/onda_processor_tests IncompleteBufferStateRestore
+./build/onda_processor_tests UnboundBuffers
+./build/onda_processor_tests PartialBufferStateRestore
 ./build/onda_processor_tests MessageThreadDelivery
 ./build/onda_plugin_tests NativeFilesystemWatcher
 ./build/onda_plugin_tests MovedSourceAncestor
@@ -111,12 +115,19 @@ Use `build/Release/onda_processor_tests.exe` for a Windows multi-config build.
 Failed CI jobs retain CTest logs and Windows test executables as diagnostic
 artifacts.
 
+`UnboundBuffers` checks both products with neutral buffers: parameters, input
+controls, and events remain published and editable before binding and after
+clearing. Rendered values and the interface survive saving and restoring without
+the source file. `NativeEditor` also loads an unbound-buffer program through a
+native file drop and edits its parameter in the real webview.
+
 ## Coverage
 
 | Test | Contract |
 | --- | --- |
 | `onda_example_tests` | Shipped examples compile and render finite, meaningful output. |
 | `onda_plugin_tests` | SDK ownership, DSP and MIDI behavior, buffer decoding, portable checkpoints, project export, worker replacement, file watching, and compiler serialization. Extended watcher permutations run separately. |
+| `onda_buffer_cache_tests` | Source/import edits before buffer binding or clearing, and shared buffer-file edits before rebinding. Uses real preparation and DSP with native notifications withheld to make cache invalidation races deterministic, including edits with unchanged size and modification time. |
 | `onda_processor_tests` | Host preparation, state persistence, defaults and automation, block-rate parameter smoothing, notifications, failure recovery, realtime callbacks, logs, scope/event adapters, editor lifecycle, and concurrent instances. |
 | `onda_native_editor_tests` | Both products: actual native browser handshake, visible file picker on fresh startup, visible checkbox edits reaching DSP, retained state on reopening, and exported `IPlugView` platform support, attachment and removal. |
 | `onda_vst3_smoke` | Built bundles expose expected metadata and parameters, instantiate independently, render through JUCE's VST3 host, and restore a saved program with imports after deleting its original files. Bundle lookup also exercises the Windows layout on other platforms. |
@@ -143,10 +154,10 @@ those transitions through the exported Bypass parameter. Controller conversion
 tests check exact native discrete counts around JUCE's continuous sentinel and
 saturation at VST3's signed 32-bit limit.
 `ProjectBufferOverrideRestore` clears an override while the linked source is
-broken, verifies that saved state and audio retain the complete checkpoint, and
-checks that repairing the source restores the project default.
-`AudioFileBuffers` also checks that clearing a required source binding after
-image restoration still invalidates its checkpoint.
+broken, verifies immediate and completed saves keep the cleared slot unbound,
+and checks that repairing the source does not resurrect the project default.
+`AudioFileBuffers` also checks that clearing a source binding after image
+restoration keeps a usable checkpoint with that slot unbound.
 `RunViewAdapter` checks that waiting states preserve pending view restoration
 while load failures still report an error.
 `UnrangedParameters` checks plugin-owned 0–1 controls for scalar `f32`, `f64`,
@@ -263,7 +274,25 @@ fallback. Source-discovery retries may capture newer host values.
 Pending-seed regressions cover explicit reloads, native source edits, host
 re-specialization, and acknowledgment during a gated build. Project-default cases
 render all five Onda primitive types through disk loading, filesystem-free image
-restoration, and export, and reject non-`f32` audio-file overrides.
+restoration, and export, and reject audio-file overrides with a mismatched element type.
+`TypedBufferBindings` loads all five primitive types from `.ondabuffer`, checks
+lossless integer and float samples, and verifies filesystem-free restoration and
+export. `TypedBufferState` exercises typed bindings in both products, clears
+and saves immediately, restores and exports without source files, and retains
+unchanged buffers while another slot is replaced. `SharedBufferFileReload` checks
+that editing a file bound to two buffers refreshes both while preserving the old
+instance and saving the updated samples in both checkpoint bindings.
+`SharedFileEditBeforeRebind` covers valid and invalid source edits combined with
+a failed binding, requiring the next clear to use and save the updated peer
+samples. `FailedDecodeBeforePeerClear` requires a corrupt override to keep
+failing after another slot is cleared, including after saved-image restoration,
+and verifies that repairing it publishes and saves fresh samples.
+`BufferCompilationReuse` shares compiled code between independent
+instances and clears one project array slot without changing the original defaults.
+`ParameterArrays` and `ParameterArrayProcessor` cover per-element defaults,
+sibling preservation, the configured scalar-slot cutoff, host metadata, automation
+of the final slot, and state restoration in both products. The custom-layout script
+also builds the minimum 1-slot and maximum 64-slot configurations.
 Filesystem-project regressions combine lowercase and mixed-case extensions,
 contained and external imports, and manifest-relative buffer assets; each
 checkpoint must render after deleting its files and exporting it again.

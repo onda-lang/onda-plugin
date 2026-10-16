@@ -133,14 +133,14 @@ juce::var makeRunViewState(Processor &processor, const WorkerStatus &status,
   set(state, "supportsSourceSelection", true);
   set(state, "supportsProjectExport", true);
   set(state, "canExportProject", canExportProject);
-  set(state, "supportsBufferEmbedding", false);
   set(state, "supportsTransport", false);
   set(state, "supportsDeviceSelection", false);
   set(state, "supportsRunSettings", true);
+  set(state, "supportsFastMath", true);
+  set(state, "fastMath", processor.fastMath());
   set(state, "canSetBlockSize", processor.canSetBlockSize());
   set(state, "hostBlockSamples", processor.hostBlockSize());
   set(state, "preferredBlockSamples", processor.preferredBlockSize());
-  set(state, "supportsReset", true);
   set(state, "ondaVersion", juce::String::fromUTF8(onda_version()));
   set(state, "supportsParamSmoothing", true);
   set(state, "paramSmoothingMs", processor.paramSmoothingSeconds() * 1000.0);
@@ -197,6 +197,21 @@ juce::var makeRunViewState(Processor &processor, const WorkerStatus &status,
     set(buffer, "loadedSampleRate",
         loaded ? juce::var{static_cast<double>(mapping.loadedSampleRate)}
                : juce::var{});
+    auto waveform = juce::var{};
+    if (mapping.waveform) {
+      waveform = object();
+      set(waveform, "minValue", mapping.waveform->minValue);
+      set(waveform, "maxValue", mapping.waveform->maxValue);
+      juce::Array<juce::var> minimums;
+      juce::Array<juce::var> maximums;
+      for (const auto value : mapping.waveform->minimums)
+        minimums.add(value);
+      for (const auto value : mapping.waveform->maximums)
+        maximums.add(value);
+      set(waveform, "minimums", std::move(minimums));
+      set(waveform, "maximums", std::move(maximums));
+    }
+    set(buffer, "waveform", std::move(waveform));
     buffers.add(std::move(buffer));
   }
   set(state, "buffers", std::move(buffers));
@@ -254,6 +269,13 @@ juce::var makeRunViewState(Processor &processor, const WorkerStatus &status,
     set(parameter, "label", juce::String(mapping.name));
     set(parameter, "type", juce::String(mapping.type));
     set(parameter, "scalar", true);
+    if (!mapping.arrayName.empty()) {
+      auto array = object();
+      set(array, "name", juce::String(mapping.arrayName));
+      set(array, "length", mapping.arrayLength);
+      set(array, "index", mapping.elementIndex);
+      set(parameter, "array", std::move(array));
+    }
     set(parameter, "normalizedValue", value.normalized);
     set(parameter, "hostValueDomain", "normalized");
     if (const auto exact = value.defaultPlain(mapping.scalarDomain()))

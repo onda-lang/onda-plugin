@@ -1,4 +1,5 @@
 #include "NativeEditorTests.h"
+#include "NativeFileDrop.h"
 
 #include "JucePath.h"
 #include "Processor.h"
@@ -8,6 +9,7 @@
 #include "Vst3ControllerTestSupport.h"
 #include "Vst3TestSupport.h"
 
+#include <juce_gui_basics/juce_gui_basics.h>
 #include <juce_gui_extra/juce_gui_extra.h>
 
 #include <algorithm>
@@ -92,10 +94,11 @@ bool exerciseNativeEditor() {
       pathToJuce(testTemporaryRoot() / "native-editor.onda")};
   if (!source.replaceWithText(R"(
 outs { out1 }
+buffers { clip: buffer<f32> }
 params { enabled = false }
 event note_on(id: i32, channel: i32, key: i32, velocity: f32) {}
 event note_off(id: i32, channel: i32, key: i32, velocity: f32) {}
-sample { if enabled { out1 = 1.0 } else { out1 = 0.0 } }
+sample { if enabled { out1 = 1.0 + clip[0] } else { out1 = 0.0 } }
 )"))
     return false;
 
@@ -117,6 +120,36 @@ sample { if enabled { out1 = 1.0 } else { out1 = 0.0 } }
         })()
       )", true))
         return false;
+      const juce::StringArray files{"/unsupported.txt",
+                                    source.getFullPathName()};
+      auto *target =
+          dynamic_cast<juce::FileDragAndDropTarget *>(&host.editor());
+      if (!target || !target->isInterestedInFileDrag(files)) {
+        std::cerr << "Editor does not accept an Onda file drag\n";
+        return false;
+      }
+      if (target->isInterestedInFileDrag({"/unsupported.txt"}) ||
+          target->isInterestedInFileDrag({"relative.onda"}) ||
+          target->isInterestedInFileDrag({}))
+        return false;
+      if (!dropNativeFile(*browser, source))
+        return false;
+      if (!test::waitForMessage([&] {
+            return processor.workerStatus().path ==
+                   pathFromJuce(source.getFullPathName());
+          })) {
+        std::cerr << "Native browser did not forward the dropped path: "
+                  << processor.workerStatus().path << ", expected "
+                  << source.getFullPathName() << '\n';
+        return false;
+      }
+      processor.prepareToPlay(48'000.0, 64);
+      if (!processor.workerStatus().active ||
+          processor.workerStatus().path !=
+              pathFromJuce(source.getFullPathName())) {
+        std::cerr << "Dropping an Onda file did not load it\n";
+        return false;
+      }
     }
     processor.loadFile(source);
     processor.prepareToPlay(48'000.0, 64);
@@ -153,6 +186,13 @@ sample { if enabled { out1 = 1.0 } else { out1 = 0.0 } }
         (() => {
           if (document.querySelector('#settings-popover').getClientRects().length)
             throw new Error('Unavailable device panel is visible');
+          if (document.querySelector('#params-section [data-param-layout="knobs"]')
+                .getAttribute('aria-pressed') !== 'true')
+            throw new Error('Params must default to knobs');
+          const buffers = document.querySelector('#buffers-section');
+          if (getComputedStyle(buffers).display === 'none'
+              || !document.querySelector('#buffers button'))
+            throw new Error('Unbound buffer picker is missing');
           for (const button of document.querySelectorAll('#params-section [data-param-layout]')) {
             const box = button.getBoundingClientRect();
             const range = document.createRange();

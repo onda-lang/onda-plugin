@@ -1096,8 +1096,11 @@ bool exerciseAutomationEchoWork() {
   processor.resetParametersToDefaults();
   if (!render(processor, 1.5F))
     return false;
-  for (const auto id : {"input01", "slot01", "slot32"}) {
-    const FlatQueue queue{juce::String(id) == "slot32" ? 0.5 : 0.75};
+  juce::StringArray ids{"input01", "slot01"};
+  if constexpr (slotCount > 1)
+    ids.add("slot" + juce::String(static_cast<int>(slotCount)).paddedLeft('0', 2));
+  for (const auto &id : ids) {
+    const FlatQueue queue{id == "input01" || id == "slot01" ? 0.75 : 0.5};
     if (!test::captureRealtime(
             processor, juce::VST3ClientExtensions::convertJuceParameterId(id),
             queue.queue(), 4096) ||

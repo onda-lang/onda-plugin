@@ -1,5 +1,7 @@
 #pragma once
 
+#include "AudioFile.h"
+#include "BufferWaveform.h"
 #include "ControlState.h"
 #include "EventPayload.h"
 #include "OndaSdk.h"
@@ -129,6 +131,11 @@ struct BufferFileBinding {
                          const BufferFileBinding &) = default;
 };
 
+struct BufferFileSnapshot {
+  BufferFileBinding binding;
+  std::shared_ptr<DecodedAudioFile> audio;
+};
+
 enum class BufferChannelKind : std::uint8_t {
   mono,
   fixed,
@@ -146,6 +153,7 @@ struct BufferMapping {
   int loadedFrames{};
   int loadedChannels{};
   float loadedSampleRate{};
+  BufferWaveformPtr waveform;
 };
 
 struct BuildResult;
@@ -167,11 +175,20 @@ public:
   [[nodiscard]] static BuildResult
   build(const std::filesystem::path &path, Product product, double sampleRate,
         int blockSize, std::span<const BufferFileBinding> bufferBindings = {},
-        const std::optional<ParameterValues> &initialParameters = std::nullopt);
+        const std::optional<ParameterValues> &initialParameters = std::nullopt,
+        bool fastMath = false);
   [[nodiscard]] static BuildResult
   build(const ProjectImage &projectImage, Product product, double sampleRate,
         int blockSize,
-        const std::optional<ParameterValues> &initialParameters = std::nullopt);
+        const std::optional<ParameterValues> &initialParameters = std::nullopt,
+        bool fastMath = false,
+        std::span<const BufferFileBinding> clearedBindings = {});
+  // Rebuild only the instance and bindings, retaining the immutable JIT code.
+  [[nodiscard]] static BuildResult
+  build(std::shared_ptr<const CompileResult> compiled, Product product,
+        std::span<const BufferFileBinding> bufferBindings = {},
+        const std::optional<ParameterValues> &initialParameters = std::nullopt,
+        std::span<const BufferFileSnapshot> retainedFiles = {});
 
   [[nodiscard]] bool process(float *const *hostInputs,
                              float *const *hostOutputs, int frames,
@@ -255,12 +272,8 @@ private:
     ScalarValue value;
   };
 
-  struct BufferStorage {
-    std::vector<float> samples;
-    int frames{};
-    int channels{};
-    float sampleRate{};
-  };
+  // File bindings are read-only. Replacement instances can share their samples.
+  using BufferStorage = std::shared_ptr<DecodedAudioFile>;
 
   struct DelegateMetadata {
     std::string name;
@@ -278,11 +291,6 @@ private:
                  std::vector<float> inputSlab, std::vector<float> outputSlab,
                  std::vector<BufferStorage> bufferStorage,
                  std::vector<BufferMapping> bufferMappings) noexcept;
-  [[nodiscard]] static BuildResult
-  build(CompileResult compiled, Product product, double sampleRate,
-        int blockSize, std::span<const BufferFileBinding> bufferBindings,
-        const std::filesystem::path &diskEntry,
-        const std::optional<ParameterValues> &initialParameters);
 
   [[nodiscard]] bool prepareRuntimeOutput(Diagnostic &diagnostic);
   [[nodiscard]] bool prepareInputDefaults(Diagnostic &diagnostic);
@@ -420,10 +428,12 @@ private:
 };
 
 struct BuildResult {
+  std::shared_ptr<const CompileResult> compilation;
   std::unique_ptr<PreparedEngine> engine;
   ProjectImage projectImage;
   std::vector<std::filesystem::path> watchPaths;
   std::vector<BufferMapping> buffers;
+  std::vector<BufferFileSnapshot> bufferFiles;
   Diagnostic diagnostic;
 };
 

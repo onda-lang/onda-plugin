@@ -15,16 +15,15 @@ bool exerciseCallbackSmoothing() {
   const juce::File source{
       pathToJuce(testTemporaryRoot() / "callback-smoothing.onda")};
   for (const auto doublePrecision : {false, true}) {
-    const auto expression = doublePrecision ? "f32(b)" : "a";
-    const auto program = juce::String{R"(
-outs { out1 }
-params { single = 0.0 {0.0, 1.0}; double: f64 = 0.0 {0.0, 1.0} }
+    const auto type = doublePrecision ? "f64" : "f32";
+    const auto program =
+        "outs { out1 }\nparams { level: " + juce::String{type} +
+        R"( = 0.0 {0.0, 1.0} }
 event note_on(id: i32, channel: i32, key: i32, velocity: f32) {}
 event note_off(id: i32, channel: i32, key: i32, velocity: f32) {}
 block {
-  a = single; b = double
-  sample { out1 = )"} + expression +
-                         R"( }
+  cached = level
+  sample { out1 = f32(cached) }
 }
 )";
     if (!source.replaceWithText(program))
@@ -43,7 +42,6 @@ block {
           return false;
         }
         processor.getParameters()[0]->setValueNotifyingHost(0.0F);
-        processor.getParameters()[1]->setValueNotifyingHost(0.0F);
         juce::MidiBuffer empty;
         const auto channels =
             std::max(pluginInputChannels, pluginOutputChannels);
@@ -52,7 +50,6 @@ block {
         if (!test::processRealtime(processor, initial, empty))
           return false;
         processor.setSlotValue(0, 1.0F);
-        processor.setSlotValue(1, 1.0F);
         int elapsed{};
         for (const auto frames : {0, 6, 0, 2, 3, 5}) {
           juce::AudioBuffer<float> audio(channels, frames);
@@ -108,7 +105,8 @@ bool exerciseCallbackProcessing() {
         }
         processor.loadFile(source, false);
         processor.prepareToPlay(1000.0, 8);
-        processor.getParameters()[1]->setValueNotifyingHost(0.0F);
+        if constexpr (slotCount > 1)
+          processor.getParameters()[1]->setValueNotifyingHost(0.0F);
         if (!test::checkCallbackProcessing(
                 processor, block, routed,
                 [&](juce::AudioBuffer<float> &audio, juce::MidiBuffer &midi,
@@ -256,13 +254,16 @@ block {
   }
   // Editor smoothing advances by each chunk's actual length, independently
   // of the host curve on another slot.
-  processor.setSlotValue(1, 1.0F);
-  processor.captureHostAutomation(slot, up.queue(), 8);
-  if (!render({0, 0, 0, 3.0F / 28, 3.0F / 28, 3.0F / 28, 6.0F / 28, 6.0F / 28},
-              {22.1F, 22.1F, 22.1F, 23.2F, 23.2F, 23.2F, 24.0F + 8.0F / 30,
-               24.0F + 8.0F / 30},
-              empty))
-    return false;
+  if constexpr (slotCount > 1) {
+    processor.setSlotValue(1, 1.0F);
+    processor.captureHostAutomation(slot, up.queue(), 8);
+    if (!render(
+            {0, 0, 0, 3.0F / 28, 3.0F / 28, 3.0F / 28, 6.0F / 28, 6.0F / 28},
+            {22.1F, 22.1F, 22.1F, 23.2F, 23.2F, 23.2F, 24.0F + 8.0F / 30,
+             24.0F + 8.0F / 30},
+            empty))
+      return false;
+  }
   processor.unload();
   return processor.canSetBlockSize() && processor.setPreferredBlockSize(2);
 }

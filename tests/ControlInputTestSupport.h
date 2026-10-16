@@ -96,7 +96,7 @@ bool checkLastControlInputRouting(juce::AudioProcessor &processor,
   if (!disableControlInputBuses(processor))
     return fail("could not disable controls before last-bus test");
   processor.prepareToPlay(48'000.0, 8);
-  auto *parameter = processor.getParameters()[32 + last];
+  auto *parameter = processor.getParameters()[ONDA_PLUGIN_PARAMETER_SLOTS + last];
   if (!waitUntil(
           [&] {
             return parameter->getName(128) == "cv" + juce::String(last + 1);

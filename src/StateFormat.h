@@ -9,7 +9,7 @@
 namespace onda::plugin {
 
 inline constexpr std::uint32_t stateMagic = 0x41444e4fU; // ONDA, little-endian.
-inline constexpr int stateVersion = 12;
+inline constexpr int stateVersion = 13;
 
 inline void writeScalarValue(juce::OutputStream &stream,
                              const ScalarValue &value) {

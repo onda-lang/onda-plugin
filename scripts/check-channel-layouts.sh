@@ -24,14 +24,15 @@ release_source="$(cache_value ONDA_RELEASE_SOURCE_DIR)"
 juce_root="${ONDA_JUCE_ROOT:-$(cache_value ONDA_JUCE_ROOT)}"
 validator="${ONDA_VST3_VALIDATOR:-$(cache_value ONDA_VST3_VALIDATOR)}"
 
-for layout in '0 16 2' '1 0 1' '4 4 4'; do
-  read -r inputs controls outputs <<< "$layout"
-  layout_build="$source_root/build-layout-$inputs-$controls-$outputs"
+for layout in '2 16 2 1' '0 16 2 32' '1 0 1 32' '4 4 4 64'; do
+  read -r inputs controls outputs slots <<< "$layout"
+  layout_build="$source_root/build-layout-$inputs-$controls-$outputs-$slots"
   cmake -S "$source_root" -B "$layout_build" \
     -DCMAKE_BUILD_TYPE=Release \
     -DONDA_PLUGIN_INPUT_CHANNELS="$inputs" \
     -DONDA_PLUGIN_CONTROL_INPUTS="$controls" \
     -DONDA_PLUGIN_OUTPUT_CHANNELS="$outputs" \
+    -DONDA_PLUGIN_PARAMETER_SLOTS="$slots" \
     -DONDA_PLUGIN_BUILD_BROWSER_TESTS=OFF \
     -DONDA_PLUGIN_BUILD_VST3_AUDIT=OFF \
     -DONDA_VST3_VALIDATOR="$validator" \
@@ -40,6 +41,6 @@ for layout in '0 16 2' '1 0 1' '4 4 4'; do
     -DONDA_RELEASE_SOURCE_DIR="${release_source:-$default_build/_deps/ondareleasesource-src}" \
     -DONDA_JUCE_ROOT="${juce_root:-$default_build/_deps/juce-src}"
   cmake --build "$layout_build" --config Release \
-    --target onda_processor_tests onda_vst3_smoke --parallel 2
+    --parallel 2
   ctest --test-dir "$layout_build" -C Release --output-on-failure --no-tests=error -L '^core$'
 done

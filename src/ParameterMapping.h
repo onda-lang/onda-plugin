@@ -14,6 +14,9 @@ namespace onda::plugin {
 // Compiled scalar metadata shared by DSP, host parameters and presentation.
 struct ParameterMapping {
   int parameterIndex{-1};
+  int elementIndex{};
+  int arrayLength{};
+  std::string arrayName;
   std::string name;
   std::string type;
   std::string unit;
@@ -103,8 +106,10 @@ struct ParameterMapping {
           return a.has_value() == b.has_value() && (!a || equalDouble(*a, *b));
         };
     return left.parameterIndex == right.parameterIndex &&
-           left.name == right.name && left.type == right.type &&
-           left.unit == right.unit &&
+           left.elementIndex == right.elementIndex &&
+           left.arrayLength == right.arrayLength &&
+           left.arrayName == right.arrayName && left.name == right.name &&
+           left.type == right.type && left.unit == right.unit &&
            equalDouble(left.defaultNormalized, right.defaultNormalized) &&
            left.defaultPlain == right.defaultPlain &&
            equalDouble(left.rangeMin, right.rangeMin) &&

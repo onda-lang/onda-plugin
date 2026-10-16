@@ -146,8 +146,8 @@ public:
 } // namespace
 
 bool smokeParameterConversions(juce::VST3PluginFormatHeadless &format,
-                                const juce::PluginDescription &description,
-                                const juce::File &module) {
+                               const juce::PluginDescription &description,
+                               const juce::File &module) {
   using namespace onda::plugin;
   ObservedController controller;
   juce::String error;
@@ -185,7 +185,7 @@ bool smokeParameterConversions(juce::VST3PluginFormatHeadless &format,
   setOndaProgram(*instance, source);
   instance->prepareToPlay(48'000.0, 8);
   if (!controller.connect(*instance->getVST3Client()->getIComponentPtr(),
-                           module))
+                          module))
     return false;
   if (!test::waitUntil(
           [&] {
@@ -210,12 +210,22 @@ bool smokeParameterConversions(juce::VST3PluginFormatHeadless &format,
     }
     return true;
   };
-  if (!check("slot01", 0.0, 1.0) || !check("slot01", 0.5, 10.0) ||
-      !check("slot01", 1.0, 100.0) || !check("slot02", 0.5, 0.0) ||
-      !check("slot02", 1.0, 2.0) || !check("slot03", 0.5, 2.0) ||
-      !check("slot04", 0.0, 0.0) || !check("slot04", 1.0, 1.0) ||
-      !check("slot32", 0.25, 0.25))
+  const auto checkSlot = [&](const int slot, const double normalized,
+                             const double plain) {
+    if (slot > ONDA_PLUGIN_PARAMETER_SLOTS)
+      return true;
+    const auto id = "slot" + juce::String(slot).paddedLeft('0', 2);
+    return check(id.toRawUTF8(), normalized, plain);
+  };
+  if (!checkSlot(1, 0.0, 1.0) || !checkSlot(1, 0.5, 10.0) ||
+      !checkSlot(1, 1.0, 100.0) || !checkSlot(2, 0.5, 0.0) ||
+      !checkSlot(2, 1.0, 2.0) || !checkSlot(3, 0.5, 2.0) ||
+      !checkSlot(4, 0.0, 0.0) || !checkSlot(4, 1.0, 1.0))
     return false;
+  if constexpr (ONDA_PLUGIN_PARAMETER_SLOTS > 9) {
+    if (!checkSlot(ONDA_PLUGIN_PARAMETER_SLOTS, 0.25, 0.25))
+      return false;
+  }
   if constexpr (pluginControlInputs > 0)
     if (!check("input01", 0.0, -2.0) || !check("input01", 0.5, 0.0) ||
         !check("input01", 1.0, 2.0))
@@ -227,19 +237,25 @@ bool smokeParameterConversions(juce::VST3PluginFormatHeadless &format,
   // Inspect native VST3 metadata: JUCE's host also uses INT_MAX as a
   // continuous sentinel and cannot faithfully expose these large counts.
   constexpr std::array counts{
-      std::pair{"slot01", int32{0}}, std::pair{"slot03", int32{4}},
-      std::pair{"slot04", int32{1}}, std::pair{"slot05", int32{2147483645}},
-      std::pair{"slot06", int32{2147483646}},
-      std::pair{"slot07", int32{2147483647}},
-      std::pair{"slot08", int32{2147483647}},
-      std::pair{"slot09", int32{2147483647}},
-      std::pair{"slot32", int32{0}}};
-  for (const auto &[id, expected] : counts) {
-    if (controller.stepCount(id) != expected) {
+      std::pair{1, int32{0}},          std::pair{3, int32{4}},
+      std::pair{4, int32{1}},          std::pair{5, int32{2147483645}},
+      std::pair{6, int32{2147483646}}, std::pair{7, int32{2147483647}},
+      std::pair{8, int32{2147483647}}, std::pair{9, int32{2147483647}}};
+  for (const auto &[slot, steps] : counts) {
+    const auto id = "slot" + juce::String(slot).paddedLeft('0', 2);
+    const auto expected = slot <= ONDA_PLUGIN_PARAMETER_SLOTS ? steps : -1;
+    if (controller.stepCount(id.toRawUTF8()) != expected) {
       std::cerr << "VST3 step count " << id << ": actual "
-                << controller.stepCount(id) << ", expected " << expected << '\n';
+                << controller.stepCount(id.toRawUTF8()) << ", expected "
+                << expected << '\n';
       return false;
     }
+  }
+  if constexpr (ONDA_PLUGIN_PARAMETER_SLOTS > 9) {
+    const auto id =
+        "slot" + juce::String(ONDA_PLUGIN_PARAMETER_SLOTS).paddedLeft('0', 2);
+    if (controller.stepCount(id.toRawUTF8()) != 0)
+      return false;
   }
   instance->releaseResources();
   return true;
@@ -683,9 +699,12 @@ block {
       const auto held =
           data.inputEvents != nullptr && frame >= 3 ? 64.0F / 127.0F : 1.0F;
       const auto levelValue = levels[static_cast<std::size_t>(frame)];
-      const auto gateValue = (frame >= gateAt) != fallingGate;
+      const auto gateValue = ONDA_PLUGIN_PARAMETER_SLOTS >= 3 &&
+                             ((frame >= gateAt) != fallingGate);
       const auto expectedBlocks = priorBlocks + frame / 2 + 1;
-      const auto right = static_cast<float>(std::pow(100.0, levelValue)) +
+      const auto right = (ONDA_PLUGIN_PARAMETER_SLOTS >= 2
+                              ? static_cast<float>(std::pow(100.0, levelValue))
+                              : 1.0F) +
                          (gateValue ? 2.0F : 0.0F) +
                          static_cast<float>(expectedBlocks) * 128.0F;
       const auto rightActual =
@@ -712,7 +731,8 @@ block {
   const std::array on{Point{4, 1.0}};
   ValueQueue level{"slot01", ramp}, precise{"slot02", ramp}, gate{"slot03", on};
   const std::array firstQueues{&level, &precise, &gate};
-  Changes first{firstQueues};
+  Changes first{std::span<ValueQueue *const>{firstQueues}.first(
+      std::min(std::size_t{ONDA_PLUGIN_PARAMETER_SLOTS}, firstQueues.size()))};
   if (!render(first,
               {0, 0, 2.0F / 3, 2.0F / 3, .25F, .25F, 7.0F / 12, 7.0F / 12}, 4,
               0))
@@ -723,7 +743,8 @@ block {
   ValueQueue down{"slot01", descending}, downPrecise{"slot02", descending},
       offGate{"slot03", off};
   const std::array secondQueues{&down, &downPrecise, &offGate};
-  Changes second{secondQueues};
+  Changes second{std::span<ValueQueue *const>{secondQueues}.first(
+      std::min(std::size_t{ONDA_PLUGIN_PARAMETER_SLOTS}, secondQueues.size()))};
   if (!render(second,
               {.65625F, .65625F, .46875F, .46875F, .28125F, .28125F, .09375F,
                .09375F},
@@ -737,7 +758,8 @@ block {
   const std::array ascending{Point{7, 1.0}};
   ValueQueue up{"slot01", ascending}, upPrecise{"slot02", ascending};
   const std::array thirdQueues{&up, &upPrecise};
-  Changes third{thirdQueues};
+  Changes third{std::span<ValueQueue *const>{thirdQueues}.first(
+      std::min(std::size_t{ONDA_PLUGIN_PARAMETER_SLOTS}, thirdQueues.size()))};
   Events events;
   events.note.type = Vst::Event::kNoteOnEvent;
   events.note.sampleOffset = 3;
@@ -877,7 +899,7 @@ bool smokeControlAutomation(juce::AudioPluginInstance &instance) {
     instance.prepareToPlay(48'000.0, 8);
     if (!test::waitUntil(
             [&] {
-              return instance.getParameters()[32]->getName(128) == "modulation";
+              return instance.getParameters()[ONDA_PLUGIN_PARAMETER_SLOTS]->getName(128) == "modulation";
             },
             [] {
               juce::MessageManager::getInstance()->runDispatchLoopUntil(10);

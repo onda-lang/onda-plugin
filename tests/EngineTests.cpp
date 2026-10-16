@@ -5,6 +5,8 @@
 
 #include "AudioFile.h"
 #include "Engine.h"
+#include "ParameterArrayTests.h"
+#include "BufferBindingTests.h"
 #include "ProjectExport.h"
 #include "SpscSlot.h"
 #include "TestAudioFile.h"
@@ -790,7 +792,8 @@ sample { out1 = held; out2 = held }
         [&] {
           snapshot.fill(0.5F);
           snapshot[0] = ++snapshotReads % 2 == 1 ? 0.25F : 0.75F;
-          snapshot[1] = 1.0 - snapshot[0].normalized;
+          if constexpr (slotCount > 1)
+            snapshot[1] = 1.0 - snapshot[0].normalized;
           return HostParameterValues{.parameters = snapshot, .controls = {}};
         },
         [&](const ProjectImage &image, Product product, double rate, int block,
@@ -807,8 +810,10 @@ sample { out1 = held; out2 = held }
     std::unique_ptr<PreparedEngine> engine{replacements.tryPop()};
     if (!engine || !coherent || attempts < (fromImage ? 1 : 2) ||
         worker.status().usingProjectImage != fromImage ||
-        !produces(*engine, static_cast<float>(snapshot[0].normalized -
-                                              snapshot[1].normalized))) {
+        !produces(*engine,
+                  static_cast<float>(
+                      snapshot[0].normalized -
+                      (slotCount > 1 ? snapshot[1].normalized : 0.5)))) {
       std::cerr << "build did not initialize from one parameter snapshot "
                 << "(saved image " << fromImage << ", reads " << snapshotReads
                 << ", attempts " << attempts << ")\n";
@@ -932,6 +937,33 @@ bool exerciseReloadDuringSeeding() {
   return true;
 }
 
+bool exerciseBufferWaveform() {
+  using namespace onda::plugin;
+  std::vector<float> samples(257U * 2U);
+  samples.front() = -2.0F;
+  samples[3] = 3.0F;
+  samples.back() = 4.0F;
+  std::fill_n(samples.begin() + 256, 4,
+              std::numeric_limits<float>::quiet_NaN());
+  samples[256] = std::numeric_limits<float>::infinity();
+  const auto waveform = makeBufferWaveform(samples, 2);
+  if (!waveform || waveform->minimums.size() != 128U ||
+      waveform->maximums.size() != 128U || waveform->minValue != -2.0 ||
+      waveform->maxValue != 4.0 || waveform->minimums.front() != -2.0 ||
+      waveform->maximums.front() != 3.0 ||
+      waveform->maximums.back() != 4.0 || waveform->minimums[64] != 0.0 ||
+      waveform->maximums[64] != 0.0) {
+    std::cerr << "waveform lost channel extrema, tail frames or finite bounds\n";
+    return false;
+  }
+  const std::array silent{0.0F};
+  const auto silence = makeBufferWaveform(silent, 1);
+  return silence && silence->minValue == 0.0 && silence->maxValue == 0.0 &&
+         silence->minimums == std::vector<double>{0.0} &&
+         !makeBufferWaveform(std::span<const float>{}, 1) && !makeBufferWaveform(silent, 0) &&
+         !makeBufferWaveform(silent, 2);
+}
+
 bool exerciseTypedProjectDefaults() {
   using namespace onda::plugin;
   struct Case {
@@ -976,10 +1008,19 @@ bool exerciseTypedProjectDefaults() {
       return false;
     }
     const auto buffers = disk.engine->bufferMappings();
+    const auto hasWaveform = [&](const PreparedEngine &engine) {
+      if (engine.bufferMappings().size() != 1U)
+        return false;
+      const auto &waveform = engine.bufferMappings()[0].waveform;
+      return waveform && waveform->minValue == testCase.expected &&
+             waveform->maxValue == testCase.expected &&
+             waveform->minimums == std::vector<double>{testCase.expected} &&
+             waveform->maximums == std::vector<double>{testCase.expected};
+    };
     if (buffers.size() != 1U || buffers[0].loadedFrames != 1 ||
         buffers[0].loadedChannels != 1 ||
         !close(buffers[0].loadedSampleRate, 48'000.0F) ||
-        !buffers[0].loadedPath.empty())
+        !buffers[0].loadedPath.empty() || !hasWaveform(*disk.engine))
       return false;
     if (testCase.type != "f32") {
       const std::array bindings{
@@ -987,7 +1028,7 @@ bool exerciseTypedProjectDefaults() {
       const auto overridden = PreparedEngine::build(project, Product::effect,
                                                     48'000.0, 8, bindings);
       if (overridden.engine || overridden.diagnostic.message.find(
-                                   "require an f32") == std::string::npos) {
+                                   "element type does not match") == std::string::npos) {
         std::cerr << "non-f32 audio-file override was accepted\n";
         return false;
       }
@@ -1002,6 +1043,7 @@ bool exerciseTypedProjectDefaults() {
     auto portable = PreparedEngine::build(exported.projectFile, Product::effect,
                                           48'000.0, 8);
     if (!restored.engine || !portable.engine ||
+        !hasWaveform(*restored.engine) || !hasWaveform(*portable.engine) ||
         !produces(*restored.engine, testCase.expected) ||
         !produces(*portable.engine, testCase.expected)) {
       std::cerr << testCase.type << " default did not survive restore/export\n";
@@ -1798,15 +1840,16 @@ sample { out1 = in1; out2 = in2 }
   source.writeBufferEffect();
   const auto unboundBuffer = onda::plugin::PreparedEngine::build(
       source.path(), onda::plugin::Product::effect, 48'000.0, 8);
-  if (unboundBuffer.engine ||
-      unboundBuffer.diagnostic.message != "Buffer 'clip' is not bound" ||
-      unboundBuffer.buffers.size() != 1U ||
-      unboundBuffer.buffers[0].channelKind !=
+  if (!unboundBuffer.engine || !unboundBuffer.diagnostic.empty() ||
+      !unboundBuffer.projectImage.valid() ||
+      !produces(*unboundBuffer.engine, 0.0F) ||
+      unboundBuffer.engine->bufferMappings().size() != 1U ||
+      unboundBuffer.engine->bufferMappings()[0].channelKind !=
           onda::plugin::BufferChannelKind::fixed ||
-      unboundBuffer.buffers[0].fixedChannels != 2) {
-    std::cerr << "unbound buffer metadata or diagnostic is incorrect: "
-              << unboundBuffer.diagnostic.message << " ("
-              << unboundBuffer.buffers.size() << " buffers)\n";
+      unboundBuffer.engine->bufferMappings()[0].fixedChannels != 2 ||
+      unboundBuffer.engine->bufferMappings()[0].loadedFrames != 0) {
+    std::cerr << "unbound buffers did not retain neutral processing and metadata: "
+              << unboundBuffer.diagnostic.message << '\n';
     return 1;
   }
 
@@ -1932,7 +1975,7 @@ sample { out1 = in1; out2 = in2 }
       source.path(), onda::plugin::Product::effect, 48'000.0, 8,
       bufferBindings);
   if (wrongType.engine ||
-      wrongType.diagnostic.message.find("require an f32 Onda buffer") ==
+      wrongType.diagnostic.message.find("element type does not match") ==
           std::string::npos) {
     std::cerr << "incompatible audio-file buffer type was accepted\n";
     return 1;
@@ -2578,6 +2621,11 @@ int main(const int argc, char **argv) {
 #endif
       {"BuildParameterSnapshot", exerciseBuildParameterSnapshot},
       {"ReloadDuringSeeding", exerciseReloadDuringSeeding},
+      {"BufferWaveform", exerciseBufferWaveform},
+      {"ParameterArrays", exerciseParameterArrays},
+      {"TypedBufferBindings", exerciseTypedBufferBindings},
+      {"BufferCompilationReuse", exerciseBufferCompilationReuse},
+      {"SharedBufferFileReload", exerciseSharedBufferFileReload, "native"},
       {"TypedProjectDefaults", exerciseTypedProjectDefaults},
       {"FilesystemProjects", exerciseFilesystemProjects},
       {"DiskRepairDuringFallback", exerciseDiskRepairDuringFallback},

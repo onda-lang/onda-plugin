@@ -14,7 +14,7 @@ on:
         type: string
         default: main
       tests:
-        description: Optional tests (all includes three extra Linux channel builds)
+        description: Optional tests (all includes four extra Linux channel/parameter builds)
         type: choice
         default: browser-audit
         options:

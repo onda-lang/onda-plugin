@@ -839,7 +839,7 @@ bool exerciseNewControlDefaults() {
       test::service(processor);
       processor.getParameters()[0]->setValue(0.75F);
       if (existing)
-        processor.getParameters()[32]->setValue(0.625F);
+        processor.getParameters()[static_cast<int>(slotCount)]->setValue(0.625F);
     }
     const auto previousValue =
         existing ? (acknowledged ? 0.625F : 0.25F) : 0.0F;
@@ -851,7 +851,7 @@ bool exerciseNewControlDefaults() {
     TestAutomationQueue queue{points};
     const auto applyWrite = [&] {
       if (write.origin == Origin::direct)
-        processor.getParameters()[32 + static_cast<int>(index)]->setValue(
+        processor.getParameters()[static_cast<int>(slotCount) + static_cast<int>(index)]->setValue(
             write.value);
       if (write.origin == Origin::queue)
         return test::captureRealtime(processor, id, queue.queue(), 8) &&
@@ -888,7 +888,7 @@ bool exerciseNewControlDefaults() {
     const auto normalized =
         write.origin == Origin::none ? (wide ? 0.5F : 0.125F) : write.value;
     if (!render(processor, previousValue + plain) ||
-        !std::is_eq(processor.getParameters()[32 + static_cast<int>(index)]
+        !std::is_eq(processor.getParameters()[static_cast<int>(slotCount) + static_cast<int>(index)]
                         ->getValue() <=> normalized) ||
         !std::is_eq(processor.getParameters()[0]->getValue() <=>
                     (acknowledged ? 0.75F : 0.25F)))

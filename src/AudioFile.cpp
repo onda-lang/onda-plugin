@@ -35,26 +35,46 @@ AudioFileResult decode(const std::vector<std::uint8_t> &encodedBytes,
       encodedBytes.data(), encodedBytes.size(), &assetInfo, nullptr, 0,
       assetDiagnostic.outParameter());
   if (decodedBytes >= 0) {
-    if (assetInfo.element_type != ONDA_PRIMITIVE_F32 ||
-        assetInfo.frames == 0U || assetInfo.channels == 0U ||
+    if (assetInfo.frames == 0U || assetInfo.channels == 0U ||
         assetInfo.frames >
             static_cast<std::uint32_t>(std::numeric_limits<int>::max()) ||
         assetInfo.channels >
             static_cast<std::uint32_t>(std::numeric_limits<int>::max()) ||
-        decodedBytes != static_cast<std::int64_t>(assetInfo.sample_bytes) ||
-        assetInfo.sample_bytes % sizeof(float) != 0U) {
+        decodedBytes != static_cast<std::int64_t>(assetInfo.sample_bytes)) {
       return failure("Unsupported Onda buffer asset", displayPath);
     }
     DecodedAudioFile decoded{
-        .interleavedSamples =
-            std::vector<float>(assetInfo.sample_bytes / sizeof(float)),
+        .samples = {},
         .frames = static_cast<int>(assetInfo.frames),
         .channels = static_cast<int>(assetInfo.channels),
         .sampleRate = assetInfo.sample_rate,
     };
+    const auto sampleCount = static_cast<std::size_t>(decoded.frames) *
+                             static_cast<std::size_t>(decoded.channels);
+    switch (assetInfo.element_type) {
+    case ONDA_PRIMITIVE_BOOL:
+      decoded.samples.values = std::vector<std::uint8_t>(sampleCount);
+      break;
+    case ONDA_PRIMITIVE_I32:
+      decoded.samples.values = std::vector<std::int32_t>(sampleCount);
+      break;
+    case ONDA_PRIMITIVE_I64:
+      decoded.samples.values = std::vector<std::int64_t>(sampleCount);
+      break;
+    case ONDA_PRIMITIVE_F32:
+      decoded.samples.values = std::vector<float>(sampleCount);
+      break;
+    case ONDA_PRIMITIVE_F64:
+      decoded.samples.values = std::vector<double>(sampleCount);
+      break;
+    default:
+      return failure("Unsupported Onda buffer element type", displayPath);
+    }
+    if (decoded.samples.bytes().size() != assetInfo.sample_bytes)
+      return failure("Invalid Onda buffer dimensions", displayPath);
     const auto written = onda_buffer_asset_decode(
         encodedBytes.data(), encodedBytes.size(), &assetInfo,
-        decoded.interleavedSamples.data(), assetInfo.sample_bytes,
+        decoded.samples.data(), assetInfo.sample_bytes,
         assetDiagnostic.outParameter());
     if (written != decodedBytes)
       return failure("Could not decode the Onda buffer asset", displayPath);
@@ -94,16 +114,17 @@ AudioFileResult decode(const std::vector<std::uint8_t> &encodedBytes,
     return failure("Failed to decode audio file", displayPath);
 
   DecodedAudioFile decoded{
-      .interleavedSamples = std::vector<float>(sampleCount),
+      .samples = {.values = std::vector<float>(sampleCount)},
       .frames = frames,
       .channels = channels,
       .sampleRate = static_cast<float>(reader->sampleRate),
   };
   for (int frame = 0; frame < frames; ++frame) {
     for (int channel = 0; channel < channels; ++channel) {
-      decoded.interleavedSamples[static_cast<std::size_t>(frame) *
-                                     static_cast<std::size_t>(channels) +
-                                 static_cast<std::size_t>(channel)] =
+      std::get<std::vector<float>>(
+          decoded.samples.values)[static_cast<std::size_t>(frame) *
+                                      static_cast<std::size_t>(channels) +
+                                  static_cast<std::size_t>(channel)] =
           planar.getSample(channel, frame);
     }
   }

@@ -32,7 +32,7 @@ setOndaProgram(juce::AudioPluginInstance &instance, const juce::File &source,
     stream.writeString({});
     stream.writeInt(0);
     stream.writeInt64(0);
-    for (std::size_t slot = 0; slot < 32U; ++slot)
+    for (std::size_t slot = 0; slot < ONDA_PLUGIN_PARAMETER_SLOTS; ++slot)
       onda::plugin::writeScalarValue(
           stream, slot < parameters.size()
                       ? parameters[slot]
@@ -43,6 +43,7 @@ setOndaProgram(juce::AudioPluginInstance &instance, const juce::File &source,
     stream.writeString({});
     stream.writeDouble(onda::plugin::defaultParamSmoothingSeconds);
     stream.writeInt(blockSamples);
+    stream.writeBool(false); // Fast Math.
     stream.writeBool(true);
     stream.writeDouble(onda::plugin::defaultParamSmoothingSeconds);
     for (std::size_t index = 0;

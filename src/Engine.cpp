@@ -125,13 +125,15 @@ std::optional<std::string> parameterUnit(const onda_program_t *program,
   return std::string(buffer.data(), buffer.size() - 1U);
 }
 
-std::optional<ParameterMapping> parameterMapping(const onda_program_t *program,
-                                                 const int index) {
-  if (onda_param_array_len(program, index) != 1)
+std::optional<ParameterMapping>
+parameterMapping(const onda_program_t *program, const int index,
+                 const int element,
+                 const std::span<const std::uint8_t> defaults) {
+  const auto length = onda_param_array_len(program, index);
+  if (element < 0 || element >= length)
     return std::nullopt;
   const auto *declaredType = onda_param_type(program, index);
-  if (declaredType == nullptr ||
-      std::string_view{declaredType}.find('[') != std::string_view::npos)
+  if (declaredType == nullptr)
     return std::nullopt;
   const auto primitive = onda_param_elem_type(program, index);
   const auto type = primitiveName(primitive);
@@ -141,10 +143,16 @@ std::optional<ParameterMapping> parameterMapping(const onda_program_t *program,
 
   ParameterMapping mapping;
   mapping.parameterIndex = index;
+  mapping.elementIndex = element;
   mapping.type = type;
   mapping.unit = *unit;
   if (const auto *name = onda_param_name(program, index))
     mapping.name = name;
+  if (std::string_view{declaredType}.find('[') != std::string_view::npos) {
+    mapping.arrayName = mapping.name;
+    mapping.arrayLength = length;
+    mapping.name += "[" + std::to_string(element) + "]";
+  }
 
   const auto ranged = onda_param_has_range(program, index) == 1;
   mapping.defaultMayExceedRange = !ranged && primitive != ONDA_PRIMITIVE_BOOL;
@@ -192,19 +200,34 @@ std::optional<ParameterMapping> parameterMapping(const onda_program_t *program,
   }
 
   const auto hasDefault = onda_param_has_default(program, index) == 1;
-  if (primitive == ONDA_PRIMITIVE_I64 && hasDefault) {
-    // Unranged i64 defaults retain the full integer width through the raw API.
-    std::array<std::uint8_t, sizeof(std::int64_t)> bytes{};
-    if (onda_param_default_bytes(program, index, bytes.data(),
-                                 static_cast<int>(bytes.size())) !=
-        static_cast<int>(bytes.size()))
+  if (hasDefault) {
+    const auto width = primitiveBytes(primitive);
+    const auto offset = static_cast<std::size_t>(element) * width;
+    if (width == 0U || offset > defaults.size() || width > defaults.size() - offset)
       return std::nullopt;
-    mapping.defaultPlain =
-        std::bit_cast<std::int64_t>(readLittleEndian<std::uint64_t>(bytes.data()));
+    const auto *bytes = defaults.data() + offset;
+    switch (primitive) {
+    case ONDA_PRIMITIVE_BOOL:
+      mapping.defaultPlain = bytes[0] != 0U ? 1.0 : 0.0;
+      break;
+    case ONDA_PRIMITIVE_I32:
+      mapping.defaultPlain = static_cast<double>(std::bit_cast<std::int32_t>(
+          readLittleEndian<std::uint32_t>(bytes)));
+      break;
+    case ONDA_PRIMITIVE_I64:
+      mapping.defaultPlain = std::bit_cast<std::int64_t>(readLittleEndian<std::uint64_t>(bytes));
+      break;
+    case ONDA_PRIMITIVE_F32:
+      mapping.defaultPlain = static_cast<double>(std::bit_cast<float>(readLittleEndian<std::uint32_t>(bytes)));
+      break;
+    case ONDA_PRIMITIVE_F64:
+      mapping.defaultPlain = std::bit_cast<double>(readLittleEndian<std::uint64_t>(bytes));
+      break;
+    default:
+      return std::nullopt;
+    }
   } else {
-    mapping.defaultPlain =
-        hasDefault ? onda_param_default_f64(program, index)
-                   : std::clamp(0.0, mapping.rangeMin, mapping.rangeMax);
+    mapping.defaultPlain = std::clamp(0.0, mapping.rangeMin, mapping.rangeMax);
   }
   const auto defaultNumber = scalarPlainNumber(mapping.defaultPlain);
   if (!std::isfinite(defaultNumber))
@@ -973,32 +996,41 @@ BuildResult
 PreparedEngine::build(const std::filesystem::path &path, const Product product,
                       const double sampleRate, const int blockSize,
                       const std::span<const BufferFileBinding> bufferBindings,
-                      const std::optional<ParameterValues> &initialParameters) {
-  return build(compileFile(path, sampleRate, blockSize), product, sampleRate,
-               blockSize, bufferBindings, path, initialParameters);
+                      const std::optional<ParameterValues> &initialParameters,
+                      const bool fastMath) {
+  return build(std::make_shared<CompileResult>(
+                   compileFile(path, sampleRate, blockSize, fastMath)),
+               product, bufferBindings, initialParameters);
+}
+
+BuildResult PreparedEngine::build(
+    const ProjectImage &projectImage, const Product product,
+    const double sampleRate, const int blockSize,
+    const std::optional<ParameterValues> &initialParameters,
+    const bool fastMath,
+    const std::span<const BufferFileBinding> clearedBindings) {
+  return build(std::make_shared<CompileResult>(compileProjectImage(
+                   projectImage, sampleRate, blockSize, fastMath)),
+               product, clearedBindings, initialParameters);
 }
 
 BuildResult
-PreparedEngine::build(const ProjectImage &projectImage, const Product product,
-                      const double sampleRate, const int blockSize,
-                      const std::optional<ParameterValues> &initialParameters) {
-  return build(compileProjectImage(projectImage, sampleRate, blockSize),
-               product, sampleRate, blockSize, {}, {}, initialParameters);
-}
-
-BuildResult
-PreparedEngine::build(CompileResult compiled, const Product product,
-                      const double sampleRate, const int blockSize,
+PreparedEngine::build(std::shared_ptr<const CompileResult> compilation,
+                      const Product product,
                       const std::span<const BufferFileBinding> bufferBindings,
-                      const std::filesystem::path &diskEntry,
-                      const std::optional<ParameterValues> &initialParameters) {
+                      const std::optional<ParameterValues> &initialParameters,
+                      const std::span<const BufferFileSnapshot> retainedFiles) {
   BuildResult result;
-  result.projectImage = compiled.projectImage;
-  result.watchPaths = std::move(compiled.watchPaths);
-  result.diagnostic = std::move(compiled.diagnostic);
+  result.compilation = std::move(compilation);
+  const auto &compiled = *result.compilation;
+  const auto sampleRate = compiled.sampleRate;
+  const auto blockSize = compiled.blockSize;
+  result.watchPaths = compiled.watchPaths;
+  result.diagnostic = compiled.diagnostic;
   if (!compiled.program)
     return result;
-  const auto hasProjectDefaults = result.projectImage.valid();
+  const auto hasProjectDefaults = compiled.projectImage.valid();
+  std::optional<BufferWaveforms> defaultWaveforms;
 
   Diagnostic diagnostic;
   const auto inputs = flattenedChannels(compiled.program.get(), true,
@@ -1020,6 +1052,7 @@ PreparedEngine::build(CompileResult compiled, const Product product,
   bufferMappings.reserve(static_cast<std::size_t>(bufferCount));
   std::vector<ProjectBufferAsset> projectBufferAssets;
   projectBufferAssets.reserve(static_cast<std::size_t>(bufferCount));
+  std::vector<std::string> clearedBuffers;
   std::string bufferError;
   for (int index = 0; index < bufferCount; ++index) {
     const auto *rawName = onda_buffer_name(compiled.program.get(), index);
@@ -1059,20 +1092,19 @@ PreparedEngine::build(CompileResult compiled, const Product product,
         hasProjectDefaults && asset != compiled.projectBuffers.end();
     const auto binding = std::ranges::find(bufferBindings, mapping.name,
                                            &BufferFileBinding::name);
-    if (binding == bufferBindings.end() || binding->path.empty()) {
-      if (!hasProjectDefaults) {
-        if (bufferError.empty())
-          bufferError = "Buffer '" + mapping.name + "' is not bound";
+    if (binding != bufferBindings.end() && binding->path.empty()) {
+      clearedBuffers.push_back(mapping.name);
+      bufferMappings.push_back(std::move(mapping));
+      continue;
+    }
+    if (binding == bufferBindings.end()) {
+      // Unbound slots use Onda's neutral buffer descriptor, as in onda run.
+      if (asset == compiled.projectBuffers.end()) {
         bufferMappings.push_back(std::move(mapping));
         continue;
       }
-
-      if (asset == compiled.projectBuffers.end()) {
-        if (bufferError.empty())
-          bufferError =
-              "Buffer '" + mapping.name + "' is missing from the saved project";
-      } else if (asset->frames > std::numeric_limits<int>::max() ||
-                 asset->channels > std::numeric_limits<int>::max()) {
+      if (asset->frames > std::numeric_limits<int>::max() ||
+          asset->channels > std::numeric_limits<int>::max()) {
         if (bufferError.empty())
           bufferError = "Saved project buffer '" + mapping.name +
                         "' has unsupported dimensions";
@@ -1080,6 +1112,11 @@ PreparedEngine::build(CompileResult compiled, const Product product,
         mapping.loadedFrames = static_cast<int>(asset->frames);
         mapping.loadedChannels = static_cast<int>(asset->channels);
         mapping.loadedSampleRate = asset->sampleRate;
+        if (!defaultWaveforms)
+          defaultWaveforms = projectBufferWaveforms(compiled.projectImage);
+        if (const auto preview = defaultWaveforms->find(mapping.name);
+            preview != defaultWaveforms->end())
+          mapping.waveform = preview->second;
       }
       bufferMappings.push_back(std::move(mapping));
       continue;
@@ -1095,20 +1132,28 @@ PreparedEngine::build(CompileResult compiled, const Product product,
       bufferMappings.push_back(std::move(mapping));
       continue;
     }
-    if (onda_buffer_elem_type(compiled.program.get(), index) !=
-        ONDA_PRIMITIVE_F32) {
-      if (bufferError.empty()) {
-        bufferError = "Audio-file bindings require an f32 Onda buffer, but '" +
-                      mapping.name + "' is " + mapping.type;
+    const auto retained = std::ranges::find_if(
+        retainedFiles, [&](const BufferFileSnapshot &file) {
+          return file.binding == *binding;
+        });
+    std::shared_ptr<DecodedAudioFile> audio;
+    if (retained != retainedFiles.end()) {
+      audio = retained->audio;
+    } else {
+      auto decoded = decodeAudioFile(binding->path);
+      if (!decoded.audio) {
+        if (bufferError.empty())
+          bufferError = std::move(decoded.error);
+        bufferMappings.push_back(std::move(mapping));
+        continue;
       }
-      bufferMappings.push_back(std::move(mapping));
-      continue;
+      audio = std::make_shared<DecodedAudioFile>(std::move(*decoded.audio));
     }
-
-    auto decoded = decodeAudioFile(binding->path);
-    if (!decoded.audio) {
+    if (audio->samples.elementType() !=
+        onda_buffer_elem_type(compiled.program.get(), index)) {
       if (bufferError.empty())
-        bufferError = std::move(decoded.error);
+        bufferError = "Buffer asset element type does not match Onda buffer '" +
+                      mapping.name + "' (" + mapping.type + ")";
       bufferMappings.push_back(std::move(mapping));
       continue;
     }
@@ -1117,30 +1162,30 @@ PreparedEngine::build(CompileResult compiled, const Product product,
             ? 1
             : (mapping.channelKind == BufferChannelKind::fixed
                    ? mapping.fixedChannels
-                   : decoded.audio->channels);
-    if (decoded.audio->channels != expectedChannels) {
+                   : audio->channels);
+    if (audio->channels != expectedChannels) {
       if (bufferError.empty()) {
         bufferError = "Audio file for buffer '" + mapping.name + "' has " +
-                      std::to_string(decoded.audio->channels) +
-                      " channels; expected " + std::to_string(expectedChannels);
+                      std::to_string(audio->channels) + " channels; expected " +
+                      std::to_string(expectedChannels);
       }
       bufferMappings.push_back(std::move(mapping));
       continue;
     }
 
     auto &storage = bufferStorage[static_cast<std::size_t>(index)];
-    storage.samples = std::move(decoded.audio->interleavedSamples);
-    storage.frames = decoded.audio->frames;
-    storage.channels = decoded.audio->channels;
-    storage.sampleRate = decoded.audio->sampleRate;
+    storage = std::move(audio);
+    result.bufferFiles.push_back({.binding = *binding, .audio = storage});
     mapping.loadedPath = binding->path;
-    mapping.loadedFrames = storage.frames;
-    mapping.loadedChannels = storage.channels;
-    mapping.loadedSampleRate = storage.sampleRate;
+    mapping.loadedFrames = storage->frames;
+    mapping.loadedChannels = storage->channels;
+    mapping.loadedSampleRate = storage->sampleRate;
+    mapping.waveform = makeBufferWaveform(storage->samples, storage->channels);
     Diagnostic assetDiagnostic;
-    auto encoded =
-        encodeF32BufferAsset(storage.samples, storage.frames, storage.channels,
-                             storage.sampleRate, assetDiagnostic);
+    auto encoded = encodeBufferAsset(storage->samples.elementType(),
+                                     storage->samples.bytes(), storage->frames,
+                                     storage->channels, storage->sampleRate,
+                                     assetDiagnostic);
     if (encoded.empty()) {
       if (bufferError.empty())
         bufferError = std::move(assetDiagnostic.message);
@@ -1180,8 +1225,8 @@ PreparedEngine::build(CompileResult compiled, const Product product,
   std::vector<float> inputSlab(inputSamples);
   std::vector<float> outputSlab(outputSamples);
   auto engine = std::unique_ptr<PreparedEngine>(new PreparedEngine(
-      sampleRate, blockSize, std::move(compiled.program), std::move(instance),
-      inputs, outputs, std::move(inputSlab), std::move(outputSlab),
+      sampleRate, blockSize, compiled.program, std::move(instance), inputs,
+      outputs, std::move(inputSlab), std::move(outputSlab),
       std::move(bufferStorage), std::move(bufferMappings)));
 
   if (!engine->prepareInputDefaults(result.diagnostic) ||
@@ -1195,11 +1240,17 @@ PreparedEngine::build(CompileResult compiled, const Product product,
   }
   for (int index = 0; index < bufferCount; ++index) {
     auto &storage = engine->bufferStorage_[static_cast<std::size_t>(index)];
-    if (!storage.samples.empty()) {
-      if (onda_bind_buffer(engine->instance_.get(), index,
-                           storage.samples.data(), storage.frames,
-                           storage.channels, storage.sampleRate,
-                           ONDA_PRIMITIVE_F32) != 0) {
+    const auto &mapping =
+        engine->bufferMappings_[static_cast<std::size_t>(index)];
+    const auto cleared =
+        std::ranges::find(clearedBuffers, mapping.name) != clearedBuffers.end();
+    if (storage || cleared) {
+      if (onda_bind_buffer(
+              engine->instance_.get(), index,
+              storage ? storage->samples.data() : nullptr,
+              storage ? storage->frames : 0, storage ? storage->channels : 0,
+              storage ? storage->sampleRate : 0.0F,
+              onda_buffer_elem_type(engine->program_.get(), index)) != 0) {
         result.diagnostic = error(
             "Failed to bind audio file for Onda buffer '" +
             engine->bufferMappings_[static_cast<std::size_t>(index)].name +
@@ -1216,18 +1267,36 @@ PreparedEngine::build(CompileResult compiled, const Product product,
   for (int index = 0;
        index < parameterCount && engine->parameterMappingCount_ < slotCount;
        ++index) {
-    auto mapping = parameterMapping(engine->program_.get(), index);
-    if (!mapping)
-      continue;
-    const auto slot = engine->parameterMappingCount_++;
-    const auto primitive = onda_param_elem_type(engine->program_.get(), index);
-    if (!mapping->stepCount &&
-        (primitive == ONDA_PRIMITIVE_F32 || primitive == ONDA_PRIMITIVE_F64))
-      engine->smoothedParameterTypes_[slot] = primitive;
-    engine->parameterDomains_[slot] = mapping->scalarDomain();
-    engine->parameterHostDomains_[slot] = mapping->hostDomain();
-    engine->resolvedParameterValues_[slot] = mapping->parameterDefault();
-    engine->parameterMappings_[slot] = std::move(*mapping);
+    const auto defaultBytes =
+        onda_param_default_bytes(engine->program_.get(), index, nullptr, 0);
+    std::vector<std::uint8_t> defaults(
+        static_cast<std::size_t>(std::max(defaultBytes, 0)));
+    if (defaultBytes < 0 ||
+        (defaultBytes > 0 && onda_param_default_bytes(
+                                 engine->program_.get(), index, defaults.data(),
+                                 defaultBytes) != defaultBytes)) {
+      result.diagnostic = error("Onda returned invalid parameter defaults");
+      return result;
+    }
+    const auto length = onda_param_array_len(engine->program_.get(), index);
+    for (int element = 0;
+         element < length && engine->parameterMappingCount_ < slotCount;
+         ++element) {
+      auto mapping =
+          parameterMapping(engine->program_.get(), index, element, defaults);
+      if (!mapping)
+        continue;
+      const auto slot = engine->parameterMappingCount_++;
+      const auto primitive =
+          onda_param_elem_type(engine->program_.get(), index);
+      if (!mapping->stepCount &&
+          (primitive == ONDA_PRIMITIVE_F32 || primitive == ONDA_PRIMITIVE_F64))
+        engine->smoothedParameterTypes_[slot] = primitive;
+      engine->parameterDomains_[slot] = mapping->scalarDomain();
+      engine->parameterHostDomains_[slot] = mapping->hostDomain();
+      engine->resolvedParameterValues_[slot] = mapping->parameterDefault();
+      engine->parameterMappings_[slot] = std::move(*mapping);
+    }
   }
 
   if (initialParameters) {
@@ -1268,15 +1337,16 @@ PreparedEngine::build(CompileResult compiled, const Product product,
     return result;
   }
 
+  result.projectImage = compiled.projectImage;
   if (result.projectImage.valid() && !projectBufferAssets.empty()) {
     result.projectImage = withProjectBufferOverrides(
         result.projectImage, projectBufferAssets, result.diagnostic);
     if (!result.projectImage.valid())
       return result;
-  } else if (!result.projectImage.valid()) {
-    result.projectImage =
-        captureProjectImage(diskEntry, compiled.manifest.get(),
-                            projectBufferAssets, result.diagnostic);
+  }
+  if (!clearedBuffers.empty()) {
+    result.projectImage = withoutProjectBuffers(
+        result.projectImage, clearedBuffers, result.diagnostic);
     if (!result.projectImage.valid())
       return result;
   }
@@ -1297,19 +1367,21 @@ void PreparedEngine::applyParameter(const std::size_t slot,
     return;
   parameterTargets_[slot] = normalized;
   parameterPlainDefaults_[slot] = exact;
-  const auto plain =
-      exact ? *exact
-            : ScalarPlain{onda_processor_param_normalized_to_plain(
-                  &parameterHostDomains_[slot], normalized)};
+  const auto plain = exact
+                         ? *exact
+                         : ScalarPlain{onda_processor_param_normalized_to_plain(
+                               &parameterHostDomains_[slot], normalized)};
   parameterRamps_[slot].reset(writeParameterPlain(slot, plain));
 }
 
 double PreparedEngine::writeParameterPlain(const std::size_t slot,
                                            const ScalarPlain &value) noexcept {
   const auto index = parameterMappings_[slot].parameterIndex;
-  const auto write = [this, index]<typename T>(const T scalar) noexcept {
-    static_cast<void>(onda_set_param_by_index(instance_.get(), index, &scalar,
-                                              sizeof(scalar)));
+  const auto element = parameterMappings_[slot].elementIndex;
+  const auto write = [this, index,
+                      element]<typename T>(const T scalar) noexcept {
+    static_cast<void>(onda_set_param_element_by_index(
+        instance_.get(), index, element, &scalar, sizeof(scalar)));
     return static_cast<double>(scalar);
   };
   return std::visit(
@@ -1435,7 +1507,10 @@ void PreparedEngine::beginHostCallback(const int frames,
                         ? automation
                         : nullptr;
   if (hostAutomation_ != nullptr) {
-    const auto mappedLanes = (std::uint64_t{1} << parameterMappingCount_) - 1U;
+    const auto mappedLanes =
+        parameterMappingCount_ == 64U
+            ? std::numeric_limits<std::uint64_t>::max()
+            : (std::uint64_t{1} << parameterMappingCount_) - 1U;
     detail::forEachAutomationLane(
         hostAutomation_->boundLanes() & mappedLanes,
         [this](const std::size_t slot) noexcept {

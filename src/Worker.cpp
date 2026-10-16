@@ -49,7 +49,7 @@ std::uint64_t hashStream(std::istream &stream) {
 
 void normalizeBindings(std::vector<BufferFileBinding> &bindings) {
   std::erase_if(bindings, [](const BufferFileBinding &binding) {
-    return binding.name.empty() || binding.path.empty();
+    return binding.name.empty();
   });
   std::sort(bindings.begin(), bindings.end(),
             [](const BufferFileBinding &left, const BufferFileBinding &right) {
@@ -99,13 +99,16 @@ Worker::~Worker() {
   collectRetired();
 }
 
-void Worker::configure(const double sampleRate, const int blockSize) {
+void Worker::configure(const double sampleRate, const int blockSize,
+                       const bool fastMath) {
   {
     std::lock_guard lock(mutex_);
-    if (desired_.sampleRate == sampleRate && desired_.blockSize == blockSize)
+    if (desired_.sampleRate == sampleRate && desired_.blockSize == blockSize &&
+        desired_.fastMath == fastMath)
       return;
     desired_.sampleRate = sampleRate;
     desired_.blockSize = blockSize;
+    desired_.fastMath = fastMath;
     desired_.recoverCheckpoint = true;
     advanceGeneration();
     forceRebuild_ = true;
@@ -223,7 +226,7 @@ void Worker::loadWithBufferBindings(
 std::optional<ProjectExportSnapshot> Worker::projectExportSnapshot() const {
   std::lock_guard lock(mutex_);
   // Do not export an older published project over a pending user selection.
-  if (!publishedProjectState_.projectImage.valid() ||
+  if (pendingBufferClear_ || !publishedProjectState_.projectImage.valid() ||
       desired_.path != publishedProjectState_.path ||
       desired_.bufferBindings != publishedProjectState_.bufferBindings ||
       desired_.fallbackProjectImage != publishedProjectState_.projectImage)
@@ -260,6 +263,9 @@ void Worker::restore(std::filesystem::path path, ProjectImage projectImage,
     desired_.path = std::move(path);
     desired_.bufferBindings = std::move(bufferBindings);
     desired_.fallbackProjectImage = std::move(projectImage);
+    pendingBufferClear_ = std::ranges::any_of(
+        desired_.bufferBindings,
+        [](const BufferFileBinding &binding) { return binding.path.empty(); });
     desired_.recoverCheckpoint = false;
     desired_.defaultSeedRevision = 0;
     desired_.notifyProjectChange = false;
@@ -295,6 +301,7 @@ void Worker::unload(const bool notifyHost) {
     desired_.defaultSeedRevision = 0;
     desired_.bufferBindings.clear();
     desired_.fallbackProjectImage = {};
+    pendingBufferClear_ = false;
     advanceGeneration();
     forceRebuild_ = false;
     publishProjectState({}, notifyHost);
@@ -327,11 +334,9 @@ void Worker::bindBufferFile(std::string name, std::filesystem::path path) {
     return;
   {
     std::lock_guard lock(mutex_);
-    const auto existing = std::find_if(
-        desired_.bufferBindings.begin(), desired_.bufferBindings.end(),
-        [&name](const BufferFileBinding &binding) {
-          return binding.name == name;
-        });
+    const auto changedBuffer = std::string{name};
+    const auto existing = std::ranges::find(desired_.bufferBindings, name,
+                                            &BufferFileBinding::name);
     if (existing != desired_.bufferBindings.end())
       existing->path = std::move(path);
     else
@@ -340,8 +345,10 @@ void Worker::bindBufferFile(std::string name, std::filesystem::path path) {
     normalizeBindings(desired_.bufferBindings);
     desired_.notifyProjectChange = true;
     advanceGeneration();
+    desired_.reuseCompilation = true;
+    desired_.changedBuffers = {changedBuffer};
     forceRebuild_ = true;
-    status_.message = "Waiting to bind audio file";
+    status_.message = "Waiting to bind buffer file";
     status_.compiling = false;
     status_.hasError = false;
     publishIncompleteProjectState();
@@ -355,40 +362,36 @@ void Worker::clearBuffer(const std::string_view name) {
     return;
   {
     std::lock_guard lock(mutex_);
-    std::erase_if(desired_.bufferBindings,
-                  [name](const BufferFileBinding &binding) {
-                    return binding.name == name;
-                  });
+    // An empty path explicitly unbinds this slot, including project defaults.
+    const auto changedBuffer = std::string{name};
+    const auto existing = std::ranges::find(desired_.bufferBindings, name,
+                                            &BufferFileBinding::name);
+    if (existing != desired_.bufferBindings.end())
+      existing->path.clear();
+    else
+      desired_.bufferBindings.push_back(
+          {.name = std::string{name}, .path = {}});
+    normalizeBindings(desired_.bufferBindings);
     desired_.notifyProjectChange = true;
     advanceGeneration();
+    desired_.reuseCompilation = true;
+    desired_.changedBuffers = {changedBuffer};
     forceRebuild_ = true;
-    status_.message = "Waiting for buffer binding";
+    status_.message = "Waiting to clear buffer";
     status_.compiling = false;
     status_.hasError = false;
-    auto &buffers =
-        status_.pendingBuffers ? *status_.pendingBuffers : status_.buffers;
-    const auto buffer = std::ranges::find(buffers, name, &BufferMapping::name);
-    // Source-image assets retain file bindings, rather than providing defaults
-    // for the linked source when a required binding is cleared.
-    const auto hasDefault =
-        (desired_.path.empty() || isOndaProjectPath(desired_.path)) &&
-        buffer != buffers.end() && buffer->hasProjectDefault;
-    // Required bindings invalidate the project immediately. Default-backed and
-    // pending replacements retain the complete checkpoint until they succeed.
-    if (!status_.pendingBuffers && !hasDefault) {
-      desired_.fallbackProjectImage = {};
-      deactivateStatus();
+    const auto clearsCurrentBuffer =
+        std::ranges::find(status_.buffers, name, &BufferMapping::name) !=
+        status_.buffers.end();
+    if ((!status_.pendingBuffers || clearsCurrentBuffer) &&
+        publishedProjectState_.path == desired_.path) {
+      pendingBufferClear_ = true;
       publishProjectState({.path = desired_.path,
                            .bufferBindings = desired_.bufferBindings,
-                           .projectImage = {}},
-                          true);
-      deactivateRequested_.store(true, std::memory_order_release);
-    }
-    if (buffer != buffers.end() && (status_.pendingBuffers || !hasDefault)) {
-      buffer->loadedPath.clear();
-      buffer->loadedFrames = 0;
-      buffer->loadedChannels = 0;
-      buffer->loadedSampleRate = 0.0F;
+                           .projectImage = publishedProjectState_.projectImage},
+                          true, publishedSeedValues_);
+    } else {
+      publishIncompleteProjectState();
     }
     incrementStatusRevision();
   }
@@ -549,6 +552,8 @@ HostParameterValues Worker::parameterValuesLocked() const {
 }
 
 void Worker::advanceGeneration() noexcept {
+  desired_.reuseCompilation = false;
+  desired_.changedBuffers.clear();
   ++desired_.generation;
   requestGeneration_.store(desired_.generation, std::memory_order_release);
 }
@@ -653,8 +658,17 @@ bool Worker::updateStatus(const Request &request, std::string message,
     status_.events = retained->status.events;
     status_.midi = retained->status.midi;
     status_.usingProjectImage = retained->status.usingProjectImage;
-    publishProjectState(retained->project, desired_.notifyProjectChange,
-                        retained->seed, retained->values);
+    // Clear intent belongs to saved state immediately, while audio can still
+    // be using an older instance. Status updates must not resurrect its assets.
+    const auto retainClearIntent =
+        publishedProjectState_.path == desired_.path &&
+        std::ranges::any_of(publishedProjectState_.bufferBindings,
+                            [](const BufferFileBinding &binding) {
+                              return binding.path.empty();
+                            });
+    if (!retainClearIntent)
+      publishProjectState(retained->project, desired_.notifyProjectChange,
+                          retained->seed, retained->values);
     status_.active = true;
     hasPreparedEngine_.store(true, std::memory_order_release);
   } else {
@@ -674,6 +688,7 @@ bool Worker::matchesDesiredLocked(const Request &request) const {
          request.path == desired_.path &&
          request.sampleRate == desired_.sampleRate &&
          request.blockSize == desired_.blockSize &&
+         request.fastMath == desired_.fastMath &&
          request.bufferBindings == desired_.bufferBindings &&
          request.fallbackProjectImage == desired_.fallbackProjectImage;
 }
@@ -733,8 +748,7 @@ bool Worker::sameContents(const std::vector<FileStamp> &left,
   return left.size() == right.size() &&
          std::equal(left.begin(), left.end(), right.begin(),
                     [](const FileStamp &a, const FileStamp &b) {
-                      return a.path == b.path && a.hash == b.hash &&
-                             a.size == b.size && a.exists == b.exists;
+                      return a.sameContents(b);
                     });
 }
 
@@ -745,6 +759,46 @@ Worker::mergedPaths(std::vector<std::filesystem::path> first,
   std::sort(first.begin(), first.end());
   first.erase(std::unique(first.begin(), first.end()), first.end());
   return first;
+}
+
+std::optional<std::vector<std::string>>
+Worker::changedBufferNames(const Request &request,
+                           std::span<const std::filesystem::path> paths) const {
+  std::vector<std::string> names;
+  for (const auto &path : paths) {
+    if (path == request.path ||
+        (compilation_ && std::ranges::find(compilation_->watchPaths, path) !=
+                             compilation_->watchPaths.end()))
+      return std::nullopt;
+    const auto countBefore = names.size();
+    const auto addBinding = [&](const BufferFileBinding &binding) {
+      if (binding.path == path)
+        names.push_back(binding.name);
+    };
+    for (const auto &binding : request.bufferBindings)
+      addBinding(binding);
+    // A clear or replacement can remove the old path before its event arrives.
+    for (const auto &file : bufferFiles_)
+      addBinding(file.snapshot.binding);
+    if (names.size() == countBefore)
+      return std::nullopt;
+  }
+  std::sort(names.begin(), names.end());
+  names.erase(std::unique(names.begin(), names.end()), names.end());
+  return names;
+}
+
+void Worker::replaceBufferCache(
+    const std::span<const BufferFileSnapshot> files,
+    const std::span<const FileStamp> stamps) {
+  bufferFiles_.clear();
+  bufferFiles_.reserve(files.size());
+  for (const auto &file : files) {
+    const auto stamp =
+        std::ranges::lower_bound(stamps, file.binding.path, {}, &FileStamp::path);
+    if (stamp != stamps.end() && stamp->path == file.binding.path)
+      bufferFiles_.push_back({file, *stamp});
+  }
 }
 
 void Worker::filesystemChanged(
@@ -771,7 +825,8 @@ void Worker::refreshFilesystemWatcher() {
 
 bool Worker::watchedFilesChanged(
     const std::vector<std::filesystem::path> &paths,
-    const bool allowMetadataShortcut) {
+    const bool allowMetadataShortcut,
+    std::vector<std::filesystem::path> *contentChanges) {
   auto changedPaths = paths;
   std::sort(changedPaths.begin(), changedPaths.end());
   changedPaths.erase(std::unique(changedPaths.begin(), changedPaths.end()),
@@ -800,8 +855,13 @@ bool Worker::watchedFilesChanged(
     return false;
 
   auto current = capture(selected);
-  if (!sameContents(previous, current))
+  if (!sameContents(previous, current)) {
+    if (contentChanges)
+      for (std::size_t index = 0; index < current.size(); ++index)
+        if (!previous[index].sameContents(current[index]))
+          contentChanges->push_back(current[index].path);
     return true;
+  }
 
   for (auto &stamp : current) {
     const auto destination = std::lower_bound(
@@ -847,25 +907,90 @@ void Worker::build(const Request &request) {
         initialParameters = fallback.values.parameters;
     }
   }
-  if (!updateStatus(request, "Compiling", true))
-    return;
-
+  auto reuseCompilation = !buildFunction_ && request.reuseCompilation &&
+                          compilation_ && compilationPath_ == request.path &&
+                          compilation_->sampleRate == request.sampleRate &&
+                          compilation_->blockSize == request.blockSize &&
+                          compilation_->fastMath == request.fastMath;
   auto prePaths = watchedPaths_;
   if (!request.path.empty())
     prePaths.push_back(request.path);
   for (const auto &binding : request.bufferBindings)
-    prePaths.push_back(binding.path);
+    if (!binding.path.empty())
+      prePaths.push_back(binding.path);
   prePaths = mergedPaths(std::move(prePaths), {});
   filesystemFallbackPaths_ = filesystemWatcher_.watch(prePaths);
   const auto before = capture(prePaths);
   const auto watchRevision = filesystemWatcher_.revision();
 
+  auto changedBuffers = request.changedBuffers;
+  if (reuseCompilation) {
+    // Native events may still be queued. Validate the cache against the bytes
+    // already captured above before advancing any watcher snapshot.
+    std::vector<std::filesystem::path> changes;
+    for (const auto &stamp : before) {
+      const auto previous = std::ranges::lower_bound(watchedStamp_, stamp.path,
+                                                     {}, &FileStamp::path);
+      if (previous != watchedStamp_.end() && previous->path == stamp.path &&
+          !previous->sameContents(stamp))
+        changes.push_back(stamp.path);
+    }
+    if (const auto buffers = changedBufferNames(request, changes))
+      changedBuffers.insert(changedBuffers.end(), buffers->begin(),
+                            buffers->end());
+    else
+      reuseCompilation = false;
+    // Watcher hashes describe the latest attempt, which may have failed before
+    // decoding buffers. Validate samples against the bytes they came from.
+    for (const auto &file : bufferFiles_) {
+      const auto current = std::ranges::lower_bound(
+          before, file.snapshot.binding.path, {}, &FileStamp::path);
+      if (current == before.end() ||
+          current->path != file.snapshot.binding.path)
+        continue;
+      // Saved-image instances retain samples when that same link disappears.
+      // A clear or a different requested path must still take effect.
+      if (compilationFromImage_ && !current->exists &&
+          std::ranges::find(request.bufferBindings, file.snapshot.binding) !=
+              request.bufferBindings.end())
+        std::erase(changedBuffers, file.snapshot.binding.name);
+      else if (!file.stamp.sameContents(*current))
+        changedBuffers.push_back(file.snapshot.binding.name);
+    }
+  }
+  if (!updateStatus(request,
+                    reuseCompilation ? "Preparing buffers" : "Compiling", true))
+    return;
+
   // Disk preparation and image fallback use the same captured host values.
   // New patch selections deliberately initialize with declared defaults.
   BuildResult diskResult;
+  auto imageBufferBindings = imageBufferBindings_;
   try {
     std::lock_guard compileLock(compileMutex);
-    if (request.path.empty()) {
+    if (reuseCompilation) {
+      auto bindings = request.bufferBindings;
+      std::vector<BufferFileSnapshot> retainedFiles;
+      retainedFiles.reserve(bufferFiles_.size());
+      for (const auto &file : bufferFiles_)
+        if (std::ranges::find(changedBuffers, file.snapshot.binding.name) ==
+            changedBuffers.end())
+          retainedFiles.push_back(file.snapshot);
+      if (compilationFromImage_) {
+        // A changed binding must keep using disk even if its decode fails.
+        std::erase_if(imageBufferBindings, [&](const BufferFileBinding &binding) {
+          return std::ranges::find(changedBuffers, binding.name) !=
+                 changedBuffers.end();
+        });
+        std::erase_if(bindings, [&](const BufferFileBinding &binding) {
+          return !binding.path.empty() &&
+                 std::ranges::find(imageBufferBindings, binding) !=
+                     imageBufferBindings.end();
+        });
+      }
+      diskResult = PreparedEngine::build(compilation_, product_, bindings,
+                                         initialParameters, retainedFiles);
+    } else if (request.path.empty()) {
       diskResult.diagnostic.message = "No linked Onda project path";
     } else {
       diskResult =
@@ -875,8 +1000,8 @@ void Worker::build(const Request &request) {
                                initialParameters)
               : PreparedEngine::build(request.path, product_,
                                       request.sampleRate, request.blockSize,
-                                      request.bufferBindings,
-                                      initialParameters);
+                                      request.bufferBindings, initialParameters,
+                                      request.fastMath);
     }
   } catch (const std::bad_alloc &) {
     diskResult.diagnostic.message =
@@ -889,6 +1014,9 @@ void Worker::build(const Request &request) {
   auto attemptPaths = std::move(diskResult.watchPaths);
   if (!request.path.empty())
     attemptPaths.push_back(request.path);
+  for (const auto &binding : request.bufferBindings)
+    if (!binding.path.empty())
+      attemptPaths.push_back(binding.path);
   attemptPaths = mergedPaths(std::move(attemptPaths), {});
 
   const auto discoveredNewPath =
@@ -908,14 +1036,26 @@ void Worker::build(const Request &request) {
 
   const auto retryChangedSources = [this, &request, &attemptPaths] {
     watchedPaths_ = mergedPaths(successfulPaths_, attemptPaths);
+    std::vector<std::filesystem::path> changes;
+    static_cast<void>(watchedFilesChanged(watchedPaths_, false, &changes));
+    const auto buffers = changedBufferNames(request, changes);
     refreshFilesystemWatcher();
     watchedStamp_ = capture(watchedPaths_);
     {
       std::lock_guard lock(mutex_);
+      if (!matchesDesiredLocked(request))
+        return;
       forceRebuild_ = true;
+      desired_.reuseCompilation =
+          request.reuseCompilation && buffers.has_value();
+      if (desired_.reuseCompilation)
+        desired_.changedBuffers.insert(desired_.changedBuffers.end(),
+                                       buffers->begin(), buffers->end());
+      else
+        desired_.changedBuffers.clear();
     }
     static_cast<void>(updateStatus(
-        request, "Sources changed during compilation; retrying", false));
+        request, "Files changed during preparation; retrying", false));
     wake_.notify_one();
   };
 
@@ -934,8 +1074,20 @@ void Worker::build(const Request &request) {
     watchedStamp_ = std::move(after);
   };
 
+  if (diskResult.compilation && diskResult.compilation->program) {
+    compilation_ = diskResult.compilation;
+    compilationPath_ = request.path;
+    if (!reuseCompilation)
+      compilationFromImage_ = false;
+    imageBufferBindings_ = compilationFromImage_
+                               ? std::move(imageBufferBindings)
+                               : std::vector<BufferFileBinding>{};
+    // These samples match the validated file snapshot, even on failure. Replace
+    // the cache to retain decoded peers and discard entries that failed decode.
+    replaceBufferCache(diskResult.bufferFiles, after);
+  }
   const auto diskFailure = diagnosticMessage(diskResult.diagnostic);
-  auto usingProjectImage = false;
+  auto usingProjectImage = reuseCompilation && compilationFromImage_;
   auto attemptedProjectImage = false;
   auto result = std::move(diskResult);
   if (!result.engine && !hadActiveEngine &&
@@ -946,6 +1098,10 @@ void Worker::build(const Request &request) {
         request, "Linked project failed; restoring saved project image", true));
     try {
       std::lock_guard compileLock(compileMutex);
+      std::vector<BufferFileBinding> clearedBindings;
+      for (const auto &binding : fallback.project.bufferBindings)
+        if (binding.path.empty())
+          clearedBindings.push_back(binding);
       result =
           projectBuildFunction_
               ? projectBuildFunction_(fallback.project.projectImage, product_,
@@ -953,7 +1109,14 @@ void Worker::build(const Request &request) {
                                       fallback.values.parameters)
               : PreparedEngine::build(fallback.project.projectImage, product_,
                                       request.sampleRate, request.blockSize,
-                                      fallback.values.parameters);
+                                      fallback.values.parameters,
+                                      request.fastMath, clearedBindings);
+      if (result.engine && result.compilation) {
+        compilation_ = result.compilation;
+        compilationPath_ = fallback.project.path;
+        compilationFromImage_ = true;
+        imageBufferBindings_ = fallback.project.bufferBindings;
+      }
       usingProjectImage = result.engine != nullptr;
     } catch (const std::bad_alloc &) {
       result.diagnostic.message =
@@ -992,6 +1155,7 @@ void Worker::build(const Request &request) {
     finishRequest(request.generation);
     return;
   }
+  replaceBufferCache(result.bufferFiles, after);
 
   if (!usingProjectImage)
     successfulPaths_ = attemptPaths;
@@ -1062,17 +1226,22 @@ void Worker::build(const Request &request) {
     retainResets(checkpointValues.controls, checkpointValues.controlStamps,
                  editorDefaults_.controls, editorDefaults_.controlStamps,
                  editorDefaults.controlStamps);
-    publishProjectState(
-        usingProjectImage
+    auto project =
+        attemptedProjectImage
             ? fallback.project
             : PersistedProjectState{.path = desired_.path,
                                     .bufferBindings = desired_.bufferBindings,
-                                    .projectImage = result.projectImage},
-        desired_.notifyProjectChange, seed, checkpointValues);
+                                    .projectImage = {}};
+    project.projectImage = result.projectImage;
+    publishProjectState(std::move(project), desired_.notifyProjectChange, seed,
+                        checkpointValues);
+    pendingBufferClear_ = false;
     desired_.fallbackProjectImage = result.projectImage;
     status_.path = desired_.path;
     status_.message = usingProjectImage
-                          ? "Active from saved project: " + diskFailure
+                          ? (attemptedProjectImage
+                                 ? "Active from saved project: " + diskFailure
+                                 : "Active from saved project")
                           : "Active";
     status_.compiling = false;
     status_.hasError = usingProjectImage && !desired_.path.empty();
@@ -1165,6 +1334,11 @@ void Worker::run() noexcept {
 
       if (request.path.empty() && !request.fallbackProjectImage.valid()) {
         destroy(replacements_.tryPop());
+        compilation_.reset();
+        compilationPath_.clear();
+        bufferFiles_.clear();
+        compilationFromImage_ = false;
+        imageBufferBindings_.clear();
         watchedPaths_.clear();
         successfulPaths_.clear();
         watchedStamp_.clear();
@@ -1176,6 +1350,7 @@ void Worker::run() noexcept {
         continue;
 
       auto filesChanged = false;
+      std::vector<std::filesystem::path> contentChanges;
       const auto nativeChange = !filesystemChanges.empty();
       if (nativeChange || fallbackValidation) {
         if (fallbackValidation) {
@@ -1188,8 +1363,13 @@ void Worker::run() noexcept {
         refreshFilesystemWatcher();
         // A native invalidation can change bytes without changing metadata.
         // Only fallback polling may skip hashing unchanged metadata.
-        filesChanged = watchedFilesChanged(filesystemChanges, !nativeChange);
+        filesChanged = watchedFilesChanged(filesystemChanges, !nativeChange,
+                                           &contentChanges);
       }
+      // File replacements can arrive alongside an explicit bind. Reuse code
+      // for external-buffer edits, but decode every affected file afresh.
+      const auto changedBuffers = changedBufferNames(request, contentChanges);
+      const auto buffersOnly = filesChanged && changedBuffers.has_value();
       bool shouldBuild = false;
       {
         std::lock_guard lock(mutex_);
@@ -1197,6 +1377,15 @@ void Worker::run() noexcept {
           if (filesChanged && request.generation == completedGeneration_) {
             desired_.notifyProjectChange = true;
             advanceGeneration();
+          }
+          if (filesChanged) {
+            desired_.reuseCompilation = buffersOnly;
+            if (buffersOnly)
+              desired_.changedBuffers.insert(desired_.changedBuffers.end(),
+                                             changedBuffers->begin(),
+                                             changedBuffers->end());
+            else
+              desired_.changedBuffers.clear();
             request = desired_;
           }
           shouldBuild = forceRebuild || filesChanged ||

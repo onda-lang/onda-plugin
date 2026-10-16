@@ -161,6 +161,10 @@ public:
   [[nodiscard]] int preferredBlockSize() const noexcept {
     return preferredBlockSize_.load(std::memory_order_acquire);
   }
+  [[nodiscard]] bool fastMath() const noexcept {
+    return fastMath_.load(std::memory_order_acquire);
+  }
+  [[nodiscard]] bool setFastMath(bool enabled);
   [[nodiscard]] int ondaBlockSize() const noexcept;
   [[nodiscard]] bool canSetBlockSize() const;
   [[nodiscard]] bool setPreferredBlockSize(int samples);
@@ -260,6 +264,7 @@ private:
   std::atomic<int> configuredBlockSize_{};
   // Zero follows the host; a fixed preference is capped by the host capacity.
   std::atomic<int> preferredBlockSize_{};
+  std::atomic<bool> fastMath_{};
   std::unique_ptr<Worker> worker_;
   juce::ThreadPool exportPool_{1};
   std::atomic<bool> exportPending_{};
@@ -316,7 +321,7 @@ private:
   std::atomic<int> editorWidth_{720};
   std::atomic<int> editorHeight_{840};
   std::atomic<ParamControlLayout> paramControlLayout_{
-      ParamControlLayout::sliders};
+      ParamControlLayout::knobs};
   std::atomic<double> paramSmoothingSeconds_{defaultParamSmoothingSeconds};
   std::atomic<ParamControlLayout> inputControlLayout_{
       ParamControlLayout::knobs};

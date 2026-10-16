@@ -33,7 +33,7 @@ if(ONDA_PLUGIN_INPUT_CHANNELS EQUAL 2 AND
     onda_add_test(onda_example_tests core onda_example_tests)
 endif()
 
-add_executable(onda_plugin_tests tests/EngineTests.cpp)
+add_executable(onda_plugin_tests tests/EngineTests.cpp tests/ParameterArrayTests.cpp tests/BufferBindingTests.cpp)
 target_compile_features(onda_plugin_tests PRIVATE cxx_std_20)
 target_link_libraries(onda_plugin_tests PRIVATE
     onda_plugin_engine
@@ -56,6 +56,22 @@ if(ONDA_PLUGIN_INPUT_CHANNELS EQUAL 2 AND
     endif()
 endif()
 
+add_executable(onda_buffer_cache_tests tests/BufferCacheTests.cpp)
+target_compile_features(onda_buffer_cache_tests PRIVATE cxx_std_20)
+target_link_libraries(onda_buffer_cache_tests PRIVATE
+    onda_plugin_engine juce::juce_audio_formats)
+onda_treat_juce_headers_as_system(onda_buffer_cache_tests)
+if(MSVC)
+    target_compile_options(onda_buffer_cache_tests PRIVATE /W4 /permissive-)
+else()
+    target_compile_options(onda_buffer_cache_tests PRIVATE
+        -Wall -Wextra -Wpedantic -Wconversion -Wsign-conversion)
+endif()
+if(ONDA_PLUGIN_INPUT_CHANNELS EQUAL 2 AND
+        ONDA_PLUGIN_OUTPUT_CHANNELS EQUAL 2)
+    onda_add_test(onda_buffer_cache_tests core onda_buffer_cache_tests)
+endif()
+
 juce_add_console_app(onda_processor_tests)
 set_target_properties(onda_processor_tests PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}")
@@ -66,6 +82,10 @@ target_sources(onda_processor_tests PRIVATE
     tests/RealtimeAuditTests.cpp
     tests/BypassTests.cpp
     tests/BlockProcessingTests.cpp
+    tests/RunSettingsTests.cpp
+    tests/UnboundBufferTests.cpp
+    tests/BufferBindingProcessorTests.cpp
+    tests/ParameterArrayProcessorTests.cpp
     tests/AutomationSeedingTests.cpp
     tests/ScratchHandoffTests.cpp
     tests/ControlInputTests.cpp
@@ -88,6 +108,16 @@ target_sources(onda_processor_tests PRIVATE
     src/SpscQueue.h
 )
 target_compile_features(onda_processor_tests PRIVATE cxx_std_20)
+if(APPLE)
+    target_sources(onda_processor_tests PRIVATE tests/NativeFileDrop_mac.mm)
+elseif(WIN32)
+    target_sources(onda_processor_tests PRIVATE tests/NativeFileDrop_windows.cpp)
+    target_link_libraries(onda_processor_tests PRIVATE ole32 shell32 uuid)
+elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    find_package(X11 REQUIRED)
+    target_sources(onda_processor_tests PRIVATE tests/NativeFileDrop_linux.cpp)
+    target_link_libraries(onda_processor_tests PRIVATE X11::X11)
+endif()
 if(NOT MSVC)
     set_source_files_properties(tests/RealtimeAuditTests.cpp PROPERTIES
         COMPILE_OPTIONS "-fno-builtin;$<$<CXX_COMPILER_ID:Clang,AppleClang>:-fsized-deallocation>")
@@ -151,6 +181,8 @@ else()
     onda_add_test(onda_callback_processing_tests core onda_processor_tests CallbackProcessing)
     onda_add_test(onda_callback_smoothing_tests core onda_processor_tests CallbackSmoothing)
     onda_add_test(onda_control_input_tests core onda_processor_tests ControlInputs)
+    onda_add_test(onda_parameter_array_processor_tests core onda_processor_tests ParameterArrayProcessor)
+    onda_add_test(onda_unbound_buffer_tests core onda_processor_tests UnboundBuffers)
     onda_add_test(onda_input_control_editor_tests core onda_processor_tests InputControlEditor)
     onda_add_test(onda_unranged_parameter_tests core onda_processor_tests UnrangedParameters)
     onda_add_test(onda_control_automation_tests core onda_processor_tests ControlAutomation)
@@ -188,6 +220,7 @@ target_compile_definitions(onda_vst3_smoke PRIVATE
     ONDA_PLUGIN_INPUT_CHANNELS=${ONDA_PLUGIN_INPUT_CHANNELS}
     ONDA_PLUGIN_CONTROL_INPUTS=${ONDA_PLUGIN_CONTROL_INPUTS}
     ONDA_PLUGIN_OUTPUT_CHANNELS=${ONDA_PLUGIN_OUTPUT_CHANNELS}
+    ONDA_PLUGIN_PARAMETER_SLOTS=${ONDA_PLUGIN_PARAMETER_SLOTS}
     JUCE_PLUGINHOST_AU=0
     JUCE_PLUGINHOST_LADSPA=0
     JUCE_PLUGINHOST_LV2=0

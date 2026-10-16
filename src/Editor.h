@@ -1,5 +1,7 @@
 #pragma once
 
+#include "ParameterState.h"
+
 #include "ControlValue.h"
 #include "ScopeCapture.h"
 
@@ -15,13 +17,17 @@ namespace onda::plugin {
 class Processor;
 enum class ParamControlLayout : std::uint8_t;
 
-class Editor final : public juce::AudioProcessorEditor, private juce::Timer {
+class Editor final : public juce::AudioProcessorEditor,
+                     public juce::FileDragAndDropTarget,
+                     private juce::Timer {
 public:
   explicit Editor(Processor &owner);
   ~Editor() override;
 
   void paint(juce::Graphics &graphics) override;
   void resized() override;
+  bool isInterestedInFileDrag(const juce::StringArray &files) override;
+  void filesDropped(const juce::StringArray &files, int x, int y) override;
 
 private:
   friend struct EditorTestAccess;
@@ -45,12 +51,13 @@ private:
   std::uint64_t publishedViewStateRestoreRevision_{};
   int publishedReadyId_{};
   ScopeRevision publishedScopeRevision_{};
-  std::array<std::uint64_t, 32U> publishedSlotStamps_{};
+  std::array<std::uint64_t, slotCount> publishedSlotStamps_{};
   std::array<std::uint64_t, controlCount> publishedControlStamps_{};
   std::uint64_t publishedBuses_{};
   ParamControlLayout publishedInputLayout_{};
   double publishedInputSmoothing_{};
   bool publishedKnobLayout_{};
+  bool publishedFastMath_{};
   double publishedSmoothingSeconds_{};
   int publishedHostBlockSize_{};
   int publishedBlockPreference_{};
@@ -59,7 +66,7 @@ private:
   bool hasPublishedScope_{};
   bool scopeCaptureActive_{};
   bool browserReady_{};
-  std::array<bool, 32U + controlCount> activeGestures_{};
+  std::array<bool, slotCount + controlCount> activeGestures_{};
   std::string actionError_;
 
   JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(Editor)

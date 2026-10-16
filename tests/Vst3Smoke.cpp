@@ -113,7 +113,7 @@ struct ProductExpectation {
   }
   // Exercise the exported VST3 Bypass parameter through JUCE's actual host.
   instance.prepareToPlay(48'000.0, 64);
-  auto *const bypass = instance.getParameters()[32 + onda::plugin::pluginControlInputs];
+  auto *const bypass = instance.getParameters()[ONDA_PLUGIN_PARAMETER_SLOTS + onda::plugin::pluginControlInputs];
   const auto dryChannels =
       instance.getName() == "OndaFX"
           ? juce::jmin(ONDA_PLUGIN_INPUT_CHANNELS, ONDA_PLUGIN_OUTPUT_CHANNELS)
@@ -168,7 +168,7 @@ struct ProductExpectation {
   }
   const auto render = [&](juce::AudioBuffer<float> &audio,
                           juce::MidiBuffer &midi, const bool bypassed) {
-    instance.getParameters()[32 + pluginControlInputs]
+    instance.getParameters()[ONDA_PLUGIN_PARAMETER_SLOTS + pluginControlInputs]
         ->setValueNotifyingHost(bypassed ? 1.0F : 0.0F);
     instance.processBlock(audio, midi);
     return true;
@@ -177,7 +177,7 @@ struct ProductExpectation {
     if (!test::checkBypassTransitions(instance, instance.getName() == "OndaFX",
                                       sampleRate, render))
       return false;
-  instance.getParameters()[32 + pluginControlInputs]->setValueNotifyingHost(0.0F);
+  instance.getParameters()[ONDA_PLUGIN_PARAMETER_SLOTS + pluginControlInputs]->setValueNotifyingHost(0.0F);
   return instance.disableNonMainBuses();
 }
 
@@ -193,7 +193,7 @@ struct ProductExpectation {
   instance.setNonRealtime(false);
   const auto render = [&](juce::AudioBuffer<float> &audio,
                           juce::MidiBuffer &midi, const bool bypassed) {
-    instance.getParameters()[32 + onda::plugin::pluginControlInputs]
+    instance.getParameters()[ONDA_PLUGIN_PARAMETER_SLOTS + onda::plugin::pluginControlInputs]
         ->setValueNotifyingHost(bypassed ? 1.0F : 0.0F);
     instance.processBlock(audio, midi);
     return true;
@@ -328,12 +328,12 @@ bool smokeSavedProject(juce::VST3PluginFormatHeadless &format,
   auto succeeded = true;
   const auto parameterCount = instance->getParameters().size();
   succeeded &= check(
-      parameterCount == 2113 + onda::plugin::pluginControlInputs,
+      parameterCount == 2081 + ONDA_PLUGIN_PARAMETER_SLOTS + onda::plugin::pluginControlInputs,
       description.name +
-          " must expose 32 Onda slots, bypass, and 2080 VST3 MIDI mappings "
+          " must expose the configured Onda slots, bypass, and 2080 VST3 MIDI mappings "
           "(found " +
           juce::String(parameterCount) + ")");
-  for (int index = 0; index < juce::jmin(parameterCount, 32); ++index) {
+  for (int index = 0; index < juce::jmin(parameterCount, ONDA_PLUGIN_PARAMETER_SLOTS); ++index) {
     const auto slotNumber = index + 1;
     const auto expectedName = "Slot " + juce::String(index + 1);
     const auto sourceID = "slot" + juce::String(slotNumber).paddedLeft('0', 2);
@@ -358,8 +358,8 @@ bool smokeSavedProject(juce::VST3PluginFormatHeadless &format,
               description.name + " parameter default mismatch at index " +
                   juce::String(index));
   }
-  if (parameterCount > 32) {
-    const auto *bypass = instance->getParameters()[32 + onda::plugin::pluginControlInputs];
+  if (parameterCount > ONDA_PLUGIN_PARAMETER_SLOTS) {
+    const auto *bypass = instance->getParameters()[ONDA_PLUGIN_PARAMETER_SLOTS + onda::plugin::pluginControlInputs];
     succeeded &= check(bypass->getName(64) == "Bypass",
                        description.name + " final parameter must be Bypass");
     succeeded &= check(bypass->getNumSteps() == 2,
@@ -368,7 +368,7 @@ bool smokeSavedProject(juce::VST3PluginFormatHeadless &format,
                        description.name + " bypass must default off");
   }
   auto midiMappingsAreNonAutomatable = true;
-  for (int index = 33 + onda::plugin::pluginControlInputs; index < parameterCount; ++index)
+  for (int index = 1 + ONDA_PLUGIN_PARAMETER_SLOTS + onda::plugin::pluginControlInputs; index < parameterCount; ++index)
     midiMappingsAreNonAutomatable &=
         !instance->getParameters()[index]->isAutomatable();
   succeeded &= check(midiMappingsAreNonAutomatable,

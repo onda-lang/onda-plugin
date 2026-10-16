@@ -15,6 +15,7 @@
 #include <cstring>
 #include <limits>
 #include <new>
+#include <tuple>
 #include <unordered_set>
 
 namespace onda::plugin {
@@ -312,7 +313,7 @@ void Processor::prepareToPlay(const double sampleRate,
     deactivateRequested_.store(true, std::memory_order_release);
   }
   clearMidiActivity();
-  worker_->configure(sampleRate, ondaSize);
+  worker_->configure(sampleRate, ondaSize, fastMath());
   configuredBlockSize_.store(safeBlockSize, std::memory_order_release);
   synchronizeEngine();
   preparationLock.unlock();
@@ -1294,6 +1295,20 @@ void Processor::captureHostAutomation(const std::uint32_t id,
   }
 }
 
+bool Processor::setFastMath(const bool enabled) {
+  std::unique_lock lock(preparationMutex_);
+  if (!canSetBlockSize())
+    return false;
+  if (fastMath() == enabled)
+    return true;
+  fastMath_.store(enabled, std::memory_order_release);
+  worker_->configure(hostSampleRate(), ondaBlockSize(), enabled);
+  lock.unlock();
+  updateHostDisplay(juce::AudioProcessorListener::ChangeDetails{}
+                        .withNonParameterStateChanged(true));
+  return true;
+}
+
 int Processor::ondaBlockSize() const noexcept {
   const auto maximum = hostBlockSize();
   const auto preference = preferredBlockSize();
@@ -1314,7 +1329,7 @@ bool Processor::setPreferredBlockSize(const int samples) {
     return true;
   preferredBlockSize_.store(samples, std::memory_order_release);
   if (hostBlockSize() > 0)
-    worker_->configure(hostSampleRate(), ondaBlockSize());
+    worker_->configure(hostSampleRate(), ondaBlockSize(), fastMath());
   lock.unlock();
   updateHostDisplay(juce::AudioProcessorListener::ChangeDetails{}
                         .withNonParameterStateChanged(true));
@@ -1619,7 +1634,7 @@ void Processor::timerCallback() {
     auto scratch = std::make_unique<DryScratch>(expected);
     delete scratchReplacements_.replace(scratch.release());
     worker_->configure(expectedSampleRate_.load(std::memory_order_acquire),
-                       ondaBlockSize());
+                       ondaBlockSize(), fastMath());
     configuredBlockSize_.store(expected, std::memory_order_release);
   }
   if (runtimeRecoveryRequested_.exchange(false, std::memory_order_acq_rel))
@@ -1658,9 +1673,10 @@ void Processor::getStateInformation(juce::MemoryBlock &destination) {
   juce::MemoryOutputStream stream(destination, false);
   stream.writeInt(static_cast<int>(stateMagic));
   stream.writeInt(stateVersion);
-  const auto [snapshot, blockPreference] = [this] {
+  const auto [snapshot, blockPreference, fastMathEnabled] = [this] {
     std::lock_guard preparationLock(preparationMutex_);
-    return std::pair{worker_->persistedStateSnapshot(), preferredBlockSize()};
+    return std::tuple{worker_->persistedStateSnapshot(), preferredBlockSize(),
+                      fastMath()};
   }();
   const auto &project = snapshot.project;
   stream.writeString(pathToJuce(project.path));
@@ -1682,6 +1698,7 @@ void Processor::getStateInformation(juce::MemoryBlock &destination) {
   stream.writeString(viewState());
   stream.writeDouble(paramSmoothingSeconds());
   stream.writeInt(blockPreference);
+  stream.writeBool(fastMathEnabled);
   stream.writeBool(inputControlLayout() == ParamControlLayout::knobs);
   stream.writeDouble(inputControlSmoothingSeconds());
   for (const auto &value : snapshot.values.controls)
@@ -1712,7 +1729,7 @@ void Processor::setStateInformation(const void *data, const int byteCount) {
     for (int index = 0; index < bufferCount; ++index) {
       const auto name = readBoundedString(stream, maximumBufferNameBytes);
       const auto bufferPath = readBoundedString(stream, maximumPathBytes);
-      if (!name || !bufferPath || name->isEmpty() || bufferPath->isEmpty() ||
+      if (!name || !bufferPath || name->isEmpty() ||
           !bufferNames.insert(name->toStdString()).second) {
         return;
       }
@@ -1750,11 +1767,12 @@ void Processor::setStateInformation(const void *data, const int byteCount) {
     if (!parameterSmoothingSamples(smoothingSeconds,
                                    std::max(1.0, hostSampleRate())))
       return;
-    if (stream.getNumBytesRemaining() < 4)
+    if (stream.getNumBytesRemaining() < 5)
       return;
     const auto blockPreference = stream.readInt();
     if (blockPreference < 0)
       return;
+    const auto fastMathEnabled = stream.readBool();
 
     if (stream.getNumBytesRemaining() < 9)
       return;
@@ -1775,8 +1793,9 @@ void Processor::setStateInformation(const void *data, const int byteCount) {
     std::unique_lock preparationLock(preparationMutex_);
     deactivateRequested_.store(true, std::memory_order_release);
     preferredBlockSize_.store(blockPreference, std::memory_order_release);
+    fastMath_.store(fastMathEnabled, std::memory_order_release);
     if (hostBlockSize() > 0)
-      worker_->configure(hostSampleRate(), ondaBlockSize());
+      worker_->configure(hostSampleRate(), ondaBlockSize(), fastMath());
     for (std::size_t index = 0; index < slotCount; ++index) {
       restored.parameterStamps[index] = slotState_[index].set(
           static_cast<float>(restored.parameters[index].normalized));

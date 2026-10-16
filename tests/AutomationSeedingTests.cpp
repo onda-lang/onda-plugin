@@ -65,7 +65,8 @@ sample { out1 = left + right; out2 = left + right }
     Processor processor(product);
     processor.prepareToPlay(48'000.0, 8);
     processor.getParameters()[0]->setValueNotifyingHost(0.4F);
-    processor.getParameters()[1]->setValueNotifyingHost(0.1F);
+    if constexpr (slotCount > 1)
+      processor.getParameters()[1]->setValueNotifyingHost(0.1F);
     ValueListener listener{*processor.getParameters()[0]};
     processor.loadFile(source, true);
     // Allow compilation and adoption without servicing the seeding timer.
@@ -242,7 +243,8 @@ sample { out1 = left + right; out2 = left + right }
     return false;
   ParameterState values;
   values.set(0, 0.25F);
-  values.set(1, 0.75F);
+  if constexpr (slotCount > 1)
+    values.set(1, 0.75F);
   std::array<std::array<float, 8>, 2> audio{};
   const std::array outputs{audio[0].data(), audio[1].data()};
   built.engine->beginHostCallback(8);

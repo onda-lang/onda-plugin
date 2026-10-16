@@ -107,7 +107,7 @@ public:
   Worker(const Worker &) = delete;
   Worker &operator=(const Worker &) = delete;
 
-  void configure(double sampleRate, int blockSize);
+  void configure(double sampleRate, int blockSize, bool fastMath = false);
   // Host lifecycle/offline callers only; never wait on a realtime thread.
   [[nodiscard]] std::uint64_t waitForPreparation();
   void
@@ -170,6 +170,9 @@ private:
     std::filesystem::path path;
     double sampleRate{};
     int blockSize{};
+    bool fastMath{};
+    bool reuseCompilation{};
+    std::vector<std::string> changedBuffers;
     std::uint64_t generation{};
     // Nonzero until this selection's defaults are acknowledged by the host.
     std::uint64_t defaultSeedRevision{};
@@ -186,7 +189,16 @@ private:
     std::filesystem::file_time_type modified{};
     bool exists{};
 
+    [[nodiscard]] bool sameContents(const FileStamp &other) const noexcept {
+      return path == other.path && hash == other.hash && size == other.size &&
+             exists == other.exists;
+    }
     friend bool operator==(const FileStamp &, const FileStamp &) = default;
+  };
+
+  struct CachedBufferFile {
+    BufferFileSnapshot snapshot;
+    FileStamp stamp;
   };
 
   void run() noexcept;
@@ -238,11 +250,17 @@ private:
   [[nodiscard]] static std::vector<std::filesystem::path>
   mergedPaths(std::vector<std::filesystem::path> first,
               const std::vector<std::filesystem::path> &second);
+  [[nodiscard]] std::optional<std::vector<std::string>>
+  changedBufferNames(const Request &request,
+                     std::span<const std::filesystem::path> paths) const;
+  void replaceBufferCache(std::span<const BufferFileSnapshot> files,
+                          std::span<const FileStamp> stamps);
   void filesystemChanged(std::vector<std::filesystem::path> paths) noexcept;
   void refreshFilesystemWatcher();
-  [[nodiscard]] bool
-  watchedFilesChanged(const std::vector<std::filesystem::path> &paths,
-                      bool allowMetadataShortcut = false);
+  [[nodiscard]] bool watchedFilesChanged(
+      const std::vector<std::filesystem::path> &paths,
+      bool allowMetadataShortcut = false,
+      std::vector<std::filesystem::path> *contentChanges = nullptr);
 
   Product product_;
   SpscSlot<PreparedEngine *> &replacements_;
@@ -262,6 +280,7 @@ private:
   WorkerStatus status_;
   std::vector<std::weak_ptr<const EnginePublication>> publications_;
   PersistedProjectState publishedProjectState_;
+  bool pendingBufferClear_{};
   // Belongs to the checkpoint, so survives superseding a pending request.
   std::shared_ptr<SeedValues> publishedSeedValues_;
   HostParameterValues publishedValues_;
@@ -286,6 +305,13 @@ private:
   std::vector<std::filesystem::path> successfulPaths_;
   std::vector<FileStamp> watchedStamp_;
   std::uint64_t completedGeneration_{};
+  // Worker-owned immutable code; live instances retain their own shared owner.
+  std::shared_ptr<const CompileResult> compilation_;
+  std::filesystem::path compilationPath_;
+  std::vector<CachedBufferFile> bufferFiles_;
+  bool compilationFromImage_{};
+  // Linked paths still supplied by the cached image rather than file decoding.
+  std::vector<BufferFileBinding> imageBufferBindings_;
   // Start the thread only after all of its state has been initialized.
   std::thread thread_;
 };

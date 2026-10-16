@@ -80,6 +80,8 @@ set(ONDA_PLUGIN_CONTROL_INPUTS "16" CACHE STRING
     "Number of optional mono external control input buses")
 set(ONDA_PLUGIN_OUTPUT_CHANNELS "2" CACHE STRING
     "Number of audio output channels exposed by each VST3")
+set(ONDA_PLUGIN_PARAMETER_SLOTS "32" CACHE STRING
+    "Number of scalar DAW parameter slots exposed by each VST3")
 
 function(validate_channel_count variable minimum)
     if(NOT "${${variable}}" MATCHES "^(0|[1-9][0-9]?)$")
@@ -95,6 +97,7 @@ endfunction()
 validate_channel_count(ONDA_PLUGIN_INPUT_CHANNELS 0)
 validate_channel_count(ONDA_PLUGIN_CONTROL_INPUTS 0)
 validate_channel_count(ONDA_PLUGIN_OUTPUT_CHANNELS 1)
+validate_channel_count(ONDA_PLUGIN_PARAMETER_SLOTS 1)
 math(EXPR ONDA_PLUGIN_TOTAL_INPUT_CHANNELS
     "${ONDA_PLUGIN_INPUT_CHANNELS} + ${ONDA_PLUGIN_CONTROL_INPUTS}")
 if(ONDA_PLUGIN_TOTAL_INPUT_CHANNELS GREATER 64)
@@ -331,13 +334,14 @@ endif()
 
 include(cmake/OndaVst3Automation.cmake)
 include(cmake/OndaJuceXEmbed.cmake)
+include(cmake/OndaJuceBrowser.cmake)
 if(MSVC)
     # MSVC /O2 and /Ox can break JUCE's WebView2 COM callbacks. Source options
     # follow target options, so only this JUCE compilation unit uses /O1 and
     # stays outside link-time optimization.
     # https://github.com/juce-framework/JUCE/issues/1642
     set_property(SOURCE
-        "${ONDA_JUCE_SOURCE_DIR}/modules/juce_gui_extra/juce_gui_extra.cpp"
+        "${onda_browser_module_patched}"
         APPEND PROPERTY COMPILE_OPTIONS
         "$<$<NOT:$<CONFIG:Debug>>:/O1>"
         "$<$<CONFIG:Release>:/GL->")
@@ -453,6 +457,8 @@ add_library(onda_plugin_engine STATIC
     src/HostAutomation.h
     src/AudioFile.cpp
     src/AudioFile.h
+    src/BufferWaveform.cpp
+    src/BufferWaveform.h
     src/Engine.cpp
     src/Engine.h
     src/EventPayload.cpp
@@ -483,6 +489,7 @@ target_compile_definitions(onda_plugin_engine PUBLIC
     ONDA_PLUGIN_INPUT_CHANNELS=${ONDA_PLUGIN_INPUT_CHANNELS}
     ONDA_PLUGIN_CONTROL_INPUTS=${ONDA_PLUGIN_CONTROL_INPUTS}
     ONDA_PLUGIN_OUTPUT_CHANNELS=${ONDA_PLUGIN_OUTPUT_CHANNELS}
+    ONDA_PLUGIN_PARAMETER_SLOTS=${ONDA_PLUGIN_PARAMETER_SLOTS}
 )
 # Keep engine, codec, and embedded-resource symbols private to each module.
 set_target_properties(onda_plugin_engine onda_run_resources PROPERTIES

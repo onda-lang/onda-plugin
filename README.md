@@ -52,8 +52,9 @@ Initialize any fallback values your program needs, such as a default tempo.
 
 ## Parameters and automation
 
-The plugin provides 32 DAW automation slots for `params`. Mapped slots use the
-loaded program's parameter names and units. Slots remain stable when the
+The plugin provides 32 DAW automation slots for `params` by default. Mapped slots use the
+loaded program's parameter names and units. Array elements each consume one
+slot, in declaration order, up to the configured limit. Slots remain stable when the
 program is recompiled.
 
 Scalar numeric parameters without a declared range appear in **Params** and map to
@@ -64,7 +65,7 @@ Continuous `params` automation follows the DAW's normalized linear curve,
 sampled at the start of each Onda block. Discrete parameters hold the latest
 point at that boundary. 
 
-**Onda Block Size** controls how often params automation updates.
+**Block Size** controls how often params automation updates.
 
 The **Smooth** value only affects changes made in the UI editor. 
 DAW automation normally bypasses smoothing. 
@@ -91,13 +92,16 @@ to set the values covered by automation, which maps linearly to that range.
 ## Audio buffers
 
 Bind audio files to named buffers in the editor. Supported formats include WAV,
-AIFF, FLAC, Ogg Vorbis, and `.ondabuffer`. Audio-file bindings require read-only
-`f32` buffers. An `.ondaproject` can also supply buffer defaults; clearing a
-binding restores its project default when available.
+AIFF, FLAC, and Ogg Vorbis through JUCE's audio decoders, producing `f32` samples.
+Typed `.ondabuffer` assets preserve `bool`, `i32`, `i64`, `f32`, or `f64` elements,
+including tables. File bindings must be read-only and match the declaration's
+element type and channel count. Project assets provide immutable defaults.
+**Clear** unbinds the slot, including a project default, and saves that choice.
+Unbound buffers return neutral values while parameters and controls remain usable.
 
-Linked source and audio files reload automatically after edits. Failed reloads
-keep the previous working program playing; missing required buffers must be
-bound before a new program can run.
+Binding or clearing a buffer rebuilds the runtime instance using the existing
+compiled program. Linked source and buffer files reload automatically after
+edits. Failed reloads keep the previous working program playing.
 
 Your DAW project saves the program, buffer data, and plugin settings. If linked
 files are unavailable when reopening it, the plugin restores the saved version.
@@ -125,17 +129,19 @@ ctest --test-dir build --output-on-failure -L '^(core|native)$'
 Native editor tests require a desktop; Linux CI uses `xvfb-run -a`.
 See [test placement and browser setup](tests/README.md) for manual CI and local checks.
 
-Custom builds can change the fixed input, control, and output channel counts:
+Custom builds can change the fixed input, control, output, and parameter-slot counts:
 
 ```sh
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
   -DONDA_PLUGIN_INPUT_CHANNELS=4 \
   -DONDA_PLUGIN_CONTROL_INPUTS=8 \
-  -DONDA_PLUGIN_OUTPUT_CHANNELS=8
+  -DONDA_PLUGIN_OUTPUT_CHANNELS=8 \
+  -DONDA_PLUGIN_PARAMETER_SLOTS=64
 ```
 
 Main and control inputs together must not exceed 64 channels; outputs support
 1 to 64 channels. Set `ONDA_PLUGIN_CONTROL_INPUTS=0` to omit control inputs.
+Parameter slots support counts from 1 to 64, matching the automation bank's capacity.
 
 Versions are pinned in [plugin-version](plugin-version),
 [onda-version](onda-version), and [juce-version](juce-version).

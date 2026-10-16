@@ -8,6 +8,8 @@ const script = source.match(/constexpr auto juceHostBridgeScript = R"JS\(([\s\S]
 assert.ok(script, "Could not locate the editor's injected host bridge");
 
 const commands = [];
+const nativeDrops = [];
+const documentListeners = new Map();
 let receiveState;
 let renderedState;
 let documentReady;
@@ -17,6 +19,11 @@ const sampleRate = { closest() { return sampleRateRow; } };
 const runSettings = { style: {} };
 const blockSelect = { replaceChildren(...options) { this.options = options; } };
 const window = {
+  chrome: { webview: {
+    postMessageWithAdditionalObjects(message, files) {
+      nativeDrops.push({ message, files });
+    },
+  } },
   __JUCE__: {
     backend: {
       emitEvent(type, message) {
@@ -35,6 +42,7 @@ runInNewContext(script, {
   window,
   document: {
     addEventListener(type, callback) {
+      documentListeners.set(type, callback);
       if (type === "DOMContentLoaded") documentReady = callback;
     },
     querySelector() { return null; },
@@ -54,11 +62,34 @@ runInNewContext(script, {
     }),
   },
 });
+
+// Windows must forward actual File objects so WebView2 can supply native paths.
+const dragOver = documentListeners.get("dragover");
+const drop = documentListeners.get("drop");
+assert.equal(typeof dragOver, "function", "The Windows browser must accept file drags");
+assert.equal(typeof drop, "function", "The Windows browser must forward file drops");
+let prevented = 0;
+const transfer = { types: ["Files"], files: [
+  { name: "ignore.txt" }, { name: "patch.onda" }, { name: "project.ondaproject" },
+] };
+const event = { dataTransfer: transfer, preventDefault() { ++prevented; } };
+dragOver(event);
+assert.equal(transfer.dropEffect, "copy");
+drop(event);
+assert.equal(prevented, 2);
+assert.equal(nativeDrops.length, 1);
+assert.equal(nativeDrops[0].message, "ondaFilesDropped");
+assert.deepEqual(Array.from(nativeDrops[0].files), transfer.files.slice(1));
+assert.equal(nativeDrops[0].files[0], transfer.files[1], "Keep native File identity");
+dragOver({ dataTransfer: { types: ["text/plain"] }, preventDefault() { assert.fail("Text is not a file drag"); } });
+drop({ dataTransfer: { types: ["Files"], files: [{ name: "ignore.txt" }] }, preventDefault() {} });
+assert.equal(nativeDrops.length, 1, "Ignore unsupported files");
 documentReady();
 assert.equal(smoothingAttributes["aria-label"], "Editor parameter smoothing duration in milliseconds");
 assert.match(smoothingAttributes.title, /DAW automation updates at block boundaries/);
 assert.equal(sampleRate.disabled, true);
 assert.equal(sampleRateRow.hidden, true);
+assert.equal(runSettings.style.gridTemplateColumns, "minmax(0, 1fr)");
 const blockChoices = () => Array.from(blockSelect.options)
   .filter(option => !option.hidden).map(option => option.value);
 assert.deepEqual(blockChoices(), ["0"]);

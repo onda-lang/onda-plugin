@@ -5,7 +5,8 @@ project state with an Onda project image, two one-slot realtime
 handoffs, a bounded UI-event queue, and the active engine pointer, accessed
 only by processing or suspended host preparation. The VST3 wrapper
 adds its format-required `Bypass` parameter outside
-the permanent 32-slot `params` set and the control input parameter bank. IDs
+the fixed `params` set (32 slots by default, configured with
+`ONDA_PLUGIN_PARAMETER_SLOTS`) and the control input parameter bank. IDs
 and the normalized parameter interface never change.
 Bypassed callbacks keep DSP, automation, and MIDI state advancing through the
 same processing path. A 5 ms wet/dry crossfade advances once per real sample
@@ -57,11 +58,15 @@ Construction validates:
 
 - audio flattens to no more than the combined main/control input capacity and
   output channel count, and every channel is `f32`;
-- every buffer has either an Onda-owned immutable project default or an explicit
-  read-only `f32` audio-file binding with a compatible channel count;
+- supplied buffer bindings are Onda-owned immutable project defaults or explicit
+  read-only file assets with matching element type and a compatible channel count;
 - canonical MIDI and host-context payload names, order, scalar shapes, and
   types match;
 - instruments declare exact `note_on` and `note_off` events.
+
+Unbound buffers use Onda's neutral descriptors, matching `onda run`. They do not
+block preparation or hide parameters, input controls, events, or MIDI controls;
+the program remains active and reads neutral values from those slots.
 
 Audio declarations support individual `f32` scalars, fixed `f32[N]` arrays,
 and mixtures of both in `ins` and `outs`. Flattening follows declaration order
@@ -108,7 +113,17 @@ Audio files are read and decoded entirely on the worker. Their storage remains
 stable for the lifetime of the prepared engine and is never touched by the
 message thread. Bound paths participate in the same pre/post-build hashing as
 source files, so an edit cannot publish a mixed or stale engine. JUCE audio
-formats and canonical `.ondabuffer` files feed the same decoded `f32` storage.
+formats decode to `f32`; canonical `.ondabuffer` files retain their primitive
+element type in aligned typed vectors (`bool`, `i32`, `i64`, `f32`, or `f64`).
+Parameter arrays flatten in declaration order, with each element taking one
+scalar DAW slot. Per-element setters retain sibling and unexposed elements.
+
+Preparation also caches an immutable waveform summary per loaded buffer: up to
+128 min/max columns across all channels, ignoring non-finite samples. The run
+view receives these summaries through its existing `waveform` field. Project
+defaults use the SDK's in-memory materialization plan to obtain canonical typed
+assets and their logical bindings; previews never reopen external files or
+scan sample storage on the audio or message thread.
 
 After full preparation, Onda captures a source input's successful manifest and
 decoded buffers into one immutable, validated project image. For a filesystem
@@ -121,14 +136,31 @@ Onda's ASCII case-insensitive recognition. Buffer names and absolute
 override paths remain in plugin state for live disk loading; the image carries
 canonical typed assets for filesystem-free fallback. A disk restore either
 prepares every source and buffer or compiles the complete image.
-Clearing a required binding invalidates the complete image but retains the
-source link and remaining binding paths in saved state, even while preparation
-is incomplete.
-Clearing an override with a project default retains the engine, interface, and
-complete checkpoint until the default-backed replacement succeeds. Canonical
-assets captured from a linked source preserve its file bindings during restore;
-they do not turn required source bindings into project defaults.
-When a replacement is missing buffers, its binding choices are published
+Clearing a buffer records an empty-path binding that explicitly unbinds the slot,
+including an immutable project default. The SDK's materialization manifest is
+updated and reloaded to remove that binding from the saved/exported image.
+Only the root buffer-bindings object is replaced; unrelated manifest bytes stay
+opaque, preserving exact compile constants despite JUCE's decimal-parser limits.
+Program-owned defaults remain unchanged. Clear intent is saved immediately,
+including while a replacement instance is being prepared. Image fallback applies
+those explicit unbindings before initialization.
+
+Binding and clearing retain the last valid compiled specialization for the same
+source selection, sample rate, block size, and fast-math setting. A replacement
+instance shares the immutable program and unchanged read-only file samples.
+Each cached file records the content hash of its decoded samples, independently
+of watcher snapshots from later attempts. Preparation validates both source and
+sample caches before reuse, detecting edits even when native notifications have
+not arrived or a previous compilation failed. Failed buffer preparations retain
+successfully decoded peers and discard entries whose decoding failed. Bindings
+supplied by a saved image are tracked separately, so a failed explicit file
+override cannot silently revert to the image default on the next buffer edit.
+Saved-image instances retain validated samples when the same linked file becomes
+unavailable; explicit clears and path replacements still take effect.
+Explicit reloads, source changes, and host specialization changes compile again.
+The worker owns the cache and retires instances through the usual handoff, so
+shared program and buffer ownership never allocates or destroys on the audio thread.
+When a replacement has invalid audio-file bindings, its binding choices are published
 separately from the retained engine's audio, parameters, events, and checkpoint.
 The editor can bind or clear those pending choices while the previous engine
 continues playing. Successful preparation replaces both interfaces together.
@@ -152,6 +184,13 @@ into the shared view's host-message schema. `Editor` owns the native browser
 lifetime, periodic publication, and command routing. Processor tests
 exercise the editor lifecycle through JUCE's real browser component; resource
 bytes and capability state are tested directly through `RunViewHost`.
+The editor accepts native source/project drops and keeps their original paths
+for imports and live reload. Build copies of JUCE forward macOS webview drops
+and GTK subprocess drops to the browser's `FileDragAndDropTarget`. The GTK IPC
+decoder reads UTF-8 explicitly so filenames survive the subprocess boundary.
+Windows accepts DOM file drops through WebView2's additional-object messages,
+then reads their native `ICoreWebView2File` paths. Its native test drives a real
+OLE drop through the browser rather than calling the editor's handler directly.
 The shared run view and number widget are embedded directly from the pinned
 Onda release sources; their fixes and behavior live upstream. Host publications
 and unedited blur retain plain values without applying the editor's range or
@@ -284,6 +323,11 @@ the audio thread adopts it, at callback entry, and returns the old storage for
 message-thread destruction. Smaller callbacks can keep rendering during
 preparation; a larger callback uses fallback until adequate storage is adopted.
 Suspended host preparation can replace and reclaim scratch storage directly.
+
+Fast Math is an instance compilation preference, off in a new instance and
+editable while unloaded. Saved state restores it before specialization. Every
+worker request captures the option for both disk and saved-image compilation,
+including automatic reloads and host specialization changes.
 
 The callback captures aliased host input before clearing output. Each callback
 is divided into logical blocks of at most the compiled Onda block size. Its

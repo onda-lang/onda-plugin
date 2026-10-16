@@ -10,6 +10,10 @@
 #include "ProcessorTestSupport.h"
 #include "RealtimeAudit.h"
 #include "RunViewHost.h"
+#include "RunSettingsTests.h"
+#include "UnboundBufferTests.h"
+#include "ParameterArrayProcessorTests.h"
+#include "BufferBindingProcessorTests.h"
 #include "StateFormat.h"
 #include "TestAudioFile.h"
 #include "BlockProcessingTests.h"
@@ -535,6 +539,7 @@ makeState(const juce::String &path, const juce::String &browseDirectory,
   stream.writeString(viewState);
   stream.writeDouble(onda::plugin::defaultParamSmoothingSeconds);
   stream.writeInt(0);
+  stream.writeBool(false); // Fast Math.
   stream.writeBool(true);
   stream.writeDouble(onda::plugin::defaultParamSmoothingSeconds);
   for (std::size_t index = 0; index < onda::plugin::controlCount; ++index)
@@ -613,11 +618,9 @@ bool exerciseRunViewAdapter() {
   if (state == nullptr ||
       !static_cast<bool>(state->getProperty("supportsSourceSelection")) ||
       !static_cast<bool>(state->getProperty("supportsProjectExport")) ||
-      static_cast<bool>(state->getProperty("supportsBufferEmbedding")) ||
       static_cast<bool>(state->getProperty("supportsTransport")) ||
       static_cast<bool>(state->getProperty("supportsDeviceSelection")) ||
       !static_cast<bool>(state->getProperty("supportsRunSettings")) ||
-      !static_cast<bool>(state->getProperty("supportsReset")) ||
       !static_cast<bool>(state->getProperty("supportsParamSmoothing")) ||
       state->getProperty("ondaVersion").toString() != onda_version() ||
       state->getProperty("ondaVersion").toString().isEmpty() ||
@@ -630,7 +633,8 @@ bool exerciseRunViewAdapter() {
                       "paramSmoothingDefaultMs")) <=> 30.0) ||
       !static_cast<bool>(state->getProperty("supportsScope")) ||
       static_cast<bool>(state->getProperty("midiKeyboardInteractive")) ||
-      state->getProperty("paramLayout").toString() != "sliders" ||
+      state->getProperty("paramLayout").toString() != "knobs" ||
+      state->getProperty("inputControlLayout").toString() != "knobs" ||
       static_cast<bool>(state->getProperty("canExportProject")) ||
       static_cast<bool>(state->getProperty("logRevealed")) ||
       state->getProperty("logText").toString().isNotEmpty() ||
@@ -706,16 +710,16 @@ bool exerciseRunViewAdapter() {
     return false;
   }
 
-  processor.setParamControlLayout(onda::plugin::ParamControlLayout::knobs);
-  const auto knobMessage = onda::plugin::makeRunViewState(
+  processor.setParamControlLayout(onda::plugin::ParamControlLayout::sliders);
+  const auto layoutMessage = onda::plugin::makeRunViewState(
       processor, processor.workerStatus(), processor.canExportProject(), {});
-  const auto *knobEnvelope = knobMessage.getDynamicObject();
-  const auto knobStateValue = knobEnvelope == nullptr
-                                  ? juce::var{}
-                                  : knobEnvelope->getProperty("state");
-  const auto *knobState = knobStateValue.getDynamicObject();
-  if (knobState == nullptr ||
-      knobState->getProperty("paramLayout").toString() != "knobs") {
+  const auto *layoutEnvelope = layoutMessage.getDynamicObject();
+  const auto layoutStateValue =
+      layoutEnvelope == nullptr ? juce::var{}
+                                : layoutEnvelope->getProperty("state");
+  const auto *layoutState = layoutStateValue.getDynamicObject();
+  if (layoutState == nullptr ||
+      layoutState->getProperty("paramLayout").toString() != "sliders") {
     std::cerr << "run-view parameter layout state was invalid\n";
     return false;
   }
@@ -1027,9 +1031,9 @@ sample { out1 = 0.0; out2 = 0.0 }
 
   const auto &parameters = processor.getParameters();
   const auto *cutoff = parameters[0];
-  const auto *mode = parameters[1];
-  const auto *enabled = parameters[2];
-  const auto *unused = parameters[3];
+  const auto *mode = onda::plugin::slotCount > 1 ? parameters[1] : nullptr;
+  const auto *enabled = onda::plugin::slotCount > 2 ? parameters[2] : nullptr;
+  const auto *unused = onda::plugin::slotCount > 3 ? parameters[3] : nullptr;
   const auto cutoffDefault =
       static_cast<float>(std::log(440.0 / 20.0) / std::log(20000.0 / 20.0));
   if (listener.parameterInfoChanges == 0 ||
@@ -1043,28 +1047,27 @@ sample { out1 = 0.0; out2 = 0.0 }
                              1.0e-3) ||
       !test::withinTolerance(cutoff->getValueForText("440 Hz") - cutoffDefault,
                              1.0e-5F) ||
-      mode->getName(128) != "mode [Slot 2]" || !mode->isDiscrete() ||
-      mode->isBoolean() || mode->getNumSteps() != 5 ||
-      !test::withinTolerance(mode->getDefaultValue() - 0.5F, 1.0e-6F) ||
-      mode->getText(0.75F, 128) != "3" ||
-      enabled->getName(128) != "enabled [Slot 3]" || !enabled->isDiscrete() ||
-      !enabled->isBoolean() || enabled->getNumSteps() != 2 ||
-      !test::withinTolerance(enabled->getDefaultValue() - 1.0F, 1.0e-6F) ||
-      enabled->getText(0.0F, 128) != "Off" ||
-      !test::withinTolerance(enabled->getValueForText("On") - 1.0F, 1.0e-6F) ||
-      unused->getName(128) != "Slot 4" || unused->getLabel().isNotEmpty() ||
-      unused->isDiscrete() ||
-      !test::withinTolerance(unused->getDefaultValue() - 0.5F, 1.0e-6F)) {
+      (mode != nullptr &&
+       (mode->getName(128) != "mode [Slot 2]" || !mode->isDiscrete() ||
+        mode->isBoolean() || mode->getNumSteps() != 5 ||
+        !test::withinTolerance(mode->getDefaultValue() - 0.5F, 1.0e-6F) ||
+        mode->getText(0.75F, 128) != "3")) ||
+      (enabled != nullptr &&
+       (enabled->getName(128) != "enabled [Slot 3]" || !enabled->isDiscrete() ||
+        !enabled->isBoolean() || enabled->getNumSteps() != 2 ||
+        !test::withinTolerance(enabled->getDefaultValue() - 1.0F, 1.0e-6F) ||
+        enabled->getText(0.0F, 128) != "Off" ||
+        !test::withinTolerance(enabled->getValueForText("On") - 1.0F,
+                               1.0e-6F))) ||
+      (unused != nullptr &&
+       (unused->getName(128) != "Slot 4" || unused->getLabel().isNotEmpty() ||
+        unused->isDiscrete() ||
+        !test::withinTolerance(unused->getDefaultValue() - 0.5F, 1.0e-6F)))) {
     std::cerr << "host parameter presentation did not reflect Onda metadata: "
               << cutoff->getName(128) << ", label=" << cutoff->getLabel()
               << ", default=" << cutoff->getDefaultValue()
               << ", midpoint=" << cutoff->getText(0.5F, 128)
               << ", parsed=" << cutoff->getValueForText("440 Hz")
-              << "; mode=" << mode->getName(128)
-              << ", steps=" << mode->getNumSteps()
-              << ", value=" << mode->getText(0.75F, 128)
-              << "; enabled=" << enabled->getName(128)
-              << ", default=" << enabled->getDefaultValue()
               << "; notifications=" << listener.parameterInfoChanges << '\n';
     return false;
   }
@@ -1084,7 +1087,7 @@ sample { out1 = 0.0; out2 = 0.0 }
       processor.getParameters()[0] != cutoff ||
       cutoff->getName(128) != "frequency [Slot 1]" ||
       cutoff->getLabel() != "kHz" || cutoff->isDiscrete() ||
-      mode->getName(128) != "Slot 2") {
+      (mode != nullptr && mode->getName(128) != "Slot 2")) {
     std::cerr << "recompile did not refresh the fixed host slot metadata\n";
     return false;
   }
@@ -1536,7 +1539,7 @@ bool exerciseStateRestore() {
       return false;
     }
     original.setEditorSize(777, 888);
-    original.setParamControlLayout(onda::plugin::ParamControlLayout::knobs);
+    original.setParamControlLayout(onda::plugin::ParamControlLayout::sliders);
     juce::var viewState{new juce::DynamicObject};
     viewState.getDynamicObject()->setProperty("octave", 2);
     StateChangeListener viewStateChanges{original};
@@ -1553,7 +1556,7 @@ bool exerciseStateRestore() {
       return std::abs(original.slotValue(0) - 0.8125F) < 1.0e-6F &&
              width == 777 && height == 888 &&
              original.paramControlLayout() ==
-                 onda::plugin::ParamControlLayout::knobs &&
+                 onda::plugin::ParamControlLayout::sliders &&
              static_cast<int>(juce::JSON::parse(original.viewState())
                                   .getProperty("octave", {})) == 2 &&
              original.workerStatus().path == source.path();
@@ -1666,7 +1669,7 @@ bool exerciseStateRestore() {
         static_cast<int>(juce::JSON::parse(restored.viewState())
                              .getProperty("octave", {})) != 2 ||
         restored.paramControlLayout() !=
-            onda::plugin::ParamControlLayout::knobs ||
+            onda::plugin::ParamControlLayout::sliders ||
         restored.workerStatus().path != source.path()) {
       std::cerr << "path, slot, or editor state did not restore\n";
       return false;
@@ -1681,13 +1684,18 @@ bool exerciseStateRestore() {
     }
   }
 
-  {
+  const std::array hostileCases{
+      std::pair{std::numeric_limits<float>::quiet_NaN(), 0.5F},
+      std::pair{std::numeric_limits<float>::infinity(), 0.5F},
+      std::pair{-1.0F, 0.0F}, std::pair{2.0F, 1.0F}};
+  for (std::size_t start = 0; start < hostileCases.size();
+       start += onda::plugin::slotCount) {
     std::array<float, onda::plugin::slotCount> hostileValues{};
     hostileValues.fill(0.25F);
-    hostileValues[0] = std::numeric_limits<float>::quiet_NaN();
-    hostileValues[1] = std::numeric_limits<float>::infinity();
-    hostileValues[2] = -1.0F;
-    hostileValues[3] = 2.0F;
+    for (std::size_t index = 0;
+         index < hostileValues.size() && start + index < hostileCases.size();
+         ++index)
+      hostileValues[index] = hostileCases[start + index].first;
     const juce::File unicodeDirectory{onda::plugin::pathToJuce(
         testTemporaryRoot() /
         std::filesystem::path{u8"\u00d8nda/\u72b6\u614b"})};
@@ -1697,11 +1705,17 @@ bool exerciseStateRestore() {
     normalized.setStateInformation(hostileState.getData(),
                                    static_cast<int>(hostileState.getSize()));
     const auto [width, height] = normalized.editorSize();
-    if (!test::withinTolerance(normalized.slotValue(0) - 0.5F, 1.0e-6F) ||
-        !test::withinTolerance(normalized.slotValue(1) - 0.5F, 1.0e-6F) ||
-        !test::withinTolerance(normalized.slotValue(2), 1.0e-6F) ||
-        !test::withinTolerance(normalized.slotValue(3) - 1.0F, 1.0e-6F) ||
-        width != 360 || height != 1400 ||
+    for (std::size_t index = 0; index < hostileValues.size(); ++index) {
+      const auto expected = start + index < hostileCases.size()
+                                ? hostileCases[start + index].second
+                                : 0.25F;
+      if (!test::withinTolerance(normalized.slotValue(index) - expected,
+                                 1.0e-6F)) {
+        std::cerr << "hostile slot value was not normalized safely\n";
+        return false;
+      }
+    }
+    if (width != 360 || height != 1400 ||
         normalized.lastBrowseDirectory() != unicodeDirectory) {
       std::cerr << "hostile finite, non-finite, or Unicode state was not "
                    "normalized safely\n";
@@ -1842,11 +1856,11 @@ bool exerciseEditorLifecycle() {
   }
   editor->setVisible(true);
   editor->setSize(777, 888);
-  processor.setParamControlLayout(onda::plugin::ParamControlLayout::knobs);
+  processor.setParamControlLayout(onda::plugin::ParamControlLayout::sliders);
   const auto [resizedWidth, resizedHeight] = processor.editorSize();
   if (resizedWidth != 777 || resizedHeight != 888 ||
       processor.paramControlLayout() !=
-          onda::plugin::ParamControlLayout::knobs ||
+          onda::plugin::ParamControlLayout::sliders ||
       stateChanges.nonParameterChanges < 2 ||
       !automate(0.4F, "with the editor open")) {
     std::cerr << "editor preferences did not mark plugin state dirty\n";
@@ -1882,7 +1896,7 @@ bool exerciseEditorLifecycle() {
   return true;
 }
 
-bool exerciseIncompleteBufferStateRestore() {
+bool exercisePartialBufferStateRestore() {
   TemporarySource source;
   TemporaryAudioFile clip{"cleared-clip"};
   TemporaryAudioFile retained{"retained-clip"};
@@ -1938,12 +1952,16 @@ sample { out1 = clip[0, 0] + retained[1, 0]; out2 = clip[0, 0] + retained[1, 0] 
           std::ranges::find(status.buffers, "retained", &BufferMapping::name);
       const auto cleared =
           std::ranges::find(status.buffers, "clip", &BufferMapping::name);
-      if (status.path != source.path() || status.active ||
-          restored.canExportProject() || kept == status.buffers.end() ||
+      if (status.path != source.path() || !status.active ||
+          !restored.canExportProject() || kept == status.buffers.end() ||
           kept->loadedPath != retained.path() ||
-          cleared == status.buffers.end() || !cleared->loadedPath.empty()) {
+          cleared == status.buffers.end() || !cleared->loadedPath.empty() ||
+          !waitForOutput(restored, 0.25F, 8)) {
         std::cerr
-            << "incomplete buffer state lost its source or remaining binding\n";
+            << "partial buffer state lost its source or remaining binding: "
+            << status.message << "; exportable=" << restored.canExportProject()
+            << "; bindings=" << juce::JSON::toString(makeRunViewState(restored, status, false, {})["state"]["buffers"], true)
+            << '\n';
         return false;
       }
       test::service(restored);
@@ -1994,7 +2012,7 @@ sample {
   // Compare the checkpoint exactly, accounting for the FLAC fixture's 16-bit
   // quantization before applying the project constant and unchanged buffer.
   const auto expectedOverride =
-      decoded.audio->interleavedSamples[0] * 2.0F + 0.125F;
+      std::get<std::vector<float>>(decoded.audio->samples.values)[0] * 2.0F + 0.125F;
   juce::MemoryBlock saved;
   {
     onda::plugin::Processor processor(onda::plugin::Product::effect);
@@ -2023,7 +2041,7 @@ sample {
     }
     changes = listener.nonParameterChanges;
     processor.getStateInformation(saved);
-    // A failed reload must not make clearing an optional override destructive.
+    // A failed source reload must not prevent clearing with the last valid JIT.
     if (!source.write("invalid syntax\n"))
       return false;
     processor.requestReload();
@@ -2034,22 +2052,24 @@ sample {
     processor.clearBuffer("clip");
     juce::MemoryBlock clearing;
     processor.getStateInformation(clearing);
-    if (clearing != saved) {
-      std::cerr << "clearing a project override discarded its checkpoint\n";
+    // Saving before preparation must retain the explicit clear intent.
+    onda::plugin::Processor immediate(onda::plugin::Product::effect);
+    immediate.setStateInformation(clearing.getData(), static_cast<int>(clearing.getSize()));
+    immediate.prepareToPlay(48'000.0, 8);
+    if (!waitForOutput(immediate, 0.125F, 8)) {
+      std::cerr << "pending clear resurrected a saved project asset\n";
       return false;
     }
     processor.prepareToPlay(48'000.0, 8);
-    if (!processor.workerStatus().active ||
-        !waitForOutput(processor, expectedOverride, 8)) {
-      std::cerr << "failed default replacement stopped the working engine\n";
+    if (!processor.workerStatus().active || !waitForOutput(processor, 0.125F, 8)) {
+      std::cerr << "clearing a project buffer did not unbind it\n";
       return false;
     }
-    processor.getStateInformation(clearing);
-    if (clearing != saved || !source.write(projectSource))
+    if (!source.write(projectSource))
       return false;
     processor.requestReload();
-    if (!waitForOutput(processor, 0.625F, 8)) {
-      std::cerr << "clearing an override did not restore the project default\n";
+    if (!waitForOutput(processor, 0.125F, 8)) {
+      std::cerr << "source reload resurrected a cleared project default\n";
       return false;
     }
     test::service(processor);
@@ -2107,14 +2127,17 @@ sample {
     return false;
 
   const auto waitForBufferStatus = [](onda::plugin::Processor &processor,
-                                      const bool active) {
+                                      const bool active,
+                                      const int loadedFrames = -1) {
     onda::plugin::WorkerStatus status;
     const auto ready = test::waitUntil(
         [&] {
           test::service(processor);
           status = processor.workerStatus();
           return !status.compiling && status.buffers.size() == 1U &&
-                 status.active == active;
+                 status.active == active &&
+                 (loadedFrames < 0 ||
+                  status.buffers[0].loadedFrames == loadedFrames);
         },
         test::yieldToWorker);
     return ready ? status : onda::plugin::WorkerStatus{};
@@ -2135,21 +2158,34 @@ sample {
     processor.prepareToPlay(48'000.0, 8);
     processor.loadFile(juce::File(onda::plugin::pathToJuce(source.path())),
                        false);
-    const auto unbound = waitForBufferStatus(processor, false);
+    const auto unbound = waitForBufferStatus(processor, true);
     if (unbound.buffers.size() != 1U ||
-        unbound.message.find("not bound") == std::string::npos) {
-      std::cerr << "declared buffer did not wait for an audio-file binding\n";
+        unbound.buffers[0].loadedFrames != 0 || unbound.hasError ||
+        processFirstFrame(processor) != std::pair{0.0F, 0.0F}) {
+      std::cerr << "unbound buffer did not use neutral audio\n";
       return false;
     }
 
     processor.bindBufferFile(
         "clip", juce::File(onda::plugin::pathToJuce(audioFile.path())));
-    const auto bound = waitForBufferStatus(processor, true);
+    const auto bound = waitForBufferStatus(processor, true, 8);
     if (bound.buffers.size() != 1U ||
         bound.buffers[0].loadedPath != audioFile.path() ||
         bound.buffers[0].loadedFrames != 8 ||
         bound.buffers[0].loadedChannels != 2) {
       std::cerr << "processor did not publish decoded buffer metadata\n";
+      return false;
+    }
+    const auto view = onda::plugin::makeRunViewState(processor, bound, false, {})
+                          .getProperty("state", {});
+    const auto waveform =
+        view.getProperty("buffers", {})[0].getProperty("waveform", {});
+    const auto minimums = waveform.getProperty("minimums", {});
+    const auto maximums = waveform.getProperty("maximums", {});
+    if (minimums.size() != 8 || maximums.size() != 8 ||
+        !test::withinTolerance(static_cast<double>(minimums[0]) - 0.1, 5.0e-4) ||
+        !test::withinTolerance(static_cast<double>(maximums[7]) - 0.57, 5.0e-4)) {
+      std::cerr << "run view did not publish the loaded buffer waveform\n";
       return false;
     }
     const auto [left, right] = processFirstFrame(processor);
@@ -2175,6 +2211,12 @@ sample {
           const auto status = processor.workerStatus();
           const auto output = processFirstFrame(processor);
           return status.revision > revision && status.active &&
+                 status.buffers.size() == 1U &&
+                 status.buffers[0].waveform &&
+                 test::withinTolerance(
+                     status.buffers[0].waveform->minValue - 0.2, 5.0e-4) &&
+                 test::withinTolerance(
+                     status.buffers[0].waveform->maxValue - 0.67, 5.0e-4) &&
                  !status.compiling && std::abs(output.first - 0.2F) < 5.0e-4F &&
                  std::abs(output.second - 0.6F) < 5.0e-4F;
         },
@@ -2185,16 +2227,11 @@ sample {
     }
 
     processor.clearBuffer("clip");
-    const auto fallback = processFirstFrame(processor);
-    if (!test::withinTolerance(fallback.first - 1.0F, 1.0e-6F) ||
-        !test::withinTolerance(fallback.second - 1.0F, 1.0e-6F)) {
-      std::cerr << "clearing a buffer did not deactivate the engine\n";
-      return false;
-    }
-    const auto cleared = waitForBufferStatus(processor, false);
+    const auto cleared = waitForBufferStatus(processor, true, 0);
     if (cleared.buffers.size() != 1U ||
-        !cleared.buffers[0].loadedPath.empty()) {
-      std::cerr << "cleared buffer remained bound in worker status\n";
+        !cleared.buffers[0].loadedPath.empty() || cleared.buffers[0].waveform ||
+        processFirstFrame(processor) != std::pair{0.0F, 0.0F}) {
+      std::cerr << "cleared buffer did not return to neutral audio\n";
       return false;
     }
   }
@@ -2266,7 +2303,18 @@ sample {
         viewBuffers == nullptr || viewBuffers->size() != 1
             ? nullptr
             : viewBuffers->getReference(0).getDynamicObject();
+    const auto savedWaveform = viewBuffer == nullptr
+                                   ? juce::var{}
+                                   : viewBuffer->getProperty("waveform");
     if (viewState == nullptr || viewBuffer == nullptr ||
+        savedWaveform.getProperty("minimums", {}).size() != 8 ||
+        savedWaveform.getProperty("maximums", {}).size() != 8 ||
+        !test::withinTolerance(
+            static_cast<double>(savedWaveform.getProperty("minValue", {})) - 0.1,
+            5.0e-4) ||
+        !test::withinTolerance(
+            static_cast<double>(savedWaveform.getProperty("maxValue", {})) - 0.57,
+            5.0e-4) ||
         !static_cast<bool>(viewState->getProperty("canExportProject")) ||
         viewBuffer->getProperty("loadedPath").toString().isNotEmpty() ||
         static_cast<int>(viewBuffer->getProperty("loadedFrames")) != 8 ||
@@ -2325,13 +2373,13 @@ sample {
       std::cerr << "disk buffer authority did not refresh the checkpoint\n";
       return false;
     }
-    // Embedded source assets restore required file bindings; clearing one must
-    // still invalidate the image rather than treating that asset as a default.
+    // Clearing an embedded source asset keeps the program and saves it unbound.
     restored.clearBuffer("clip");
+    restored.prepareToPlay(48'000.0, 8);
     const auto clearedOutput = processFirstFrame(restored);
-    if (restored.workerStatus().active ||
-        !test::withinTolerance(clearedOutput.first - 1.0F, 1.0e-6F) ||
-        !test::withinTolerance(clearedOutput.second - 1.0F, 1.0e-6F))
+    if (!restored.workerStatus().active ||
+        !test::withinTolerance(clearedOutput.first, 1.0e-6F) ||
+        !test::withinTolerance(clearedOutput.second, 1.0e-6F))
       return false;
     juce::MemoryBlock clearedState;
     restored.getStateInformation(clearedState);
@@ -2339,8 +2387,11 @@ sample {
     incomplete.setStateInformation(clearedState.getData(),
                                    static_cast<int>(clearedState.getSize()));
     incomplete.prepareToPlay(48'000.0, 8);
-    if (incomplete.workerStatus().active) {
-      std::cerr << "clearing a required source binding retained its image\n";
+    const auto neutral = processFirstFrame(incomplete);
+    if (!incomplete.workerStatus().active ||
+        !test::withinTolerance(neutral.first, 1.0e-6F) ||
+        !test::withinTolerance(neutral.second, 1.0e-6F)) {
+      std::cerr << "cleared source buffer did not restore unbound\n";
       return false;
     }
   }
@@ -2513,95 +2564,91 @@ bool exerciseExtendedMidi() {
 
 bool exerciseEventOnlyParameterSmoothing() {
   TemporarySource source;
-  if (!source.write(R"(
+  for (const auto *type : {"f32", "f64"}) {
+    if (!source.write(std::string{R"(
 outs { out1, out2 }
-params {
-  single: f32 = 0.0 {0.0, 1.0}
-  double: f64 = 0.0 {0.0, 1.0}
-}
+params { level: )"} + type +
+                      R"( = 0.0 {0.0, 1.0} }
 event note_on(id: i32, channel: i32, key: i32, velocity: f32) {}
 event configure() {}
 block {
-  cached_single = single
-  cached_double = double
-  sample { out1 = cached_single; out2 = f32(cached_double) }
+  cached = level
+  sample { out1 = f32(cached); out2 = f32(cached) }
 }
 )"))
-    return false;
+      return false;
 
-  for (const auto userEvent : {false, true}) {
-    for (const auto firstFrames : {32, 64}) {
-      onda::plugin::Processor processor(onda::plugin::Product::effect);
-      processor.loadFile(juce::File(onda::plugin::pathToJuce(source.path())));
-      // Prepare synchronously without rendering the engine's first samples.
-      processor.prepareToPlay(48'000.0, 64);
-      if (!processor.workerStatus().active ||
-          !processor.setParamSmoothingSeconds(0.03))
-        return false;
-
-      const auto render = [&](const int frames, const float expected,
-                              juce::MidiBuffer &midi) {
-        juce::AudioBuffer<float> audio(2, frames);
-        allocation_audit::count.store(0, std::memory_order_relaxed);
-        lock_audit::count.store(0, std::memory_order_relaxed);
-        allocation_audit::enabled = lock_audit::enabled = true;
-        processor.processBlock(audio, midi);
-        allocation_audit::enabled = lock_audit::enabled = false;
-        if (allocation_audit::count.load(std::memory_order_relaxed) != 0 ||
-            lock_audit::count.load(std::memory_order_relaxed) != 0)
+    for (const auto userEvent : {false, true}) {
+      for (const auto firstFrames : {32, 64}) {
+        onda::plugin::Processor processor(onda::plugin::Product::effect);
+        processor.loadFile(juce::File(onda::plugin::pathToJuce(source.path())));
+        // Prepare synchronously without rendering the engine's first samples.
+        processor.prepareToPlay(48'000.0, 64);
+        if (!processor.workerStatus().active ||
+            !processor.setParamSmoothingSeconds(0.03))
           return false;
-        for (int channel = 0; channel < audio.getNumChannels(); ++channel) {
-          for (int frame = 0; frame < frames; ++frame) {
-            if (!test::withinTolerance(
-                    audio.getSample(channel, frame) - expected, 1.0e-6F)) {
-              std::cerr << "event-only callback changed smoothing startup: "
-                        << audio.getSample(channel, frame) << ", expected "
-                        << expected << " (user event " << userEvent
-                        << ", first frames " << firstFrames << ")\n";
-              return false;
+
+        const auto render = [&](const int frames, const float expected,
+                                juce::MidiBuffer &midi) {
+          juce::AudioBuffer<float> audio(2, frames);
+          allocation_audit::count.store(0, std::memory_order_relaxed);
+          lock_audit::count.store(0, std::memory_order_relaxed);
+          allocation_audit::enabled = lock_audit::enabled = true;
+          processor.processBlock(audio, midi);
+          allocation_audit::enabled = lock_audit::enabled = false;
+          if (allocation_audit::count.load(std::memory_order_relaxed) != 0 ||
+              lock_audit::count.load(std::memory_order_relaxed) != 0)
+            return false;
+          for (int channel = 0; channel < audio.getNumChannels(); ++channel) {
+            for (int frame = 0; frame < frames; ++frame) {
+              if (!test::withinTolerance(
+                      audio.getSample(channel, frame) - expected, 1.0e-6F)) {
+                std::cerr << "event-only callback changed smoothing startup: "
+                          << audio.getSample(channel, frame) << ", expected "
+                          << expected << " (user event " << userEvent
+                          << ", first frames " << firstFrames << ")\n";
+                return false;
+              }
             }
           }
-        }
-        return true;
-      };
+          return true;
+        };
 
-      const auto flushEvent = [&] {
-        juce::MidiBuffer midi;
-        if (userEvent) {
-          if (!processor
-                   .triggerEvent(processor.workerStatus().engineGeneration,
-                                 "configure", juce::Array<juce::var>{})
-                   .empty())
+        const auto flushEvent = [&] {
+          juce::MidiBuffer midi;
+          if (userEvent) {
+            if (!processor
+                     .triggerEvent(processor.workerStatus().engineGeneration,
+                                   "configure", juce::Array<juce::var>{})
+                     .empty())
+              return false;
+          } else {
+            midi.addEvent(juce::MidiMessage::noteOn(1, 60, 1.0F), 0);
+          }
+          return render(0, 0.0F, midi);
+        };
+        juce::MidiBuffer emptyMidi;
+        for (const auto reset : {false, true}) {
+          if (reset) {
+            processor.setSlotValue(0, 0.0F);
+            processor.reset();
+          }
+          if (!flushEvent() || !render(firstFrames, 0.0F, emptyMidi))
             return false;
-        } else {
-          midi.addEvent(juce::MidiMessage::noteOn(1, 60, 1.0F), 0);
+          processor.setSlotValue(0, 1.0F);
+          if (!render(64, 64.0F / 1440.0F, emptyMidi) ||
+              !render(64, 128.0F / 1440.0F, emptyMidi))
+            return false;
         }
-        return render(0, 0.0F, midi);
-      };
-      juce::MidiBuffer emptyMidi;
-      for (const auto reset : {false, true}) {
-        if (reset) {
-          processor.setSlotValue(0, 0.0F);
-          processor.setSlotValue(1, 0.0F);
-          processor.reset();
-        }
-        if (!flushEvent() || !render(firstFrames, 0.0F, emptyMidi))
+        // Targets changed before the first samples after reset still settle
+        // directly; an event-only callback must not enable smoothing early.
+        processor.reset();
+        if (!flushEvent())
           return false;
-        processor.setSlotValue(0, 1.0F);
-        processor.setSlotValue(1, 1.0F);
-        if (!render(64, 64.0F / 1440.0F, emptyMidi) ||
-            !render(64, 128.0F / 1440.0F, emptyMidi))
+        processor.setSlotValue(0, 0.0F);
+        if (!render(firstFrames, 0.0F, emptyMidi))
           return false;
       }
-      // Targets changed before the first samples after reset still settle
-      // directly; an event-only callback must not enable smoothing early.
-      processor.reset();
-      if (!flushEvent())
-        return false;
-      processor.setSlotValue(0, 0.0F);
-      processor.setSlotValue(1, 0.0F);
-      if (!render(firstFrames, 0.0F, emptyMidi))
-        return false;
     }
   }
   return true;
@@ -2846,10 +2893,13 @@ sample {
   processor.loadFile(juce::File(onda::plugin::pathToJuce(source.path())));
   if (!waitForOutput(processor, 0.0F, 8))
     return false;
-  for (std::size_t slot = 0; slot < 3U; ++slot)
+  for (std::size_t slot = 0;
+       slot < std::min(onda::plugin::slotCount, std::size_t{3}); ++slot)
     processor.getParameters()[static_cast<int>(slot)]->setValueNotifyingHost(
         1.0F);
-  if (!render(8, 21.0F))
+  if (!render(8, onda::plugin::slotCount == 1   ? 10.0F
+                 : onda::plugin::slotCount == 2 ? 20.0F
+                                                : 21.0F))
     return false;
   processor.unload();
   return std::is_eq(processor.paramSmoothingSeconds() <=> 0.016);
@@ -4096,7 +4146,8 @@ bool exerciseStateSaveDuringNotification() {
     restored.prepareToPlay(48'000.0, 64);
     if (!rendersImmediately(restored, 64, 1.0F) ||
         !test::withinTolerance(restored.slotValue(0) - 0.25F, 1.0e-6F) ||
-        !test::withinTolerance(restored.slotValue(1) - 0.75F, 1.0e-6F))
+        (slotCount > 1 &&
+         !test::withinTolerance(restored.slotValue(1) - 0.75F, 1.0e-6F)))
       return false;
   }
   return true;
@@ -4161,7 +4212,8 @@ sample { out1 = held; out2 = pinned }
   Processor original(Product::effect);
   original.prepareToPlay(48'000.0, 64);
   original.setSlotValue(0, 0.9F);
-  original.setSlotValue(slotCount - 1U, 0.7F);
+  if constexpr (slotCount > 1)
+    original.setSlotValue(slotCount - 1U, 0.7F);
   original.loadFile(juce::File(onda::plugin::pathToJuce(source.path())), true);
   if (!waitForPublishedReplacement(original))
     return false;
@@ -4182,8 +4234,9 @@ sample { out1 = held; out2 = pinned }
                                  static_cast<int>(saved.getSize()));
     restored.prepareToPlay(48'000.0, 64);
     if (!processWithoutAllocation(restored, 0.25F) ||
-        !test::withinTolerance(restored.slotValue(slotCount - 1U) - 0.7F,
-                               1.0e-6F)) {
+        (slotCount > 1 &&
+         !test::withinTolerance(restored.slotValue(slotCount - 1U) - 0.7F,
+                                1.0e-6F))) {
       std::cerr << "saved checkpoint lost pending defaults or unmapped slots\n";
       return false;
     }
@@ -4234,6 +4287,10 @@ event beta(value: i32) {}
 sample { out1 = clip[0, 0] + extra[0, 0]; out2 = clip[0, 0] + extra[0, 0] }
 )"))
     return false;
+  const juce::File missingAudio{onda::plugin::pathToJuce(
+      testTemporaryRoot() / "missing-pending-audio.wav")};
+  processor.bindBufferFile("clip", missingAudio);
+  processor.bindBufferFile("extra", missingAudio);
   processor.requestReload();
   processor.prepareToPlay(48'000.0, 64);
   const auto pending = processor.workerStatus();
@@ -4607,7 +4664,8 @@ bool exerciseConcurrentInstances() {
 
 int runProcessorCases(const int argc, const char *const *argv) {
   const test::Case cases[]{
-      {"RealtimeAuditInstrumentation", test::exerciseRealtimeAuditInstrumentation},
+      {"RealtimeAuditInstrumentation",
+       test::exerciseRealtimeAuditInstrumentation},
       {"AlignedAllocation", exerciseAlignedAllocation},
       {"NewControlDefaults", exerciseNewControlDefaults},
       {"HostPreparation", exerciseHostPreparation},
@@ -4624,6 +4682,7 @@ int runProcessorCases(const int argc, const char *const *argv) {
       {"MessageThreadDelivery", exerciseMessageThreadDelivery},
       {"ProjectDirtyNotifications", exerciseProjectDirtyNotifications},
       {"RunViewAdapter", exerciseRunViewAdapter},
+      {"FastMath", exerciseFastMath},
       {"ScopeCapture", exerciseScopeCapture},
       {"UserEvents", exerciseUserEvents},
       {"StructuredEvents", exerciseStructuredEvents},
@@ -4639,16 +4698,21 @@ int runProcessorCases(const int argc, const char *const *argv) {
       {"Vst3EditorAttachment", exerciseVst3EditorAttachment, "native"},
       {"EditorGestureCancellation", exerciseEditorGestureCancellation},
       {"StaleEditorEvents", exerciseStaleEditorEvents},
+      {"TypedBufferState", exerciseTypedBufferState},
       {"AudioFileBuffers", exerciseAudioFileBuffers},
+      {"ParameterArrayProcessor", exerciseParameterArrayProcessor},
+      {"UnboundBuffers", exerciseUnboundBuffers},
       {"ProjectBufferOverrideRestore", exerciseProjectBufferOverrideRestore},
-      {"IncompleteBufferStateRestore", exerciseIncompleteBufferStateRestore},
+      {"PartialBufferStateRestore", exercisePartialBufferStateRestore},
       {"SourceGraphFallbackAndDiskAuthority",
        exerciseSourceGraphFallbackAndDiskAuthority},
       {"ProjectExportRelinksAuthority", exerciseProjectExportRelinksAuthority},
       {"ExtendedMidi", exerciseExtendedMidi},
       {"HostAutomationBeforeMidi", exerciseHostAutomationBeforeMidi},
       {"EventOnlyParameterSmoothing", exerciseEventOnlyParameterSmoothing},
-      {"UiAndHostParameterChanges", exerciseUiAndHostParameterChanges},
+      {"UiAndHostParameterChanges", exerciseUiAndHostParameterChanges, "core",
+       onda::plugin::slotCount < 2 ? "requires two independent parameter slots"
+                                   : ""},
       {"BlockProcessing", exerciseBlockProcessing},
       {"CallbackProcessing", exerciseCallbackProcessing},
       {"CallbackSmoothing", exerciseCallbackSmoothing},
@@ -4685,7 +4749,10 @@ int runProcessorCases(const int argc, const char *const *argv) {
        exerciseReplacementDuringRuntimeFailure},
       {"SupersededHandoff", exerciseSupersededHandoff},
       {"SeededHandoff", exerciseSeededHandoff},
-      {"ReplacementDuringSeeding", exerciseReplacementDuringSeeding},
+      {"ReplacementDuringSeeding", exerciseReplacementDuringSeeding, "core",
+       onda::plugin::slotCount < 2
+           ? "requires a partially applied two-slot seed"
+           : ""},
       {"ConcurrentInstances", exerciseConcurrentInstances},
   };
   return test::runCases(argc, argv, cases);

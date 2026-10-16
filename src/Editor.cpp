@@ -32,6 +32,24 @@ constexpr auto juceHostBridgeScript = R"JS(
   let eventDefinitions = [];
   let eventGeneration = "0";
 
+  // WebView2 preserves native paths when File objects cross as additional
+  // objects. Ordinary JSON messages only retain their names and contents.
+  const webview = window.chrome?.webview;
+  if (typeof webview?.postMessageWithAdditionalObjects === "function") {
+    document.addEventListener("dragover", (event) => {
+      if (!Array.from(event.dataTransfer?.types || []).includes("Files")) return;
+      event.preventDefault();
+      event.dataTransfer.dropEffect = "copy";
+    });
+    document.addEventListener("drop", (event) => {
+      if (!Array.from(event.dataTransfer?.types || []).includes("Files")) return;
+      event.preventDefault();
+      const files = Array.from(event.dataTransfer.files || [])
+        .filter(file => /\.(?:onda|on|ondaproject)$/i.test(file.name));
+      if (files.length) webview.postMessageWithAdditionalObjects("ondaFilesDropped", files);
+    });
+  }
+
   function parameterControlKey(parameter) {
     const { value, normalizedValue, ...control } = parameter;
     return JSON.stringify(control);
@@ -143,8 +161,6 @@ constexpr auto juceHostBridgeScript = R"JS(
     }
     const runSettings = document.getElementById("file-picker-settings");
     if (runSettings) runSettings.style.gridTemplateColumns = "minmax(0, 1fr)";
-    const blockLabel = document.querySelector('label[for="run-block-size"]');
-    if (blockLabel) blockLabel.textContent = "Onda Block Size";
     const input = document.getElementById("param-smoothing-ms");
     if (input) {
       input.setAttribute("aria-label", "Editor parameter smoothing duration in milliseconds");
@@ -310,7 +326,8 @@ juce::WebBrowserComponent::Options browserOptions() {
 
 } // namespace
 
-class Editor::Browser final : public juce::WebBrowserComponent {
+class Editor::Browser final : public juce::WebBrowserComponent,
+                              public juce::FileDragAndDropTarget {
 public:
   explicit Browser(Editor &owner)
       : WebBrowserComponent(
@@ -346,6 +363,14 @@ public:
   }
 
   void newWindowAttemptingToLoad(const juce::String &) override {}
+
+  bool isInterestedInFileDrag(const juce::StringArray &files) override {
+    return owner_.isInterestedInFileDrag(files);
+  }
+
+  void filesDropped(const juce::StringArray &files, int x, int y) override {
+    owner_.filesDropped(files, x, y);
+  }
 
   bool pageLoadHadNetworkError(const juce::String &error) override {
     owner_.loadingOverlay_.setText("Could not load the Onda editor: " + error,
@@ -402,6 +427,26 @@ void Editor::endParameterGesture(const std::size_t index) {
 
 void Editor::paint(juce::Graphics &graphics) {
   graphics.fillAll(editorBackground);
+}
+
+bool Editor::isInterestedInFileDrag(const juce::StringArray &files) {
+  return std::any_of(files.begin(), files.end(), [](const auto &path) {
+    return juce::File::isAbsolutePath(path) &&
+           juce::File(path).hasFileExtension("onda;on;ondaproject");
+  });
+}
+
+void Editor::filesDropped(const juce::StringArray &files, int, int) {
+  for (const auto &path : files) {
+    if (!isInterestedInFileDrag({path}))
+      continue;
+    const juce::File file(path);
+    if (!file.existsAsFile())
+      continue;
+    actionError_.clear();
+    processor_.loadFile(file, true);
+    return;
+  }
 }
 
 void Editor::resized() {
@@ -469,6 +514,7 @@ void Editor::publishState(const bool force) {
   const auto currentSmoothingSeconds = processor_.paramSmoothingSeconds();
   const auto currentHostBlockSize = processor_.hostBlockSize();
   const auto currentBlockPreference = processor_.preferredBlockSize();
+  const auto currentFastMath = processor_.fastMath();
   if (!force && hasPublished_ && revision == publishedRevision_ &&
       logRevision == publishedLogRevision_ &&
       currentSlots == publishedSlotStamps_ &&
@@ -480,6 +526,7 @@ void Editor::publishState(const bool force) {
       std::is_eq(currentSmoothingSeconds <=> publishedSmoothingSeconds_) &&
       currentHostBlockSize == publishedHostBlockSize_ &&
       currentBlockPreference == publishedBlockPreference_ &&
+      currentFastMath == publishedFastMath_ &&
       viewStateRestoreRevision == publishedViewStateRestoreRevision_) {
     return;
   }
@@ -504,6 +551,7 @@ void Editor::publishState(const bool force) {
   publishedSmoothingSeconds_ = currentSmoothingSeconds;
   publishedHostBlockSize_ = currentHostBlockSize;
   publishedBlockPreference_ = currentBlockPreference;
+  publishedFastMath_ = currentFastMath;
   publishedViewStateRestoreRevision_ = viewStateRestoreRevision;
   hasPublished_ = true;
   auto message =
@@ -638,6 +686,13 @@ void Editor::handleCommand(const juce::var &command) {
       processor_.setInputControlLayout(layout == "knobs"
                                            ? ParamControlLayout::knobs
                                            : ParamControlLayout::sliders);
+  } else if (type == "setFastMath") {
+    const auto enabled = input->getProperty("enabled");
+    actionError_ =
+        enabled.isBool() && processor_.setFastMath(static_cast<bool>(enabled))
+            ? std::string{}
+            : "Unload the program before changing Fast Math";
+    publishState(true);
   } else if (type == "setRunSettings") {
     const auto samples = input->getProperty("blockSamples");
     actionError_ = samples.isInt() && processor_.setPreferredBlockSize(
@@ -680,7 +735,7 @@ void Editor::handleCommand(const juce::var &command) {
     if (!hasBuffer(processor_.workerStatus(), name))
       return;
     fileChooser_ = std::make_unique<juce::FileChooser>(
-        "Bind an audio file", processor_.lastBrowseDirectory(),
+        "Load buffer file", processor_.lastBrowseDirectory(),
         juce::String::fromUTF8(supportedAudioFileWildcard().c_str()));
     fileChooser_->launchAsync(
         juce::FileBrowserComponent::openMode |
