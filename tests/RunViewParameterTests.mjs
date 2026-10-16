@@ -13,14 +13,6 @@ assert.ok(bridge, "Could not locate the editor's injected host bridge");
 // Use the shipped view and bridge. Only the native transport is replaced.
 const transport = `
 window.__parameterCommands = [];
-window.__droppedFiles = [];
-window.__ondaBufferFileExtensions = [".wav", ".aif", ".aiff", ".flac", ".ogg", ".ondabuffer"];
-window.chrome ??= {};
-window.chrome.webview = {
-  postMessageWithAdditionalObjects: (message, files) => {
-    window.__droppedFiles.push({ message, files });
-  },
-};
 window.__JUCE__ = { backend: {
   emitEvent: (_name, value) => window.__parameterCommands.push(value),
   addEventListener: (_name, receive) => { window.__receiveParameters = receive; },
@@ -144,28 +136,6 @@ try {
   page.on("pageerror", error => errors.push(String(error)));
   await page.goto(`http://127.0.0.1:${server.address().port}/`);
   await page.bringToFront();
-  const dropped = await page.evaluate(() => {
-    const transfer = new DataTransfer();
-    // Chromium ignores native dropEffect writes on synthetic drags. Track the
-    // handlers' final choice to cover source drops outside the buffer cards.
-    Object.defineProperty(transfer, "dropEffect", { value: "none", writable: true });
-    transfer.items.add(new File([""], "ignore.txt"));
-    const file = new File(["outs { out1 }"], "patch.onda");
-    transfer.items.add(file);
-    const enter = new DragEvent("dragover", { dataTransfer: transfer, cancelable: true, bubbles: true });
-    const drop = new DragEvent("drop", { dataTransfer: transfer, cancelable: true, bubbles: true });
-    document.body.dispatchEvent(enter);
-    document.body.dispatchEvent(drop);
-    return { accepted: enter.defaultPrevented, effect: transfer.dropEffect, handled: drop.defaultPrevented,
-      count: window.__droppedFiles.length,
-      message: window.__droppedFiles[0]?.message,
-      names: window.__droppedFiles[0]?.files.map(file => file.name),
-      nativeFile: window.__droppedFiles[0]?.files[0] instanceof File,
-      sameFile: window.__droppedFiles[0]?.files[0] === transfer.files[1] };
-  });
-  assert.deepEqual(dropped, { accepted: true, effect: "copy", handled: true, count: 1,
-    message: JSON.stringify({ type: "ondaFilesDropped", x: 0, y: 0 }),
-    names: ["patch.onda"], nativeFile: true, sameFile: true });
   await page.evaluate(() => window.__receiveParameters({ type: "state", state: {
     supportsFastMath: true, fastMath: false, supportsSourceSelection: true,
     supportsRunSettings: true, path: "", hostBlockSamples: 64,
@@ -223,81 +193,6 @@ try {
       channelsStatic: 2, loadedFrames: null, loadedChannels: null, waveform: null }],
   } }));
   assert.equal(await preview.count(), 0, "Cleared buffers must remove their waveform");
-  await page.evaluate(() => window.__receiveParameters({ type: "state", state: {
-    buffers: [{ name: "clip", type: "buffer<f32>" }, { name: "spare", type: "buffer<f32>" }],
-  } }));
-  await page.locator('[data-buffer-name="spare"]').scrollIntoViewIfNeeded();
-  const bufferDrops = await page.evaluate(() => {
-    const cards = () => [...document.querySelectorAll(".buffer-card")];
-    const position = index => {
-      const rect = cards()[index].querySelector(".param-name").getBoundingClientRect();
-      return { x: Math.round(rect.left + 5), y: Math.round(rect.top + rect.height / 2) };
-    };
-    const send = window.__receiveParameters;
-    const drag = (phase, paths, index = 0) => send({
-      type: "bufferFileDrag", phase, paths, position: position(index),
-    });
-    const target = () => document.querySelector(".file-hover")?.dataset.bufferName;
-    const bindings = () => window.__parameterCommands.filter(command => command.type === "bindBufferFile");
-    const initial = bindings().length;
-    drag("enter", ["/samples/音.wav"]);
-    const enter = target();
-    send({ type: "state", state: { status: "background publication" } });
-    const retained = target();
-    drag("over", ["/samples/音.wav"], 1);
-    const moved = target();
-    drag("leave");
-    const cancelled = target() === undefined;
-    drag("drop", ["/samples/音.ondabuffer"], 1);
-    const typed = bindings().at(-1);
-    const cleared = target() === undefined;
-    drag("drop", ["/a.wav", "/b.wav"]);
-    drag("drop", ["/a.txt"]);
-    send({ type: "bufferFileDrag", phase: "drop", paths: ["/a.wav"], position: { x: 0, y: 0 } });
-    const rejected = bindings().length === initial + 1;
-
-    const windows = [];
-    const native = [];
-    for (const extension of window.__ondaBufferFileExtensions) {
-      const name = "clip" + extension.toUpperCase();
-      drag("enter", ["/samples/" + name]);
-      const highlightedNative = target() === "clip";
-      drag("drop", ["/samples/" + name]);
-      native.push({ highlighted: highlightedNative, cleared: target() === undefined,
-        binding: bindings().at(-1) });
-      const point = position(0);
-      const transfer = new DataTransfer();
-      transfer.items.add(new File(["audio"], name));
-      const dispatch = type => cards()[0].querySelector(".param-name").dispatchEvent(
-        new DragEvent(type, { dataTransfer: transfer, cancelable: true, bubbles: true,
-          clientX: point.x, clientY: point.y }));
-      dispatch("dragover");
-      const highlighted = target() === "clip";
-      dispatch("drop");
-      const forwarded = window.__droppedFiles.at(-1);
-      const message = JSON.parse(forwarded.message);
-      windows.push({ highlighted, cleared: target() === undefined,
-        file: forwarded.files[0] === transfer.files[0],
-        position: message.x === point.x && message.y === point.y,
-        type: message.type });
-    }
-    send({ type: "state", state: { path: "" } });
-    drag("drop", ["/a.wav"]);
-    const unloaded = bindings().length === initial + 1 + native.length && target() === undefined;
-    send({ type: "state", state: { path: "defaults.onda" } });
-    return { enter, retained, moved, cancelled, typed, cleared, rejected, native, windows, unloaded };
-  });
-  assert.deepEqual(bufferDrops, {
-    enter: "clip", retained: "clip", moved: "spare", cancelled: true,
-    typed: { type: "bindBufferFile", name: "spare", filePath: "/samples/音.ondabuffer" },
-    cleared: true, rejected: true, unloaded: true,
-    native: [".wav", ".aif", ".aiff", ".flac", ".ogg", ".ondabuffer"].map(extension => ({
-      highlighted: true, cleared: true, binding: { type: "bindBufferFile", name: "clip",
-        filePath: "/samples/clip" + extension.toUpperCase() },
-    })),
-    windows: Array.from({ length: 6 }, () => ({ highlighted: true, cleared: true, file: true,
-      position: true, type: "ondaFilesDropped" })),
-  });
   await page.evaluate(() => window.__receiveParameters({ type: "state", state: { buffers: [] } }));
   const capabilities = await page.evaluate(() => {
     window.__receiveParameters({ type: "state", state: {

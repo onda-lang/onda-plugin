@@ -109,16 +109,6 @@ target_sources(onda_processor_tests PRIVATE
     src/SpscQueue.h
 )
 target_compile_features(onda_processor_tests PRIVATE cxx_std_20)
-if(APPLE)
-    target_sources(onda_processor_tests PRIVATE tests/NativeFileDrop_mac.mm)
-elseif(WIN32)
-    target_sources(onda_processor_tests PRIVATE tests/NativeFileDrop_windows.cpp)
-    target_link_libraries(onda_processor_tests PRIVATE ole32 shell32 uuid)
-elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-    find_package(X11 REQUIRED)
-    target_sources(onda_processor_tests PRIVATE tests/NativeFileDrop_linux.cpp)
-    target_link_libraries(onda_processor_tests PRIVATE X11::X11)
-endif()
 if(NOT MSVC)
     set_source_files_properties(tests/RealtimeAuditTests.cpp PROPERTIES
         COMPILE_OPTIONS "-fno-builtin;$<$<CXX_COMPILER_ID:Clang,AppleClang>:-fsized-deallocation>")

@@ -190,8 +190,7 @@ and GTK subprocess drops to the browser's `FileDragAndDropTarget`. The GTK IPC
 decoder and JavaScriptCore callbacks read UTF-8 explicitly so filenames survive
 both directions of the subprocess boundary.
 Windows accepts DOM file drops through WebView2's additional-object messages,
-then reads their native `ICoreWebView2File` paths. Its native test drives a real
-OLE drop through the browser rather than calling the editor's handler directly.
+then reads their native `ICoreWebView2File` paths.
 Native drag positions and paths reach the shared buffer view as `bufferFileDrag`
 messages. It highlights the card under the cursor and emits `bindBufferFile`
 on a single supported audio or `.ondabuffer` drop. The editor validates the

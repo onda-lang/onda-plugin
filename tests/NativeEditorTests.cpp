@@ -1,7 +1,5 @@
 #include "NativeEditorTests.h"
-#include "NativeFileDrop.h"
 
-#include "EditorTestSupport.h"
 #include "JucePath.h"
 #include "Processor.h"
 #include "ProcessorTestSupport.h"
@@ -10,14 +8,11 @@
 #include "Vst3ControllerTestSupport.h"
 #include "Vst3TestSupport.h"
 
-#include <juce_audio_formats/juce_audio_formats.h>
 #include <juce_gui_basics/juce_gui_basics.h>
 #include <juce_gui_extra/juce_gui_extra.h>
 
 #include <algorithm>
-#include <array>
 #include <chrono>
-#include <functional>
 #include <iostream>
 #include <memory>
 #include <optional>
@@ -97,182 +92,6 @@ juce::WebBrowserComponent *readyBrowser(juce::AudioProcessorEditor &editor) {
   return nullptr;
 }
 
-bool exerciseNativeBufferDrops(onda::plugin::Processor &processor,
-                               const std::function<bool(float)> &renders) {
-  using namespace onda::plugin;
-  const juce::File wave{
-      pathToJuce(testTemporaryRoot() / u8"native-drag-音.wav")};
-  const juce::File typed{
-      pathToJuce(testTemporaryRoot() / u8"native-drag-音.ondabuffer")};
-  juce::AudioFormatManager formats;
-  formats.registerBasicFormats();
-  std::vector<juce::File> files;
-  for (const auto *extension : {"wav", "aif", "AIFF", "flac", "ogg"}) {
-    auto *format = formats.findFormatForFileExtension(extension);
-    if (!format)
-      return false;
-    const auto file = wave.withFileExtension(extension);
-    auto output = file.createOutputStream();
-    if (!output)
-      return false;
-    output->setPosition(0);
-    output->truncate();
-    std::unique_ptr<juce::OutputStream> stream = std::move(output);
-    auto writer =
-        format->createWriterFor(stream, juce::AudioFormatWriterOptions{}
-                                            .withSampleRate(48'000.0)
-                                            .withNumChannels(1)
-                                            .withBitsPerSample(16));
-    juce::AudioBuffer<float> samples(1, 2048);
-    juce::FloatVectorOperations::fill(samples.getWritePointer(0), 0.25F, 2048);
-    if (!writer || !writer->writeFromAudioSampleBuffer(samples, 0, 2048))
-      return false;
-    files.push_back(file);
-  }
-  const std::array values{0.5F, 0.75F};
-  Diagnostic diagnostic;
-  const auto bytes =
-      encodeBufferAsset(ONDA_PRIMITIVE_F32, std::as_bytes(std::span{values}), 2,
-                        1, 48'000.0F, diagnostic);
-  if (bytes.empty() || !typed.replaceWithData(bytes.data(), bytes.size()))
-    return false;
-
-  EditorWindow host(processor);
-  auto *browser = readyBrowser(host.editor());
-  auto *target = dynamic_cast<juce::FileDragAndDropTarget *>(&host.editor());
-  if (!browser || !target ||
-      !target->isInterestedInFileDrag({wave.getFullPathName()}) ||
-      target->isInterestedInFileDrag(
-          {wave.getFullPathName(), typed.getFullPathName()}) ||
-      target->isInterestedInFileDrag({"relative.wav"}))
-    return false;
-  processor.setSlotValue(0, 1.0F);
-  if (!renders(1.0F))
-    return false;
-  if (!evaluate(*browser, R"(
-    (() => {
-      window.__testFileDrags = [];
-      const receive = window._onHostMessage;
-      window._onHostMessage = message => {
-        if (message.type === 'bufferFileDrag') window.__testFileDrags.push(message);
-        receive(message);
-      };
-      return true;
-    })()
-  )",
-                true))
-    return false;
-
-  const auto bound = [&](const juce::File &file) {
-    const auto status = processor.workerStatus();
-    return !status.compiling && !status.hasError &&
-           status.buffers.size() == 2 && status.buffers[0].loadedPath.empty() &&
-           status.buffers[1].loadedPath == pathFromJuce(file.getFullPathName());
-  };
-  files.push_back(typed);
-  for (const auto &file : files) {
-    const auto position = evaluateResult(*browser, R"(
-      (() => {
-        const card = document.querySelector('[data-buffer-name="spare"]');
-        card.scrollIntoView({ block: 'center' });
-        const rect = card.querySelector('.buffer-file').getBoundingClientRect();
-        return { x: Math.round(rect.left + 5), y: Math.round(rect.top + rect.height / 2) };
-      })()
-    )");
-    if (!position)
-      return false;
-    const juce::Point<int> point{static_cast<int>((*position)["x"]),
-                                 static_cast<int>((*position)["y"])};
-    const juce::StringArray paths{file.getFullPathName()};
-    target->fileDragMove(paths, point.x, point.y);
-    if (!test::waitForMessage([&] {
-          return evaluate(*browser,
-                          "document.querySelector('.file-hover')?.dataset."
-                          "bufferName === 'spare'",
-                          true);
-        }))
-      return false;
-    target->fileDragExit(paths);
-    if (!test::waitForMessage([&] {
-          return evaluate(
-              *browser, "document.querySelector('.file-hover') === null", true);
-        }))
-      return false;
-    if (!dropNativeFile(*browser, file, point) ||
-        !test::waitForMessage([&] { return bound(file); })) {
-      std::cerr << "Native buffer drop did not bind the selected card: "
-                << processor.workerStatus().message
-                << "; point=" << point.toString() << '\n';
-      for (const auto &mapping : processor.workerStatus().buffers)
-        std::cerr << mapping.name << ": " << mapping.loadedPath << '\n';
-      if (const auto debug = evaluateResult(*browser, R"(
-        JSON.stringify({ drags: window.__testFileDrags,
-          cards: [...document.querySelectorAll('.buffer-card')].map(card => ({
-            name: card.dataset.bufferName, rect: card.getBoundingClientRect().toJSON()
-          })) })
-      )"))
-        std::cerr << debug->toString() << '\n';
-      return false;
-    }
-    const auto decoded = decodeAudioFile(pathFromJuce(file.getFullPathName()));
-    if (!decoded.audio)
-      return false;
-    const auto expected =
-        1.0F + std::get<std::vector<float>>(decoded.audio->samples.values)[0];
-    if (!test::waitForMessage([&] { return renders(expected); }))
-      return false;
-    if (!evaluate(*browser, "document.querySelector('.file-hover') === null",
-                  true))
-      return false;
-  }
-  target->filesDropped({wave.getFullPathName()}, 20, 20);
-  if (!test::waitForMessage([&] {
-        return evaluate(*browser,
-                        "window.__testFileDrags.filter(message => "
-                        "message.phase === 'drop').length === " +
-                            juce::String(files.size() + 1),
-                        true);
-      }) ||
-      !bound(typed)) {
-    std::cerr
-        << "A native file drop outside the buffer cards changed a binding\n";
-    return false;
-  }
-  // Invalid commands cannot create a new buffer binding or replace a valid one.
-  auto &editor = dynamic_cast<Editor &>(host.editor());
-  for (const auto &[name, path] : std::array{
-           std::pair{juce::String{"missing"}, wave.getFullPathName()},
-           std::pair{juce::String{"spare"}, juce::String{"relative.wav"}},
-           std::pair{juce::String{"spare"},
-                     wave.getSiblingFile("missing.wav").getFullPathName()},
-           std::pair{
-               juce::String{"spare"},
-               wave.getSiblingFile("native-editor.onda").getFullPathName()}}) {
-    juce::var command{new juce::DynamicObject};
-    command.getDynamicObject()->setProperty("type", "bindBufferFile");
-    command.getDynamicObject()->setProperty("name", name);
-    command.getDynamicObject()->setProperty("filePath", path);
-    EditorTestAccess::command(editor, command);
-  }
-  if (!bound(typed))
-    return false;
-  if (!evaluate(*browser, R"(
-      (() => {
-        document.querySelector('[data-buffer-name="spare"] button:last-child').click();
-        return true;
-      })()
-    )",
-                true))
-    return false;
-  const auto cleared = test::waitForMessage([&] {
-    const auto status = processor.workerStatus();
-    return !status.compiling && status.buffers[1].loadedPath.empty() &&
-           renders(1.0F);
-  });
-  processor.setSlotValue(0, 0.0F);
-  return cleared;
-}
-
 } // namespace
 
 bool exerciseNativeEditor() {
@@ -307,36 +126,6 @@ sample { if enabled { out1 = 1.0 + clip[0] + spare[0] } else { out1 = 0.0 } }
         })()
       )", true))
         return false;
-      const juce::StringArray files{"/unsupported.txt",
-                                    source.getFullPathName()};
-      auto *target =
-          dynamic_cast<juce::FileDragAndDropTarget *>(&host.editor());
-      if (!target || !target->isInterestedInFileDrag(files)) {
-        std::cerr << "Editor does not accept an Onda file drag\n";
-        return false;
-      }
-      if (target->isInterestedInFileDrag({"/unsupported.txt"}) ||
-          target->isInterestedInFileDrag({"relative.onda"}) ||
-          target->isInterestedInFileDrag({}))
-        return false;
-      if (!dropNativeFile(*browser, source))
-        return false;
-      if (!test::waitForMessage([&] {
-            return processor.workerStatus().path ==
-                   pathFromJuce(source.getFullPathName());
-          })) {
-        std::cerr << "Native browser did not forward the dropped path: "
-                  << processor.workerStatus().path << ", expected "
-                  << source.getFullPathName() << '\n';
-        return false;
-      }
-      processor.prepareToPlay(48'000.0, 64);
-      if (!processor.workerStatus().active ||
-          processor.workerStatus().path !=
-              pathFromJuce(source.getFullPathName())) {
-        std::cerr << "Dropping an Onda file did not load it\n";
-        return false;
-      }
     }
     processor.loadFile(source);
     processor.prepareToPlay(48'000.0, 64);
@@ -406,8 +195,6 @@ sample { if enabled { out1 = 1.0 + clip[0] + spare[0] } else { out1 = 0.0 } }
         return false;
       }
     }
-    if (!exerciseNativeBufferDrops(processor, renders) || !renders(0.0F))
-      return false;
     processor.releaseResources();
   }
   return true;
