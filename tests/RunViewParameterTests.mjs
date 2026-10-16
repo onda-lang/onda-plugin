@@ -55,6 +55,14 @@ const checks = `
       number().blur();
       equal(number().value, "440", "Unedited blur must preserve an authored default");
       equal(writes().length, before, "Unedited blur must not write to DSP");
+      send({ ...parameter, value: 0.25, default: 0.25, normalizedValue: 0.25 });
+      document.documentElement.lang = "it-IT";
+      focus();
+      number().select();
+      equal(window.getSelection().toString(), "0.25",
+        "Visible decimals must use a dot regardless of the host locale");
+      number().blur();
+      document.documentElement.lang = "en";
       for (const value of ["9007199254740993", "-9007199254740993",
                            "9223372036854775807", "-9223372036854775808"]) {
         const integer = { ...parameter, type: "i64", value, default: value,
@@ -130,6 +138,12 @@ try {
   const result = await page.evaluate(checks);
   assert.equal(result.error, undefined, result.stack ?? result.error);
   assert.equal(result.ok, true);
+  const decimal = page.locator("#params .param-number");
+  await decimal.focus();
+  await decimal.fill("0.625");
+  await decimal.press("ArrowUp");
+  await decimal.press("Enter");
+  assert.equal(await decimal.inputValue(), "0.6251", "Arrow edits must retain numeric step behavior");
   const capabilities = await page.evaluate(() => {
     window.__receiveParameters({ type: "state", state: {
       supportsViewState: true,
@@ -173,6 +187,69 @@ try {
     activeNotes: document.querySelectorAll(".piano-key.active").length,
   })), { scroll: 50, logLines: 0, activeNotes: 0 });
   assert.deepEqual(errors, [], "The shipped view raised a browser error");
+  for (const width of [360, 480, 720]) {
+    await page.setViewportSize({ width, height: 480 });
+    const labels = await page.locator("[data-param-layout]").evaluateAll(buttons =>
+      buttons.map(button => {
+        const box = button.getBoundingClientRect();
+        const range = document.createRange();
+        range.selectNodeContents(button);
+        const text = range.getBoundingClientRect();
+        return { label: button.textContent,
+          offset: (text.left + text.right - box.left - box.right) / 2 };
+      }));
+    for (const { label, offset } of labels)
+      assert.ok(Math.abs(offset) <= 0.5, `${label} text is off-center by ${offset}px`);
+  }
+  await page.close();
+  page = await browser.newPage();
+  page.setDefaultTimeout(5000);
+  page.on("pageerror", error => errors.push(String(error)));
+  await page.addInitScript(() => {
+    // REAPER's macOS webview rejects this selector even though standalone
+    // WebKit supports popovers. Replay that feature boundary at the DOM seam.
+    const supports = CSS.supports.bind(CSS);
+    CSS.supports = (...args) => args[0] === "selector(:popover-open)"
+      ? false : supports(...args);
+    const matches = Element.prototype.matches;
+    Element.prototype.matches = function (selector) {
+      if (selector === ":popover-open")
+        throw new DOMException("Unsupported :popover-open selector", "SyntaxError");
+      return matches.call(this, selector);
+    };
+    HTMLElement.prototype.showPopover = undefined;
+    HTMLElement.prototype.hidePopover = undefined;
+    document.addEventListener("DOMContentLoaded", () => {
+      // Without popover support the attribute does not hide the element.
+      document.querySelectorAll("[popover]").forEach(node => node.removeAttribute("popover"));
+    });
+  });
+  await page.goto(`http://127.0.0.1:${server.address().port}/`);
+  await page.evaluate(() => window.__receiveParameters({ type: "state", state: {
+    supportsSourceSelection: true, supportsViewState: true,
+    status: "No Onda file loaded", viewState: { reset: true, readyId: 1 },
+  } }));
+  await page.waitForFunction(() => window.__parameterCommands.some(command =>
+    command.type === "runViewReady" && command.readyId === 1));
+  assert.equal(await page.locator("#choose-onda-file").isVisible(), true,
+    "The fresh editor must become visible without popover support");
+  assert.equal(await page.locator("#settings-popover").isVisible(), false,
+    "The unavailable device panel must not leave an empty floating capsule");
+  await page.setViewportSize({ width: 720, height: 800 });
+  await page.evaluate(() => {
+    document.querySelector(".shell").dispatchEvent(new Event("scroll"));
+    window.__receiveParameters({ type: "state", state: {
+      path: "defaults.onda", params: [{ name: "gain", label: "Gain", type: "f32", scalar: true,
+        hostValueDomain: "normalized", normalizedValue: 0.5, value: 0.5, default: 0.5,
+        rangeMin: 0, rangeMax: 1, scale: "linear", curve: null, unit: "",
+        step: null, stepCount: null }],
+    } });
+  });
+  assert.equal(await page.locator("#params .param-number").isVisible(), true,
+    "Loaded controls must render without popover support");
+  assert.equal(await page.locator("#settings-popover").isVisible(), false,
+    "Loaded editors must not show an empty floating device panel");
+  assert.deepEqual(errors, [], "Unsupported popovers must not interrupt the editor");
   console.log("Run view defaults, editing, log, MIDI monitor and scroll restoration passed");
 } catch (error) {
   try {

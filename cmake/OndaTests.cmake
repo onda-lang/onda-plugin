@@ -12,7 +12,7 @@ if(ONDA_PLUGIN_BUILD_BROWSER_TESTS)
     onda_add_test(onda_run_view_parameter_tests browser
         "${ONDA_NODE_EXECUTABLE}"
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/RunViewParameterTests.mjs"
-        "${onda_run_view_html}"
+        "${ONDA_RELEASE_SOURCE_DIR}/ui/run/run.html"
         "${ONDA_RELEASE_SOURCE_DIR}/ui/number-input.js"
         "${ONDA_RELEASE_SOURCE_DIR}/packages/onda_processor_abi/src/param-control.js")
 endif()

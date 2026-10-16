@@ -152,11 +152,19 @@ into the shared view's host-message schema. `Editor` owns the native browser
 lifetime, periodic publication, and command routing. Processor tests
 exercise the editor lifecycle through JUCE's real browser component; resource
 bytes and capability state are tested directly through `RunViewHost`.
-The pinned run view is copied and patched during configuration; a mismatched
-patch fails the build. Host publications and unedited blur retain plain values
-without applying the editor's range or step grid. Exact `i64` defaults cross
+The shared run view and number widget are embedded directly from the pinned
+Onda release sources; their fixes and behavior live upstream. Host publications
+and unedited blur retain plain values without applying the editor's range or
+step grid. Exact `i64` defaults cross
 the bridge as decimal text, preserving all 64 bits through display and focus.
 User edits still apply the control domain before normalized host conversion.
+Device-popover queries check selector support because REAPER's embedded WebKit
+can disable popovers. Unavailable device panels are hidden in their entirety,
+so an inert popover cannot appear as an empty floating panel. Layout toggle
+buttons center their labels explicitly, including when text exceeds the padded
+content width.
+Numeric fields display decimal dots independently of regional settings, while
+retaining native arithmetic for arrow-key steps and editing constraints.
 Worker failures are reported explicitly, independently of their status text.
 Waiting and retrying states leave the view's error empty, so restoration retains
 saved event arguments until their compiled schema arrives.

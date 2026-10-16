@@ -433,12 +433,11 @@ copy_onda_release_license(
     "${ONDA_JUCE_SOURCE_DIR}/modules/juce_graphics/unicode/sheenbidi/LICENSE"
     "SheenBidi-LICENSE.txt")
 
-include(cmake/OndaRunView.cmake)
 juce_add_binary_data(onda_run_resources
     NAMESPACE OndaRunResources
     HEADER_NAME OndaRunResources.h
     SOURCES
-        "${onda_run_view_html}"
+        "${ONDA_RELEASE_SOURCE_DIR}/ui/run/run.html"
         "${ONDA_RELEASE_SOURCE_DIR}/ui/number-input.js"
         "${ONDA_RELEASE_SOURCE_DIR}/packages/onda_processor_abi/src/param-control.js"
 )
