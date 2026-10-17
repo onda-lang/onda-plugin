@@ -184,6 +184,11 @@ into the shared view's host-message schema. `Editor` owns the native browser
 lifetime, periodic publication, and command routing. Processor tests
 exercise the editor lifecycle through JUCE's real browser component; resource
 bytes and capability state are tested directly through `RunViewHost`.
+After the initial schema, parameter and input-control value changes publish a
+`parameterValues` message containing only names, normalized values, and any
+exact plain defaults. The bridge converts values through the existing domains;
+the shared view updates its existing bindings without rendering other sections.
+Worker, routing, settings, and restored-view changes still publish full state.
 The editor accepts native source/project drops and keeps their original paths
 for imports and live reload. Build copies of JUCE forward macOS webview drops
 and GTK subprocess drops to the browser's `FileDragAndDropTarget`. The GTK IPC

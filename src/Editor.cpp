@@ -63,6 +63,12 @@ constexpr auto juceHostBridgeScript = R"JS(
     return JSON.stringify(control);
   }
 
+  function updatePlainValue(parameter, domain, type = parameter.type) {
+    if (typeof parameter.value !== "number"
+        && !(type === "i64" && typeof parameter.value === "string"))
+      parameter.value = domain.normalizedToPlain(parameter.normalizedValue);
+  }
+
   function createParameterDomain(parameter) {
     if (parameter.rangeMin === parameter.rangeMax) return {
       normalizedToPlain: () => parameter.rangeMin,
@@ -219,6 +225,16 @@ constexpr auto juceHostBridgeScript = R"JS(
   }
 
   window.__JUCE__.backend.addEventListener("ondaState", (message) => {
+    if (message?.type === "parameterValues") {
+      for (const bank of ["params", "inputControls"]) {
+        message.state[bank] = (message.state[bank] || []).filter(parameter => {
+          const binding = parameterDomains.get(parameter.name);
+          if (!binding || binding.bank !== bank) return false;
+          updatePlainValue(parameter, binding.domain, binding.type);
+          return true;
+        });
+      }
+    }
     if (message?.type === "state" && Array.isArray(message.state?.events)) {
       eventDefinitions = message.state.events;
       eventGeneration = message.state.engineGeneration;
@@ -235,11 +251,10 @@ constexpr auto juceHostBridgeScript = R"JS(
           try {
             const domain = createParameterDomain(parameter);
             nextDomains.set(parameter.name, {
-              domain, controlKey: parameterControlKey(parameter), endCommand, bank,
+              domain, type: parameter.type,
+              controlKey: parameterControlKey(parameter), endCommand, bank,
             });
-            if (typeof parameter.value !== "number"
-                && !(parameter.type === "i64" && typeof parameter.value === "string"))
-              parameter.value = domain.normalizedToPlain(parameter.normalizedValue);
+            updatePlainValue(parameter, domain);
           } catch {
             // The shared view will surface malformed parameter metadata.
           }
@@ -586,10 +601,7 @@ void Editor::publishState(const bool force) {
   const auto currentBlockPreference = processor_.preferredBlockSize();
   const auto currentFastMath = processor_.fastMath();
   if (!force && hasPublished_ && revision == publishedRevision_ &&
-      logRevision == publishedLogRevision_ &&
-      currentSlots == publishedSlotStamps_ &&
-      currentControls == publishedControlStamps_ &&
-      currentBuses == publishedBuses_ &&
+      logRevision == publishedLogRevision_ && currentBuses == publishedBuses_ &&
       currentInputLayout == publishedInputLayout_ &&
       std::is_eq(currentInputSmoothing <=> publishedInputSmoothing_) &&
       currentKnobLayout == publishedKnobLayout_ &&
@@ -598,6 +610,14 @@ void Editor::publishState(const bool force) {
       currentBlockPreference == publishedBlockPreference_ &&
       currentFastMath == publishedFastMath_ &&
       viewStateRestoreRevision == publishedViewStateRestoreRevision_) {
+    if (currentSlots != publishedSlotStamps_ ||
+        currentControls != publishedControlStamps_) {
+      publishedSlotStamps_ = currentSlots;
+      publishedControlStamps_ = currentControls;
+      browser_->emitEventIfBrowserIsVisible(
+          "ondaState",
+          makeRunViewParameterValues(processor_, processor_.workerStatus()));
+    }
     return;
   }
   const auto status = processor_.workerStatus();

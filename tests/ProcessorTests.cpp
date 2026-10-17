@@ -727,6 +727,28 @@ bool exerciseRunViewAdapter() {
     return false;
   }
 
+  auto parameterStatus = processor.workerStatus();
+  onda::plugin::ParameterMapping mapping;
+  mapping.name = "level";
+  mapping.type = "f32";
+  mapping.rangeMax = 2.0;
+  parameterStatus.mappings.push_back(mapping);
+  processor.setSlotValue(0, 0.75F);
+  const auto valuesMessage = onda::plugin::makeRunViewParameterValues(
+      processor, parameterStatus);
+  const auto valuesState = valuesMessage["state"];
+  const auto parameter = valuesState["params"][0];
+  if (valuesMessage["type"].toString() != "parameterValues" ||
+      valuesState.hasProperty("buffers") || valuesState.hasProperty("events") ||
+      valuesState.hasProperty("viewState") ||
+      parameter["name"].toString() != "Slot 1 -> level" ||
+      !std::is_eq(static_cast<double>(parameter["normalizedValue"]) <=> 0.75) ||
+      parameter.hasProperty("rangeMin") || parameter.hasProperty("default") ||
+      parameter.hasProperty("type")) {
+    std::cerr << "parameter publication included structural state or lost its value\n";
+    return false;
+  }
+
   const auto scopeMessage = onda::plugin::makeRunViewScope(processor);
   const auto *scope = scopeMessage.getDynamicObject();
   if (scope == nullptr ||

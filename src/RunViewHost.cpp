@@ -41,6 +41,70 @@ juce::var scalarPlainValue(const ScalarPlain &plain) {
   return juce::var{std::get<double>(plain)};
 }
 
+void appendParameters(juce::var &state, Processor &processor,
+                      const WorkerStatus &status, const bool includeMetadata) {
+  const auto values = processor.hostParameterValues();
+  const auto metadata = [includeMetadata](const ParameterMapping &mapping,
+                                          const juce::String &name,
+                                          const ScalarValue &value) {
+    auto parameter = object();
+    set(parameter, "name", name);
+    set(parameter, "normalizedValue", value.normalized);
+    if (const auto exact = value.defaultPlain(mapping.scalarDomain()))
+      set(parameter, "value", scalarPlainValue(*exact));
+    if (!includeMetadata)
+      return parameter;
+    set(parameter, "label", juce::String(mapping.name));
+    set(parameter, "type", juce::String(mapping.type));
+    set(parameter, "scalar", true);
+    if (!mapping.arrayName.empty()) {
+      auto array = object();
+      set(array, "name", juce::String(mapping.arrayName));
+      set(array, "length", mapping.arrayLength);
+      set(array, "index", mapping.elementIndex);
+      set(parameter, "array", std::move(array));
+    }
+    set(parameter, "hostValueDomain", "normalized");
+    set(parameter, "default", scalarPlainValue(mapping.defaultPlain));
+    set(parameter, "rangeMin", mapping.rangeMin);
+    set(parameter, "rangeMax", mapping.rangeMax);
+    set(parameter, "scale", juce::String(mapping.scale));
+    set(parameter, "curve",
+        mapping.curve ? juce::var{*mapping.curve} : juce::var{});
+    set(parameter, "unit", juce::String(mapping.unit));
+    set(parameter, "step",
+        mapping.step ? juce::var{*mapping.step} : juce::var{});
+    set(parameter, "stepCount",
+        mapping.stepCount
+            ? juce::var{static_cast<juce::int64>(*mapping.stepCount)}
+            : juce::var{});
+    return parameter;
+  };
+  juce::Array<juce::var> parameters;
+  for (std::size_t index = 0; index < status.mappings.size(); ++index)
+    parameters.add(
+        metadata(status.mappings[index],
+                 "Slot " + juce::String(static_cast<int>(index + 1U)) + " -> " +
+                     juce::String(status.mappings[index].name),
+                 values.parameters[index]));
+  set(state, "params", std::move(parameters));
+
+  juce::Array<juce::var> controls;
+  for (std::size_t index = 0; index < status.controls.size(); ++index) {
+    auto control =
+        metadata(status.controls[index],
+                 "Input " + juce::String(static_cast<int>(index + 1U)) +
+                     " -> " + juce::String(status.controls[index].name),
+                 values.controls[index]);
+    if (includeMetadata)
+      set(control, "enabled",
+          processor.getChannelCountOfBus(
+              true, pluginMainInputBuses + static_cast<int>(index)) == 0);
+    controls.add(std::move(control));
+  }
+  set(state, "inputControls", std::move(controls));
+}
+
 juce::int64 logCounter(const std::uint64_t value) noexcept {
   return static_cast<juce::int64>(std::min(
       value,
@@ -265,62 +329,7 @@ juce::var makeRunViewState(Processor &processor, const WorkerStatus &status,
   set(state, "events", std::move(events));
   set(state, "resetEventArguments", resetEventArguments);
 
-  const auto values = processor.hostParameterValues();
-  const auto metadata = [](const ParameterMapping &mapping,
-                           const juce::String &name, const ScalarValue &value) {
-    auto parameter = object();
-    set(parameter, "name", name);
-    set(parameter, "label", juce::String(mapping.name));
-    set(parameter, "type", juce::String(mapping.type));
-    set(parameter, "scalar", true);
-    if (!mapping.arrayName.empty()) {
-      auto array = object();
-      set(array, "name", juce::String(mapping.arrayName));
-      set(array, "length", mapping.arrayLength);
-      set(array, "index", mapping.elementIndex);
-      set(parameter, "array", std::move(array));
-    }
-    set(parameter, "normalizedValue", value.normalized);
-    set(parameter, "hostValueDomain", "normalized");
-    if (const auto exact = value.defaultPlain(mapping.scalarDomain()))
-      set(parameter, "value", scalarPlainValue(*exact));
-    set(parameter, "default", scalarPlainValue(mapping.defaultPlain));
-    set(parameter, "rangeMin", mapping.rangeMin);
-    set(parameter, "rangeMax", mapping.rangeMax);
-    set(parameter, "scale", juce::String(mapping.scale));
-    set(parameter, "curve",
-        mapping.curve ? juce::var{*mapping.curve} : juce::var{});
-    set(parameter, "unit", juce::String(mapping.unit));
-    set(parameter, "step",
-        mapping.step ? juce::var{*mapping.step} : juce::var{});
-    set(parameter, "stepCount",
-        mapping.stepCount
-            ? juce::var{static_cast<juce::int64>(*mapping.stepCount)}
-            : juce::var{});
-    return parameter;
-  };
-  juce::Array<juce::var> parameters;
-  for (std::size_t index = 0; index < status.mappings.size(); ++index)
-    parameters.add(
-        metadata(status.mappings[index],
-                 "Slot " + juce::String(static_cast<int>(index + 1U)) + " -> " +
-                     juce::String(status.mappings[index].name),
-                 values.parameters[index]));
-  set(state, "params", std::move(parameters));
-
-  juce::Array<juce::var> controls;
-  for (std::size_t index = 0; index < status.controls.size(); ++index) {
-    auto control =
-        metadata(status.controls[index],
-                 "Input " + juce::String(static_cast<int>(index + 1U)) +
-                     " -> " + juce::String(status.controls[index].name),
-                 values.controls[index]);
-    set(control, "enabled",
-        processor.getChannelCountOfBus(true, pluginMainInputBuses +
-                                                 static_cast<int>(index)) == 0);
-    controls.add(std::move(control));
-  }
-  set(state, "inputControls", std::move(controls));
+  appendParameters(state, processor, status, true);
   set(state, "supportsInputControlSmoothing", true);
   set(state, "inputControlSmoothingMs",
       processor.inputControlSmoothingSeconds() * 1000.0);
@@ -332,6 +341,16 @@ juce::var makeRunViewState(Processor &processor, const WorkerStatus &status,
 
   auto message = object();
   set(message, "type", "state");
+  set(message, "state", std::move(state));
+  return message;
+}
+
+juce::var makeRunViewParameterValues(Processor &processor,
+                                     const WorkerStatus &status) {
+  auto state = object();
+  appendParameters(state, processor, status, false);
+  auto message = object();
+  set(message, "type", "parameterValues");
   set(message, "state", std::move(state));
   return message;
 }

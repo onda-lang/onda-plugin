@@ -21,6 +21,9 @@ runViewResource(const juce::String &request);
                                          bool resetEventArguments = false,
                                          bool includeRuntimeLog = true);
 
+[[nodiscard]] juce::var makeRunViewParameterValues(Processor &processor,
+                                                   const WorkerStatus &status);
+
 [[nodiscard]] juce::var makeRunViewScope(Processor &processor);
 
 [[nodiscard]] juce::var

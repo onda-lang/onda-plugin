@@ -131,6 +131,11 @@ commands.length = 0;
 // DAW automation changes values without cancelling ongoing user gestures.
 state([{ ...first, normalizedValue: 0.2 }, second]);
 assertEnded();
+receiveState({ type: "parameterValues", state: {
+  params: [{ name: first.name, normalizedValue: 0.3 }],
+} });
+assert.equal(renderedState.params[0].value, 0.3);
+assertEnded();
 // Reloading changed metadata cancels only the obsolete control, with no value write.
 state([{ ...first, rangeMax: 100 }, second]);
 assertEnded(first.name);
@@ -177,6 +182,14 @@ console.log("Editor bridge gesture cancellation and event generations passed");
 // Input controls share conversion and gesture lifetimes without sharing a bank.
 const control = { ...first, name: "Input 1 -> cv", rangeMin: -2, rangeMax: 2, enabled: true };
 receiveState({ type: "state", state: { path: "input.onda", params: [first], inputControls: [control] } });
+receiveState({ type: "parameterValues", state: {
+  params: [{ name: first.name, normalizedValue: 0.25 },
+    { name: control.name, normalizedValue: 0.5 }],
+  inputControls: [{ name: control.name, normalizedValue: 0.25 }],
+} });
+assert.equal(renderedState.params.length, 1, "Value updates cannot cross parameter banks");
+assert.equal(renderedState.params[0].value, 0.25);
+assert.equal(renderedState.inputControls[0].value, -1);
 commands.length = 0;
 window.ipc.postMessage({ type: "setInputControl", name: control.name, value: 1, commit: false });
 assert.equal(commands.pop().value, 0.75);
@@ -197,4 +210,8 @@ for (const value of ["9007199254740993", "-9007199254740993",
                      "9223372036854775807", "-9223372036854775808"]) {
   state([{ ...first, type: "i64", value, default: value, step: 1, stepCount: 1 }]);
   assert.equal(renderedState.params[0].value, value, "Exact i64 defaults survive bridge conversion");
+  receiveState({ type: "parameterValues", state: {
+    params: [{ name: first.name, normalizedValue: 0.5, value }],
+  } });
+  assert.equal(renderedState.params[0].value, value, "Value updates preserve exact i64 defaults");
 }

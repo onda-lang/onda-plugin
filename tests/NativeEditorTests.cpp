@@ -78,9 +78,8 @@ bool evaluate(juce::WebBrowserComponent &browser, const juce::String &script,
 juce::WebBrowserComponent *readyBrowser(juce::AudioProcessorEditor &editor) {
   const auto *overlay = dynamic_cast<juce::Label *>(
       editor.findChildWithID("onda-loading-overlay"));
-  if (!overlay ||
-      !test::waitForMessage([&] { return !overlay->isVisible(); },
-                            std::chrono::seconds(30))) {
+  if (!overlay || !test::waitForMessage([&] { return !overlay->isVisible(); },
+                                        std::chrono::seconds(30))) {
     std::cerr << "Native editor did not acknowledge its initial state: "
               << (overlay ? overlay->getText() : "missing loading overlay")
               << '\n';
@@ -124,7 +123,8 @@ sample { if enabled { out1 = 1.0 + clip[0] + spare[0] } else { out1 = 0.0 } }
             && button !== null && !button.disabled
             && button.getBoundingClientRect().width > 0;
         })()
-      )", true))
+      )",
+                                true))
         return false;
     }
     processor.loadFile(source);
@@ -182,17 +182,46 @@ sample { if enabled { out1 = 1.0 + clip[0] + spare[0] } else { out1 = 0.0 } }
           if (getComputedStyle(input).visibility !== 'visible'
               || input.getBoundingClientRect().width <= 0)
             throw new Error('Checkbox is not visible');
+          window.__parameterUpdates = 0;
+          window.__bufferCard = document.querySelector('.buffer-card');
+          window.__JUCE__.backend.addEventListener('ondaState', message => {
+            if (message.type === 'parameterValues') ++window.__parameterUpdates;
+          });
           const checked = input.checked;
           input.click();
           return checked;
         })()
       )",
-                                reopened))
+                    reopened))
         return false;
       const auto expected = reopened ? 0.0F : 1.0F;
       if (!test::waitForMessage([&] { return renders(expected); })) {
         std::cerr << "Native editor edit did not reach DSP\n";
         return false;
+      }
+      if (!test::waitForMessage([&] {
+            return evaluate(*browser, R"(
+              window.__parameterUpdates > 0
+                && document.querySelector('.buffer-card') === window.__bufferCard
+            )",
+                            true);
+          })) {
+        std::cerr << "Native parameter edit did not use the values-only "
+                     "publication\n";
+        return false;
+      }
+      for (const auto value : {1.0F - expected, expected}) {
+        processor.getParameters()[0]->setValue(value);
+        if (!test::waitForMessage([&] {
+              return evaluate(*browser, R"(
+                document.querySelector('#params input[type=checkbox]').checked
+              )",
+                              value > 0.5F);
+            })) {
+          std::cerr
+              << "Host parameter change did not reach the native editor\n";
+          return false;
+        }
       }
     }
     processor.releaseResources();

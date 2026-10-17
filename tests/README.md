@@ -138,6 +138,9 @@ its parameter in the real webview.
 | VST3 validators | Steinberg's interface/protocol checks for both products. These complement the behavior checked by the smoke host. |
 
 Run bridge tests directly with `node tests/EditorBridgeTests.mjs`.
+Parameter publication tests also exercise the `parameterValues` path through
+the actual bridge, including exact defaults and focused drafts. `NativeEditor`
+requires real editor writes to publish values without replacing buffer cards.
 The `EditorGestureCancellation` processor case checks the native command against
 JUCE's actual value and gesture notifications, including cancellation after a
 newer host automation value.

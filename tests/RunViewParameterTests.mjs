@@ -34,6 +34,11 @@ const checks = `
       type: "state", state: { path: "defaults.onda", running: true, connected: true,
         [bank]: [{ ...param }] },
     });
+    const sendValue = (param, bank = "params") => window.__receiveParameters({
+      type: "parameterValues", state: {
+        [bank]: [{ name: param.name, value: param.value, normalizedValue: param.normalizedValue }],
+      },
+    });
     const number = (bank = "params") => document.querySelector("#" +
       (bank === "params" ? "params" : "input-controls") + " .param-number");
     const focus = (bank = "params") => {
@@ -50,6 +55,8 @@ const checks = `
       equal(number().value, "440", "Initial authored default");
       send(parameter);
       equal(number().value, "440", "Host publication must preserve an out-of-range default");
+      sendValue(parameter);
+      equal(number().value, "440", "Value publication must preserve an out-of-range default");
       const before = writes().length;
       focus();
       number().blur();
@@ -71,6 +78,8 @@ const checks = `
         equal(number().value, value, "Initial exact i64 default");
         send(integer);
         equal(number().value, value, "Published exact i64 default");
+        sendValue(integer);
+        equal(number().value, value, "Value publication preserves an exact i64 default");
         focus();
         equal(number().value, value, "Focused exact i64 default");
         number().blur();
@@ -83,6 +92,8 @@ const checks = `
       // Host updates must retain the focused draft.
       send({ ...parameter, value: 0.25, normalizedValue: 0.25 });
       equal(number().value, "0.75", "Host update replaced a focused draft");
+      sendValue({ ...parameter, value: 0.125, normalizedValue: 0.125 });
+      equal(number().value, "0.75", "Value update replaced a focused draft");
       number().dispatchEvent(new Event("change", { bubbles: true }));
       number().blur();
       equal(writes().length, before + 1, "Editing must emit one parameter write");
@@ -105,6 +116,8 @@ const checks = `
     focus("inputControls");
     number("inputControls").blur();
     equal(writes().length, beforeControl, "Unedited input control must not write to DSP");
+    sendValue({ ...control, value: undefined, normalizedValue: 0.5 }, "inputControls");
+    equal(number("inputControls").value, "0.5", "Input values use the existing control domain");
     return { ok: true };
   } catch (error) {
     return { error: String(error), stack: error.stack };
