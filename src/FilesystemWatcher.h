@@ -28,6 +28,7 @@ public:
   // Replaces the watch set and returns exact paths not fully covered by the
   // native backend. Existing subscriptions stay live until replacements have
   // been installed.
+  // Unchanged subscriptions are retained; recovery retries only failed roots.
   [[nodiscard]] Paths watch(std::span<const std::filesystem::path> paths);
   [[nodiscard]] std::uint64_t revision() const noexcept;
 

@@ -4,6 +4,7 @@
 #include <array>
 #include <iterator>
 #include <map>
+#include <optional>
 #include <system_error>
 #include <thread>
 #include <utility>
@@ -16,11 +17,11 @@
 #include <poll.h>
 #include <sys/eventfd.h>
 #include <sys/inotify.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #elif defined(__APPLE__)
 #include <cerrno>
 #include <fcntl.h>
-#include <optional>
 #include <sys/event.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -39,6 +40,7 @@ namespace {
 
 using Path = std::filesystem::path;
 using Paths = FilesystemWatcher::Paths;
+using RootIdentity = std::array<std::uint64_t, 3>;
 
 bool pathsOverlap(const Path &left, const Path &right) {
   const auto componentsEqual = [](const Path &a, const Path &b) {
@@ -149,11 +151,33 @@ struct WatchPlan {
   Paths roots;
   Paths contentRoots;
   std::vector<Paths> requirements;
+  std::vector<std::optional<RootIdentity>> identities;
 
   [[nodiscard]] bool watchesContents(const Path &root) const noexcept {
     return std::binary_search(contentRoots.begin(), contentRoots.end(), root);
   }
 };
+
+std::optional<RootIdentity> rootIdentity(const Path &path) {
+#if defined(_WIN32)
+  const auto handle = CreateFileW(
+      path.c_str(), 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+      nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+  if (handle == INVALID_HANDLE_VALUE)
+    return std::nullopt;
+  BY_HANDLE_FILE_INFORMATION info{};
+  const auto success = GetFileInformationByHandle(handle, &info);
+  CloseHandle(handle);
+  if (success == FALSE)
+    return std::nullopt;
+  return RootIdentity{info.dwVolumeSerialNumber, info.nFileIndexHigh, info.nFileIndexLow};
+#else
+  struct stat info{};
+  if (stat(path.c_str(), &info) != 0)
+    return std::nullopt;
+  return RootIdentity{static_cast<std::uint64_t>(info.st_dev), static_cast<std::uint64_t>(info.st_ino), 0};
+#endif
+}
 
 WatchPlan makeWatchPlan(Paths paths) {
   normalize(paths);
@@ -161,7 +185,8 @@ WatchPlan makeWatchPlan(Paths paths) {
                  .comparisonPaths = {},
                  .roots = {},
                  .contentRoots = {},
-                 .requirements = {}};
+                 .requirements = {},
+                 .identities = {}};
   plan.comparisonPaths.reserve(plan.paths.size());
   plan.requirements.reserve(plan.paths.size());
   for (const auto &path : plan.paths) {
@@ -200,6 +225,8 @@ WatchPlan makeWatchPlan(Paths paths) {
   }
   normalize(plan.roots);
   normalize(plan.contentRoots);
+  for (const auto &root : plan.roots)
+    plan.identities.push_back(rootIdentity(root));
   return plan;
 }
 
@@ -652,21 +679,23 @@ struct FilesystemWatcher::SharedState {
 class FilesystemWatcher::Impl final {
 public:
   Impl(WatchPlan plan, std::shared_ptr<SharedState> state)
-      : plan_(std::move(plan)), state_(std::move(state)),
-        native_(plan_, [this](Paths paths, const bool rescan) {
-          observe(std::move(paths), rescan);
-        }) {
-    const auto &registered = native_.registeredRoots();
-    for (std::size_t index = 0; index < plan_.paths.size(); ++index) {
-      const auto &required = plan_.requirements[index];
-      if (required.empty() ||
-          std::any_of(required.begin(), required.end(), [&](const Path &root) {
-            return !std::binary_search(registered.begin(), registered.end(),
-                                       root);
-          })) {
-        fallback_.push_back(plan_.paths[index]);
-      }
-    }
+      : plan_(std::move(plan)), state_(std::move(state)) {
+    refreshCoverage();
+  }
+
+  [[nodiscard]] bool matches(const WatchPlan &plan) const {
+    return plan_.paths == plan.paths &&
+           plan_.comparisonPaths == plan.comparisonPaths &&
+           plan_.roots == plan.roots &&
+           plan_.contentRoots == plan.contentRoots &&
+           plan_.identities == plan.identities;
+  }
+
+  void refresh(std::vector<Paths> requirements) {
+    // Requirements may become complete after permissions recover. They are
+    // worker-owned; the native callbacks only read paths and projections.
+    plan_.requirements = std::move(requirements);
+    refreshCoverage();
   }
 
   [[nodiscard]] const Paths &fallbackPaths() const noexcept {
@@ -674,8 +703,45 @@ public:
   }
 
 private:
+  void refreshCoverage() {
+    if (rescan_.exchange(false, std::memory_order_acq_rel)) {
+      native_.clear();
+      registered_.clear();
+    }
+    Paths missingRoots;
+    std::set_difference(plan_.roots.begin(), plan_.roots.end(), registered_.begin(),
+                        registered_.end(), std::back_inserter(missingRoots));
+    if (!missingRoots.empty()) {
+      auto missing = plan_;
+      missing.roots = std::move(missingRoots);
+      auto native = std::make_unique<NativeWatcher>(
+          missing, [this](Paths paths, const bool rescan) {
+            observe(std::move(paths), rescan);
+          });
+      const auto &added = native->registeredRoots();
+      if (!added.empty()) {
+        registered_.insert(registered_.end(), added.begin(), added.end());
+        normalize(registered_);
+        native_.push_back(std::move(native));
+      }
+    }
+    fallback_.clear();
+    for (std::size_t index = 0; index < plan_.paths.size(); ++index) {
+      const auto &required = plan_.requirements[index];
+      if (required.empty() ||
+          std::any_of(required.begin(), required.end(), [&](const Path &root) {
+            return !std::binary_search(registered_.begin(), registered_.end(),
+                                       root);
+          })) {
+        fallback_.push_back(plan_.paths[index]);
+      }
+    }
+  }
+
   void observe(Paths nativePaths, const bool rescan) noexcept {
     try {
+      if (rescan)
+        rescan_.store(true, std::memory_order_release);
       Paths affected;
       for (std::size_t index = 0; index < plan_.paths.size(); ++index) {
         const auto &projections = plan_.comparisonPaths[index];
@@ -700,8 +766,12 @@ private:
 
   WatchPlan plan_;
   std::shared_ptr<SharedState> state_;
-  NativeWatcher native_;
+  std::atomic<bool> rescan_{};
+  Paths registered_;
   Paths fallback_;
+  // Recovery subscriptions cover only roots that failed previously. Keeping
+  // successful groups alive avoids rebuilding healthy OS watches every poll.
+  std::vector<std::unique_ptr<NativeWatcher>> native_;
 };
 
 FilesystemWatcher::FilesystemWatcher(Callback callback)
@@ -711,11 +781,13 @@ FilesystemWatcher::~FilesystemWatcher() = default;
 
 FilesystemWatcher::Paths
 FilesystemWatcher::watch(const std::span<const Path> paths) {
-  auto next =
-      paths.empty()
-          ? std::unique_ptr<Impl>{}
-          : std::make_unique<Impl>(
-                makeWatchPlan(Paths{paths.begin(), paths.end()}), state_);
+  auto plan = makeWatchPlan(Paths{paths.begin(), paths.end()});
+  if (impl_ && impl_->matches(plan)) {
+    impl_->refresh(std::move(plan.requirements));
+    return impl_->fallbackPaths();
+  }
+  auto next = paths.empty() ? std::unique_ptr<Impl>{}
+                            : std::make_unique<Impl>(std::move(plan), state_);
   auto fallback = next ? next->fallbackPaths() : Paths{};
   impl_.swap(next);
   return fallback;

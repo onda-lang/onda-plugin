@@ -1,5 +1,9 @@
 # Test contracts
 
+`onda_watcher_tests` exercises the native notification backend without JUCE or the compiler.
+It covers missing paths and inode replacement. On Linux it also verifies that fallback retries
+and recovery retain healthy inotify subscriptions.
+
 Run the release contracts with:
 
 ```sh

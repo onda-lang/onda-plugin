@@ -5,6 +5,19 @@ function(onda_add_test name group)
     set_tests_properties(${name} PROPERTIES LABELS "${group}" TIMEOUT 180)
 endfunction()
 
+find_package(Threads REQUIRED)
+add_executable(onda_watcher_tests tests/FilesystemWatcherTests.cpp src/FilesystemWatcher.cpp)
+target_compile_features(onda_watcher_tests PRIVATE cxx_std_20)
+target_include_directories(onda_watcher_tests PRIVATE src)
+target_link_libraries(onda_watcher_tests PRIVATE Threads::Threads)
+if(MSVC)
+    target_compile_options(onda_watcher_tests PRIVATE /W4 /permissive-)
+else()
+    target_compile_options(onda_watcher_tests PRIVATE
+        -Wall -Wextra -Wpedantic -Wconversion -Wsign-conversion)
+endif()
+onda_add_test(onda_watcher_tests native onda_watcher_tests)
+
 if(ONDA_PLUGIN_BUILD_BROWSER_TESTS)
     find_program(ONDA_NODE_EXECUTABLE NAMES node nodejs REQUIRED)
     onda_add_test(onda_editor_bridge_tests browser

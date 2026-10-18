@@ -305,7 +305,9 @@ disappears, the view reports the load error while the last valid engine and
 checkpoint remain in use. Restoring the original path resumes loading.
 The worker otherwise blocks on its condition
 variable indefinitely. Only paths whose native subscription failed receive a
-targeted 500 ms disk-validation fallback.
+targeted 1-second disk-validation fallback. Unchanged watch plans retain their healthy native
+subscriptions; recovery adds subscriptions only for previously uncovered roots. Directory and
+file identities force replacement when a subscribed inode changes.
 
 While an editor is showing, the callback writes interleaved output into a bounded,
 lock-free scope ring owned by `Processor`. Reset generations avoid a

@@ -14,7 +14,7 @@
 namespace onda::plugin {
 namespace {
 
-constexpr auto filesystemFallbackInterval = std::chrono::milliseconds(500);
+constexpr auto filesystemFallbackInterval = std::chrono::seconds(1);
 constexpr auto filesystemDebounceInterval = std::chrono::milliseconds(200);
 // Each VST3 module statically owns one Onda/LLVM image. Serialize compilation
 // within that loaded image; separate images do not share compiler state.
