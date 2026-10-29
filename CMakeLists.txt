@@ -335,6 +335,7 @@ endif()
 include(cmake/OndaVst3Automation.cmake)
 include(cmake/OndaJuceXEmbed.cmake)
 include(cmake/OndaJuceBrowser.cmake)
+include(cmake/OndaJuceFileDrop.cmake)
 if(MSVC)
     # MSVC /O2 and /Ox can break JUCE's WebView2 COM callbacks. Source options
     # follow target options, so only this JUCE compilation unit uses /O1 and
@@ -436,6 +437,15 @@ copy_onda_release_license(
 copy_onda_release_license(
     "${ONDA_JUCE_SOURCE_DIR}/modules/juce_graphics/unicode/sheenbidi/LICENSE"
     "SheenBidi-LICENSE.txt")
+
+option(ONDA_PLUGIN_GPU_UI "Build the shared experimental native GPU editor" OFF)
+set(ONDA_GPU_UI_LIBRARY "" CACHE FILEPATH "Path to libonda_ui built with --features ffi")
+if(ONDA_PLUGIN_GPU_UI)
+    if(NOT EXISTS "${ONDA_RELEASE_SOURCE_DIR}/include/onda_ui.h" OR NOT EXISTS "${ONDA_GPU_UI_LIBRARY}")
+        message(FATAL_ERROR "GPU UI needs an Onda source checkout and ONDA_GPU_UI_LIBRARY")
+    endif()
+    get_filename_component(ONDA_GPU_UI_LIBRARY_NAME "${ONDA_GPU_UI_LIBRARY}" NAME)
+endif()
 
 include(cmake/OndaRunView.cmake)
 juce_add_binary_data(onda_run_resources
@@ -543,6 +553,24 @@ function(add_onda_plugin target product_name plugin_code is_synth)
         src/StateFormat.h
         src/SpscQueue.h
     )
+    if(ONDA_PLUGIN_GPU_UI)
+        target_sources(${target} PRIVATE src/GpuView.cpp src/GpuView.h src/GpuTextInput.cpp)
+        target_include_directories(${target} PRIVATE "${ONDA_RELEASE_SOURCE_DIR}/include")
+        target_compile_definitions(${target} PRIVATE ONDA_PLUGIN_GPU_UI=1
+            ONDA_GPU_UI_LIBRARY_NAME="${ONDA_GPU_UI_LIBRARY_NAME}")
+        set(onda_gpu_resources "$<TARGET_FILE_DIR:${target}_VST3>/../Resources/onda_ui")
+        file(GLOB onda_gpu_font_notices CONFIGURE_DEPENDS "${ONDA_RELEASE_SOURCE_DIR}/assets/fonts/OFL-*.txt")
+        add_custom_command(TARGET ${target}_VST3 POST_BUILD
+            COMMAND "${CMAKE_COMMAND}" -E rm -rf "${onda_gpu_resources}"
+            COMMAND "${CMAKE_COMMAND}" -E make_directory "${onda_gpu_resources}"
+            COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+                "${ONDA_GPU_UI_LIBRARY}" "${onda_gpu_resources}/${ONDA_GPU_UI_LIBRARY_NAME}"
+            COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+                ${onda_gpu_font_notices} "${onda_gpu_resources}"
+            VERBATIM)
+        set_property(TARGET ${target}_VST3 APPEND PROPERTY LINK_DEPENDS
+            "${ONDA_GPU_UI_LIBRARY}" ${onda_gpu_font_notices})
+    endif()
     target_link_libraries(${target} PRIVATE
         onda_plugin_engine
         onda_run_resources

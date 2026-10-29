@@ -192,7 +192,7 @@ try {
   const preview = page.locator(".buffer-waveform canvas");
   await preview.scrollIntoViewIfNeeded();
   assert.equal(await preview.isVisible(), true, "Loaded buffers must show a waveform");
-  assert.match(await preview.getAttribute("aria-label"), /Minimum: .0.75\nMaximum: 0.5/);
+  assert.match(await preview.getAttribute("title"), /Minimum: .0.75\nMaximum: 0.5/);
   const painted = await preview.evaluate(canvas => {
     const pixels = canvas.getContext("2d").getImageData(0, 0, canvas.width, canvas.height).data;
     return pixels.some((value, index) => index % 4 === 3 && value > 0);
@@ -223,7 +223,7 @@ try {
       source: document.querySelector(".log-context")?.textContent,
       loss: document.querySelector("#log-loss")?.textContent,
       cleared: window.__parameterCommands.some(command => command.type === "clearLog"),
-      monitored: document.querySelector('[aria-label="MIDI note 60"]')?.classList.contains("active"),
+      monitored: document.querySelector('[data-note="60"]')?.classList.contains("active"),
     };
   });
   assert.deepEqual(capabilities, {

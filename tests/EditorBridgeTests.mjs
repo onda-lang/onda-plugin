@@ -56,7 +56,6 @@ runInNewContext(script, {
 });
 
 documentReady();
-assert.equal(smoothingAttributes["aria-label"], "Editor parameter smoothing duration in milliseconds");
 assert.match(smoothingAttributes.title, /DAW automation updates at block boundaries/);
 assert.equal(sampleRate.disabled, true);
 assert.equal(sampleRateRow.hidden, true);

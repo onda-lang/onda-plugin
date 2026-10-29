@@ -6,6 +6,19 @@ function(onda_add_test name group)
 endfunction()
 
 find_package(Threads REQUIRED)
+if(ONDA_PLUGIN_GPU_UI)
+    add_executable(onda_gpu_ui_tests tests/GpuViewTests.cpp src/GpuView.cpp src/GpuTextInput.cpp)
+    target_compile_features(onda_gpu_ui_tests PRIVATE cxx_std_20)
+    target_include_directories(onda_gpu_ui_tests PRIVATE src "${ONDA_RELEASE_SOURCE_DIR}/include")
+    target_compile_definitions(onda_gpu_ui_tests PRIVATE JUCE_MODAL_LOOPS_PERMITTED=1 JUCE_USE_CURL=0
+        ONDA_GPU_UI_LIBRARY_NAME="${ONDA_GPU_UI_LIBRARY_NAME}"
+        ONDA_GPU_UI_FIXTURE="${ONDA_RELEASE_SOURCE_DIR}/ui/gpu/fixtures/panels.json")
+    target_link_libraries(onda_gpu_ui_tests PRIVATE juce::juce_gui_basics juce::juce_recommended_config_flags)
+    onda_add_test(onda_gpu_ui_tests native onda_gpu_ui_tests)
+    onda_add_test(onda_gpu_keyboard_tests core onda_gpu_ui_tests --keyboard)
+    set_tests_properties(onda_gpu_ui_tests PROPERTIES
+        ENVIRONMENT "ONDA_GPU_UI_LIBRARY=${ONDA_GPU_UI_LIBRARY}")
+endif()
 add_executable(onda_watcher_tests tests/FilesystemWatcherTests.cpp src/FilesystemWatcher.cpp)
 target_compile_features(onda_watcher_tests PRIVATE cxx_std_20)
 target_include_directories(onda_watcher_tests PRIVATE src)
@@ -122,6 +135,16 @@ target_sources(onda_processor_tests PRIVATE
     src/SpscQueue.h
 )
 target_compile_features(onda_processor_tests PRIVATE cxx_std_20)
+if(ONDA_PLUGIN_GPU_UI)
+    target_sources(onda_processor_tests PRIVATE tests/GpuEditorTests.cpp
+        src/GpuView.cpp src/GpuTextInput.cpp)
+    target_include_directories(onda_processor_tests PRIVATE "${ONDA_RELEASE_SOURCE_DIR}/include")
+    target_compile_definitions(onda_processor_tests PRIVATE ONDA_PLUGIN_GPU_UI=1
+        ONDA_GPU_UI_LIBRARY_NAME="${ONDA_GPU_UI_LIBRARY_NAME}")
+    onda_add_test(onda_gpu_editor_tests native onda_processor_tests --group gpu)
+    set_tests_properties(onda_gpu_editor_tests PROPERTIES
+        ENVIRONMENT "ONDA_GPU_UI=1;ONDA_GPU_UI_LIBRARY=${ONDA_GPU_UI_LIBRARY}")
+endif()
 if(NOT MSVC)
     set_source_files_properties(tests/RealtimeAuditTests.cpp PROPERTIES
         COMPILE_OPTIONS "-fno-builtin;$<$<CXX_COMPILER_ID:Clang,AppleClang>:-fsized-deallocation>")

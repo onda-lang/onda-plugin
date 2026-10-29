@@ -14,6 +14,9 @@
 
 namespace onda::plugin {
 
+#if ONDA_PLUGIN_GPU_UI
+class GpuView;
+#endif
 class Processor;
 enum class ParamControlLayout : std::uint8_t;
 
@@ -36,6 +39,9 @@ private:
   friend struct EditorTestAccess;
   class Browser;
 
+  bool viewVisible() const;
+  void viewReady();
+  void emitState(juce::var message);
   void timerCallback() override;
   void handleCommand(const juce::var &command);
   void publishFileDrag(const char *phase, const juce::StringArray &files, int x,
@@ -47,6 +53,10 @@ private:
 
   Processor &processor_;
   std::unique_ptr<Browser> browser_;
+#if ONDA_PLUGIN_GPU_UI
+  std::unique_ptr<GpuView> gpu_;
+  double publishedScopeTimeMs_{};
+#endif
   juce::Label loadingOverlay_;
   std::unique_ptr<juce::FileChooser> fileChooser_;
   std::uint64_t publishedRevision_{};

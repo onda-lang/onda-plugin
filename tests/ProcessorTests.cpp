@@ -1289,6 +1289,15 @@ bool exerciseRuntimeLogging() {
     return false;
   }
 
+  const auto logOnly = onda::plugin::makeRunViewLog(processor)["state"];
+  if (logOnly.hasProperty("params") || logOnly.hasProperty("events") ||
+      logOnly.hasProperty("buffers") ||
+      logOnly["logText"].toString() != state->getProperty("logText").toString() ||
+      logOnly["logEntries"].size() != entries->size()) {
+    std::cerr << "log-only update replaced controls or lost output\n";
+    return false;
+  }
+
   const auto parameterUpdate = onda::plugin::makeRunViewState(
       processor, processor.workerStatus(), processor.canExportProject(), {},
       false, false);
@@ -4720,6 +4729,16 @@ int runProcessorCases(const int argc, const char *const *argv) {
       {"StateRestore", exerciseStateRestore},
       {"EditorLifecycle", exerciseEditorLifecycle},
       {"NativeEditor", exerciseNativeEditor, "native"},
+#if ONDA_PLUGIN_GPU_UI
+      {"GpuEditorTeardown", exerciseGpuEditorTeardown, "gpu",
+       juce::SystemStats::getEnvironmentVariable("ONDA_GPU_UI", "") == "1"
+           ? ""
+           : "requires ONDA_GPU_UI=1"},
+      {"GpuEditorPeerRecreation", exerciseGpuEditorPeerRecreation, "gpu",
+       juce::SystemStats::getEnvironmentVariable("ONDA_GPU_UI", "") == "1"
+           ? ""
+           : "requires ONDA_GPU_UI=1"},
+#endif
       {"Vst3EditorAttachment", exerciseVst3EditorAttachment, "native"},
       {"EditorGestureCancellation", exerciseEditorGestureCancellation},
       {"StaleEditorEvents", exerciseStaleEditorEvents},

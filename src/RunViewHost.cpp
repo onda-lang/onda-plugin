@@ -185,6 +185,7 @@ juce::var makeRunViewState(Processor &processor, const WorkerStatus &status,
   auto state = object();
   set(state, "running", status.active);
   set(state, "connected", status.active);
+  set(state, "schemaReady", !status.compiling);
   // Use decimal text to preserve the full generation through JavaScript.
   set(state, "engineGeneration",
       juce::String(std::to_string(status.engineGeneration)));
@@ -224,6 +225,7 @@ juce::var makeRunViewState(Processor &processor, const WorkerStatus &status,
   set(state, "midi", std::move(midi));
   set(state, "midiKeyboardInteractive",
       processor.product() == Product::instrument && noteOn && noteOff);
+  set(state, "showComputerKeyLabels", false);
   set(state, "midiInputDevices", juce::Array<juce::var>{});
   set(state, "currentMidiInputDevice", juce::var{});
   set(state, "paramLayout",
@@ -339,6 +341,15 @@ juce::var makeRunViewState(Processor &processor, const WorkerStatus &status,
       processor.inputControlLayout() == ParamControlLayout::knobs ? "knobs"
                                                                   : "sliders");
 
+  auto message = object();
+  set(message, "type", "state");
+  set(message, "state", std::move(state));
+  return message;
+}
+
+juce::var makeRunViewLog(Processor &processor) {
+  auto state = object();
+  appendRuntimeLog(state, processor.runtimeLogSnapshot());
   auto message = object();
   set(message, "type", "state");
   set(message, "state", std::move(state));

@@ -110,6 +110,29 @@ files are unavailable when reopening it, the plugin restores the saved version.
 
 ## Build
 
+An experimental native Rust/wgpu editor is available in development builds.
+Build Onda's `onda_ui` crate with `cargo build --release -p onda_ui --features ffi`,
+then configure this project with `ONDA_PLUGIN_GPU_UI=ON`,
+`ONDA_DEVELOPMENT_SOURCE_DIR=/path/to/onda`, and
+`ONDA_GPU_UI_LIBRARY=/path/to/onda/target/release/libonda_ui.so` (or `.dylib`/`.dll`).
+Launch the DAW with `ONDA_GPU_UI=1` to use it. GPU-enabled builds copy the library
+and font license into each VST3 bundle's `Contents/Resources/onda_ui` directory;
+the editor resolves that location relative to its own plugin module. Bundles can
+be moved without keeping the checkout at its original path. `ONDA_GPU_UI_LIBRARY`
+provides an explicit development override. The shared renderer covers parameters,
+input controls, buffers/waveforms, typed events, logs, MIDI, and setup, with a
+collapsible scope. Native Run and the VS Code GPU panel use the same views.
+IME composition remains unfinished.
+Run the `onda_gpu_ui_tests` CTest target on a desktop to verify the native adapter.
+On Linux, `xvfb-run -a python3 scripts/test-gpu-reaper.py build` checks both
+relocated bundles inside REAPER, including native parameter input, host automation,
+resize, and reopening. Build `onda_vst3_smoke` first; its `--preset` mode generates
+test presets using the exported plugin's real state format. The DAW test needs
+REAPER, X11/XTest, and ImageMagick's `import`. An isolated X11 display avoids
+desktop focus interference. It uses a temporary profile and tracks
+with master sends disabled, and leaves screenshots and JSON results in its
+printed artifact directory.
+
 Requirements:
 
 - CMake 3.22+, Ninja, and a C++20 compiler

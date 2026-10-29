@@ -163,7 +163,7 @@ sample { if enabled { out1 = 1.0 + clip[0] + spare[0] } else { out1 = 0.0 } }
           if (document.querySelector('#settings-popover').getClientRects().length)
             throw new Error('Unavailable device panel is visible');
           if (document.querySelector('#params-section [data-param-layout="knobs"]')
-                .getAttribute('aria-pressed') !== 'true')
+                .getAttribute('data-pressed') !== 'true')
             throw new Error('Params must default to knobs');
           const buffers = document.querySelector('#buffers-section');
           if (getComputedStyle(buffers).display === 'none'

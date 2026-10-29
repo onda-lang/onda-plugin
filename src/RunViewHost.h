@@ -24,6 +24,8 @@ runViewResource(const juce::String &request);
 [[nodiscard]] juce::var makeRunViewParameterValues(Processor &processor,
                                                    const WorkerStatus &status);
 
+[[nodiscard]] juce::var makeRunViewLog(Processor &processor);
+
 [[nodiscard]] juce::var makeRunViewScope(Processor &processor);
 
 [[nodiscard]] juce::var

@@ -468,6 +468,25 @@ bool smokeSavedProject(juce::VST3PluginFormatHeadless &format,
 } // namespace
 
 int main(const int argc, const char *const *argv) {
+  // Export a preset through the real VST3 wrapper for external DAW checks.
+  // Reuse the same state writer as the other exported-module tests.
+  if (argc == 5 && juce::String(argv[1]) == "--preset") {
+    juce::ScopedJuceInitialiser_GUI juceInitialiser;
+    juce::VST3PluginFormatHeadless format;
+    juce::OwnedArray<juce::PluginDescription> descriptions;
+    format.findAllTypesForFile(descriptions, juce::File(argv[2]).getFullPathName());
+    if (descriptions.size() != 1)
+      return 1;
+    juce::String error;
+    auto instance = format.createInstanceFromDescription(*descriptions[0], 48000.0, 512, error);
+    if (!instance || !instance->getVST3Client()) {
+      std::cerr << error << '\n';
+      return 1;
+    }
+    setOndaProgram(*instance, juce::File(argv[3]));
+    const auto preset = instance->getVST3Client()->getPreset();
+    return !preset.isEmpty() && juce::File(argv[4]).replaceWithData(preset.getData(), preset.getSize()) ? 0 : 1;
+  }
   if (argc != 3) {
     std::cerr << "usage: onda_vst3_smoke <instrument-module> <effect-module>\n";
     return 2;

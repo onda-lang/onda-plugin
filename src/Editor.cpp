@@ -1,3 +1,6 @@
+#if ONDA_PLUGIN_GPU_UI
+#include "GpuView.h"
+#endif
 #include "Editor.h"
 
 #include "AudioFile.h"
@@ -177,7 +180,6 @@ constexpr auto juceHostBridgeScript = R"JS(
     if (runSettings) runSettings.style.gridTemplateColumns = "minmax(0, 1fr)";
     const input = document.getElementById("param-smoothing-ms");
     if (input) {
-      input.setAttribute("aria-label", "Editor parameter smoothing duration in milliseconds");
       input.setAttribute("title", "Smooths editor changes. DAW automation updates at block boundaries. 0 disables smoothing.");
     }
     updateBlockSettings({ hostBlockSamples: 0, canSetBlockSize: false });
@@ -431,11 +433,25 @@ private:
 };
 
 Editor::Editor(Processor &owner)
-    : AudioProcessorEditor(owner), processor_(owner),
-      browser_(std::make_unique<Browser>(*this)) {
+    : AudioProcessorEditor(owner), processor_(owner) {
+#if ONDA_PLUGIN_GPU_UI
+  if (juce::SystemStats::getEnvironmentVariable("ONDA_GPU_UI", "") == "1")
+    gpu_ = std::make_unique<GpuView>(
+        [this](const juce::var &command) { handleCommand(command); },
+        [this] {
+          viewReady();
+          loadingOverlay_.setVisible(false);
+        });
+  else
+#endif
+    browser_ = std::make_unique<Browser>(*this);
   const auto [width, height] = processor_.editorSize();
+  setAccessible(false);
   setOpaque(true);
-  addAndMakeVisible(*browser_);
+  if (browser_) addAndMakeVisible(*browser_);
+#if ONDA_PLUGIN_GPU_UI
+  if (gpu_) addAndMakeVisible(*gpu_);
+#endif
   loadingOverlay_.setComponentID("onda-loading-overlay");
   loadingOverlay_.setText("Loading Onda...", juce::dontSendNotification);
   loadingOverlay_.setJustificationType(juce::Justification::centred);
@@ -446,15 +462,24 @@ Editor::Editor(Processor &owner)
   setResizable(true, true);
   setSize(width, height);
   setResizeLimits(360, 480, 1600, 1400);
-  if (const auto error = browser_->initializationError(); error.isNotEmpty())
-    loadingOverlay_.setText(error, juce::dontSendNotification);
-  else
-    browser_->goToURL(juce::WebBrowserComponent::getResourceProviderRoot());
+  if (browser_) {
+    if (const auto error = browser_->initializationError(); error.isNotEmpty())
+      loadingOverlay_.setText(error, juce::dontSendNotification);
+    else browser_->goToURL(juce::WebBrowserComponent::getResourceProviderRoot());
+  }
+#if ONDA_PLUGIN_GPU_UI
+  startTimerHz(gpu_ ? 60 : 20);
+#else
   startTimerHz(20);
+#endif
 }
 
 Editor::~Editor() {
   stopTimer();
+#if ONDA_PLUGIN_GPU_UI
+  // Release drafts and gestures while their command handlers are still alive.
+  gpu_.reset();
+#endif
   processor_.releaseKeyboardNotes();
   processor_.setScopeCaptureEnabled(false);
   for (std::size_t index = 0; index < activeGestures_.size(); ++index)
@@ -503,7 +528,7 @@ void Editor::publishFileDrag(const char *phase, const juce::StringArray &files,
   position.getDynamicObject()->setProperty("x", x);
   position.getDynamicObject()->setProperty("y", y);
   object.setProperty("position", std::move(position));
-  browser_->emitEventIfBrowserIsVisible("ondaState", std::move(message));
+  emitState(std::move(message));
 }
 
 void Editor::fileDragEnter(const juce::StringArray &files, int x, int y) {
@@ -535,16 +560,62 @@ void Editor::filesDropped(const juce::StringArray &files, int x, int y) {
 }
 
 void Editor::resized() {
-  browser_->setBounds(getLocalBounds());
+  if (browser_) browser_->setBounds(getLocalBounds());
+#if ONDA_PLUGIN_GPU_UI
+  if (gpu_) gpu_->setBounds(getLocalBounds());
+#endif
   loadingOverlay_.setBounds(getLocalBounds());
   processor_.setEditorSize(getWidth(), getHeight());
 }
 
+bool Editor::viewVisible() const {
+#if ONDA_PLUGIN_GPU_UI
+  if (gpu_) return gpu_->isVisible();
+#endif
+  return browser_ && browser_->isVisible();
+}
+
+void Editor::emitState(juce::var message) {
+#if ONDA_PLUGIN_GPU_UI
+  if (gpu_) {
+    gpu_->message(message);
+    return;
+  }
+#endif
+  if (browser_) browser_->emitEventIfBrowserIsVisible("ondaState", std::move(message));
+}
+
+void Editor::viewReady() {
+  for (std::size_t index = 0; index < activeGestures_.size(); ++index)
+    endParameterGesture(index);
+  browserReady_ = true;
+  hasPublished_ = false;
+  hasPublishedMidi_ = false;
+  hasPublishedScope_ = false;
+  publishState(true);
+  publishMidiActivity(true);
+  publishScope(true);
+}
+
 void Editor::timerCallback() {
-  const auto showing = browserReady_ && isShowing() && browser_->isVisible();
-  if (scopeCaptureActive_ != showing) {
-    scopeCaptureActive_ = showing;
-    processor_.setScopeCaptureEnabled(showing);
+#if ONDA_PLUGIN_GPU_UI
+  const auto tickGpu = [this] {
+    gpu_->tick();
+    if (gpu_->error().isNotEmpty()) {
+      loadingOverlay_.setText(gpu_->error(), juce::dontSendNotification);
+      loadingOverlay_.setVisible(true);
+    }
+  };
+  if (gpu_ && (!browserReady_ || !gpu_->isShowing())) tickGpu();
+#endif
+  const auto showing = browserReady_ && isShowing() && viewVisible();
+  bool captureScope=showing;
+#if ONDA_PLUGIN_GPU_UI
+  if (gpu_) captureScope=captureScope && gpu_->scopeVisible();
+#endif
+  if (scopeCaptureActive_ != captureScope) {
+    scopeCaptureActive_ = captureScope;
+    processor_.setScopeCaptureEnabled(captureScope);
   }
   if (!showing) {
     hasPublished_ = false;
@@ -555,6 +626,9 @@ void Editor::timerCallback() {
   publishState(false);
   publishMidiActivity();
   publishScope();
+#if ONDA_PLUGIN_GPU_UI
+  if (gpu_) tickGpu();
+#endif
 }
 
 void Editor::publishMidiActivity(const bool force) {
@@ -569,12 +643,11 @@ void Editor::publishMidiActivity(const bool force) {
   }
   publishedMidiRevision_ = activity.revision;
   hasPublishedMidi_ = true;
-  browser_->emitEventIfBrowserIsVisible("ondaState",
-                                        makeRunViewMidiActivity(activity));
+  emitState(makeRunViewMidiActivity(activity));
 }
 
 void Editor::publishState(const bool force) {
-  if (!browserReady_ || !isShowing() || !browser_->isVisible()) {
+  if (!browserReady_ || !isShowing() || !viewVisible()) {
     hasPublished_ = false;
     return;
   }
@@ -601,7 +674,7 @@ void Editor::publishState(const bool force) {
   const auto currentBlockPreference = processor_.preferredBlockSize();
   const auto currentFastMath = processor_.fastMath();
   if (!force && hasPublished_ && revision == publishedRevision_ &&
-      logRevision == publishedLogRevision_ && currentBuses == publishedBuses_ &&
+      currentBuses == publishedBuses_ &&
       currentInputLayout == publishedInputLayout_ &&
       std::is_eq(currentInputSmoothing <=> publishedInputSmoothing_) &&
       currentKnobLayout == publishedKnobLayout_ &&
@@ -614,9 +687,12 @@ void Editor::publishState(const bool force) {
         currentControls != publishedControlStamps_) {
       publishedSlotStamps_ = currentSlots;
       publishedControlStamps_ = currentControls;
-      browser_->emitEventIfBrowserIsVisible(
-          "ondaState",
+      emitState(
           makeRunViewParameterValues(processor_, processor_.workerStatus()));
+    }
+    if (logRevision != publishedLogRevision_) {
+      publishedLogRevision_ = logRevision;
+      emitState(makeRunViewLog(processor_));
     }
     return;
   }
@@ -656,24 +732,50 @@ void Editor::publishState(const bool force) {
       viewState = juce::var{new juce::DynamicObject};
       viewState.getDynamicObject()->setProperty("reset", true);
     }
+    // Presentation belongs to its source; an untouched newly loaded source
+    // must not inherit a previously saved source's event arguments on reopen.
+    if (!viewState.isObject() ||
+        (viewState.hasProperty("path") &&
+         viewState.getProperty("path", {}).toString() !=
+             state.getProperty("path", {}).toString())) {
+      viewState = juce::var{new juce::DynamicObject};
+      viewState.getDynamicObject()->setProperty("reset", true);
+    }
     viewState.getDynamicObject()->setProperty("readyId", ++publishedReadyId_);
     state.getDynamicObject()->setProperty("viewState", std::move(viewState));
   }
-  browser_->emitEventIfBrowserIsVisible("ondaState", message);
+  emitState(message);
 }
 
 void Editor::publishScope(const bool force) {
-  if (!isShowing() || !browser_->isVisible()) {
+  if (!isShowing() || !viewVisible()) {
     hasPublishedScope_ = false;
     return;
   }
+#if ONDA_PLUGIN_GPU_UI
+  // Scope capture targets 30 Hz; GPU input/rendering stays at 60 Hz.
+  constexpr auto scopeIntervalMs = 1000.0 / 30.0;
+  const auto now = juce::Time::getMillisecondCounterHiRes();
+  const auto elapsed = !force && hasPublishedScope_
+                           ? now - publishedScopeTimeMs_ : scopeIntervalMs;
+  if (gpu_ && elapsed < scopeIntervalMs)
+    return;
+#endif
   const auto revision = processor_.scopeRevision();
   if (!force && hasPublishedScope_ && revision == publishedScopeRevision_)
     return;
   publishedScopeRevision_ = revision;
   hasPublishedScope_ = true;
-  browser_->emitEventIfBrowserIsVisible("ondaState",
-                                        makeRunViewScope(processor_));
+#if ONDA_PLUGIN_GPU_UI
+  if (gpu_) {
+    // Keep the capture clock's phase despite jitter in the 60 Hz editor timer.
+    publishedScopeTimeMs_ = now - std::fmod(elapsed, scopeIntervalMs);
+    const auto snapshot = processor_.scopeSnapshot();
+    gpu_->scope(snapshot.channels, snapshot.samples);
+    return;
+  }
+#endif
+  emitState(makeRunViewScope(processor_));
 }
 
 void Editor::handleCommand(const juce::var &command) {
@@ -683,15 +785,7 @@ void Editor::handleCommand(const juce::var &command) {
   const auto type = input->getProperty("type").toString();
 
   if (type == "webviewReady") {
-    for (std::size_t index = 0; index < activeGestures_.size(); ++index)
-      endParameterGesture(index);
-    browserReady_ = true;
-    hasPublished_ = false;
-    hasPublishedMidi_ = false;
-    hasPublishedScope_ = false;
-    publishState(true);
-    publishMidiActivity(true);
-    publishScope(true);
+    viewReady();
   } else if (type == "runViewReady") {
     const auto readyId = input->getProperty("readyId");
     if (browserReady_ && (readyId.isInt() || readyId.isInt64()) &&

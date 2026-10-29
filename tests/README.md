@@ -15,6 +15,32 @@ Native editor checks require a desktop. Linux CI supplies an X11 display with
 `juce_add_console_app` for the Windows console entry point and normal JUCE
 message-loop and WebKit subprocess startup.
 
+With `ONDA_PLUGIN_GPU_UI=ON`, `onda_gpu_editor_tests` closes a real GPU editor
+with an unfinished smoothing edit, including after a host error, and verifies
+that teardown commits the draft while editor command handlers remain alive.
+It also verifies that repeated hidden timer ticks send no additional UI input
+after suspension, and that showing the editor rearms the next suspension.
+Reparenting a visible GPU editor between native peers must restore saved
+presentation with a fresh readiness ID and replay MIDI activity and scope data.
+`onda_gpu_keyboard_tests` runs without a native surface and checks that unused
+keys reach the DAW, consumed keys stay in the UI, and input errors remain distinct.
+`onda_gpu_ui_tests` also checks that an idle instrument leaves computer-key MIDI
+to the DAW, and checks the framebuffer scale against the display density on macOS.
+On Windows it also checks that GPU presentation disables JUCE's composition
+layer and restores each peer's previous renderer on close or reparenting,
+including when the old peer has already been destroyed.
+
+On Linux, run `xvfb-run -a python3 scripts/test-gpu-reaper.py build --file-drops`
+to drop a source file into each empty GPU editor through the real X11 protocol.
+The file offer puts text before file URIs, matching Nautilus, and the path contains
+spaces and Unicode. The host window moves after the editor is attached, and
+data requests must preserve the drag event's timestamp. Add `--nautilus` to
+exercise the file manager's actual drag gesture instead. These checks use a
+temporary REAPER profile and relocated bundles, verify the loaded UI library
+paths, and confirm that each dropped patch
+publishes its parameter to the DAW. They require REAPER, X11/XTest, ImageMagick,
+and, for `--nautilus`, Nautilus and `dbus-run-session`.
+
 | CTest label | Placement and purpose |
 | --- | --- |
 | `core` | All three toolchains: deterministic C++ DSP, state, automation and worker behavior; examples; exported VST3 behavior and protocol validation. |
