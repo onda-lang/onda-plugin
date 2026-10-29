@@ -16,16 +16,14 @@ on:
       tests:
         description: Optional tests (all includes four extra Linux channel/parameter builds)
         type: choice
-        default: browser-audit
+        default: audit
         options:
-          - browser-audit
-          - browser
           - audit
           - extended
           - channels
           - all
       platform:
-        description: Platform (browser, audit and channels require linux-x64)
+        description: Platform (audit and channels require linux-x64)
         type: choice
         default: linux-x64
         options:
@@ -80,7 +78,6 @@ jobs:
             *) echo "unknown platform: $TARGET_PLATFORM" >&2; exit 1 ;;
           esac
 
-          browser=false
           audit=false
           extended=false
           channels=false
@@ -90,12 +87,10 @@ jobs:
           targets=()
           case "$TEST_SELECTION" in
             release) labels='core|native'; build=true; validator=true ;;
-            browser-audit) browser=true; audit=true ;;
-            browser) browser=true ;;
             audit) audit=true ;;
             extended) extended=true ;;
             channels) channels=true ;;
-            all) browser=true; audit=true; extended=true; channels=true ;;
+            all) audit=true; extended=true; channels=true ;;
             *) echo "unknown test selection: $TEST_SELECTION" >&2; exit 1 ;;
           esac
 
@@ -105,11 +100,9 @@ jobs:
               exit 1
             fi
             if [[ "$RUNNER_OS" != Linux ]]; then
-              browser=false
               audit=false
               channels=false
             fi
-            if [[ "$browser" == true ]]; then labels+='browser|'; fi
             if [[ "$audit" == true ]]; then
               labels+='audit|'
               targets+=(onda_vst3_realtime_audit_tests onda_vst3_smoke)
@@ -124,7 +117,7 @@ jobs:
           fi
           if [[ -n "$labels" ]]; then labels="^($labels)$"; fi
           printf '%s\n' "source_ref=$SOURCE_REF" "release_tag=$RELEASE_TAG" \
-            "browser=$browser" "audit=$audit" \
+            "audit=$audit" \
             "channels=$channels" "build=$build" "validator=$validator" \
             "labels=$labels" "targets=${targets[*]}" >> "$GITHUB_OUTPUT"
 
@@ -168,8 +161,7 @@ jobs:
             libasound2-dev \
             libfontconfig1-dev \
             libfreetype6-dev \
-            libgtk-3-dev \
-            libwebkit2gtk-4.1-dev \
+            libvulkan1 mesa-vulkan-drivers \
             libx11-dev \
             libxcomposite-dev \
             libxcursor-dev \
@@ -206,35 +198,13 @@ jobs:
           test -f "$validator"
           echo "ONDA_VST3_VALIDATOR=$validator" >> "$GITHUB_ENV"
 
-      - name: Set up browser test tooling
-        if: steps.tests.outputs.browser == 'true'
-        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
-        with:
-          node-version: '24'
-          cache: npm
-          cache-dependency-path: tests/package-lock.json
-
-      - name: Install controlled browser
-        if: steps.tests.outputs.browser == 'true'
-        shell: bash
-        run: |
-          npm ci --prefix tests
-          npm exec --prefix tests -- playwright install --with-deps chromium --only-shell
-
       - name: Configure CMake on Windows
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $webView2 = Join-Path $env:RUNNER_TEMP "webview2"
-          nuget install Microsoft.Web.WebView2 `
-            -Version 1.0.3485.44 `
-            -OutputDirectory $webView2 `
-            -NonInteractive
           cmake -S . -B $env:BUILD_PATH -A x64 `
             "-DONDA_VST3_VALIDATOR=$env:ONDA_VST3_VALIDATOR" `
-            "-DONDA_PLUGIN_BUILD_BROWSER_TESTS=OFF" `
-            "-DONDA_PLUGIN_BUILD_VST3_AUDIT=OFF" `
-            "-DJUCE_WEBVIEW2_PACKAGE_LOCATION=$webView2"
+            "-DONDA_PLUGIN_BUILD_VST3_AUDIT=OFF"
 
       - name: Configure CMake on Unix
         if: runner.os != 'Windows'
@@ -243,7 +213,6 @@ jobs:
           cmake -S . -B "$BUILD_PATH"
           -DCMAKE_BUILD_TYPE=Release
           -DONDA_VST3_VALIDATOR="${ONDA_VST3_VALIDATOR:-}"
-          -DONDA_PLUGIN_BUILD_BROWSER_TESTS=${{ steps.tests.outputs.browser == 'true' && 'ON' || 'OFF' }}
           -DONDA_PLUGIN_BUILD_VST3_AUDIT=${{ steps.tests.outputs.audit == 'true' && 'ON' || 'OFF' }}
 
       - name: Build

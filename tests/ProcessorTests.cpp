@@ -586,25 +586,6 @@ bool processWithoutAllocation(onda::plugin::Processor &processor,
 }
 
 bool exerciseRunViewAdapter() {
-  const auto root = onda::plugin::runViewResource("/");
-  const auto index = onda::plugin::runViewResource("/index.html?cache=1");
-  const auto script = onda::plugin::runViewResource("/param-control.js?v=2");
-  const auto numberScript =
-      onda::plugin::runViewResource("/number-input.js?v=2");
-  const auto buffersScript = onda::plugin::runViewResource("/buffers.js?v=2");
-  if (!root || !index || !script || !numberScript || !buffersScript ||
-      buffersScript->data.size() <= 3U || root->data.size() <= 3U ||
-      index->data != root->data ||
-      root->mimeType != "text/html; charset=utf-8" ||
-      script->mimeType != "text/javascript; charset=utf-8" ||
-      numberScript->mimeType != "text/javascript; charset=utf-8" ||
-      buffersScript->mimeType != "text/javascript; charset=utf-8" ||
-      root->data[0] != std::byte{0xef} || root->data[1] != std::byte{0xbb} ||
-      root->data[2] != std::byte{0xbf} ||
-      onda::plugin::runViewResource("/missing.txt")) {
-    std::cerr << "embedded run-view resources were not served canonically\n";
-    return false;
-  }
   onda::plugin::Processor processor(onda::plugin::Product::effect);
   processor.prepareToPlay(48'000.0, 64);
   const auto message = onda::plugin::makeRunViewState(
@@ -749,16 +730,6 @@ bool exerciseRunViewAdapter() {
     return false;
   }
 
-  const auto scopeMessage = onda::plugin::makeRunViewScope(processor);
-  const auto *scope = scopeMessage.getDynamicObject();
-  if (scope == nullptr ||
-      scope->getProperty("type").toString() != "scopeData" ||
-      static_cast<int>(scope->getProperty("channels")) != 0 ||
-      scope->getProperty("samples").getArray() == nullptr ||
-      !scope->getProperty("samples").getArray()->isEmpty()) {
-    std::cerr << "empty run-view scope message was invalid\n";
-    return false;
-  }
   return true;
 }
 
@@ -1213,19 +1184,6 @@ bool exerciseScopeCapture() {
     }
   }
 
-  const auto message = onda::plugin::makeRunViewScope(processor);
-  const auto *scope = message.getDynamicObject();
-  const auto *samples =
-      scope == nullptr ? nullptr : scope->getProperty("samples").getArray();
-  if (scope == nullptr ||
-      scope->getProperty("type").toString() != "scopeData" ||
-      static_cast<int>(scope->getProperty("channels")) != 2 ||
-      samples == nullptr ||
-      samples->size() != static_cast<int>(snapshot.samples.size())) {
-    std::cerr << "captured run-view scope message was invalid\n";
-    return false;
-  }
-
   processor.setScopeCaptureEnabled(false);
   if (processor.scopeRevision().enabled ||
       processor.scopeSnapshot().channels != 0 ||
@@ -1306,7 +1264,7 @@ bool exerciseRuntimeLogging() {
   if (update == nullptr || !update->hasProperty("params") ||
       update->hasProperty("logText") || update->hasProperty("logEntries") ||
       update->hasProperty("printTransportDropCount")) {
-    std::cerr << "parameter update replaced the unchanged browser log\n";
+    std::cerr << "parameter update replaced the unchanged UI log\n";
     return false;
   }
 
@@ -1318,7 +1276,7 @@ bool exerciseRuntimeLogging() {
       clearedState.getProperty("logEntries", {}).getArray();
   if (clearedEntries == nullptr || !clearedEntries->isEmpty() ||
       clearedState.getProperty("logText", {}).toString().isNotEmpty()) {
-    std::cerr << "cleared log was not sent to the browser\n";
+    std::cerr << "cleared log was not sent to the UI\n";
     return false;
   }
   snapshot = processor.runtimeLogSnapshot();
@@ -3096,7 +3054,7 @@ sample { out1 = level; out2 = level }
   hostNote.addEvent(juce::MidiMessage::noteOn(1, 60, 1.0F), 0);
   if (!renders(1.0F, hostNote))
     return false;
-  // The browser can release a virtual hold from before adoption. That release
+  // The UI can release a virtual hold from before adoption. That release
   // must not dispatch a note-off to the new engine's host voice.
   processor.triggerMidiNote(60, 0.0F, false);
   if (!renders(1.0F) || !processor.midiActivitySnapshot().active(60)) {
@@ -4729,16 +4687,8 @@ int runProcessorCases(const int argc, const char *const *argv) {
       {"StateRestore", exerciseStateRestore},
       {"EditorLifecycle", exerciseEditorLifecycle},
       {"NativeEditor", exerciseNativeEditor, "native"},
-#if ONDA_PLUGIN_GPU_UI
-      {"GpuEditorTeardown", exerciseGpuEditorTeardown, "gpu",
-       juce::SystemStats::getEnvironmentVariable("ONDA_GPU_UI", "") == "1"
-           ? ""
-           : "requires ONDA_GPU_UI=1"},
-      {"GpuEditorPeerRecreation", exerciseGpuEditorPeerRecreation, "gpu",
-       juce::SystemStats::getEnvironmentVariable("ONDA_GPU_UI", "") == "1"
-           ? ""
-           : "requires ONDA_GPU_UI=1"},
-#endif
+      {"GpuEditorTeardown", exerciseGpuEditorTeardown, "gpu"},
+      {"GpuEditorPeerRecreation", exerciseGpuEditorPeerRecreation, "gpu"},
       {"Vst3EditorAttachment", exerciseVst3EditorAttachment, "native"},
       {"EditorGestureCancellation", exerciseEditorGestureCancellation},
       {"StaleEditorEvents", exerciseStaleEditorEvents},
@@ -4802,9 +4752,8 @@ int runProcessorCases(const int argc, const char *const *argv) {
   return test::runCases(argc, argv, cases);
 }
 
-// A real JUCE application supplies native message-loop initialization and the
-// WebKit subprocess entry point. ScopedJuceInitialiser_GUI alone identifies an
-// executable as an embedded plugin and cannot host its browser correctly.
+// A real JUCE application supplies native message-loop initialization and
+// application lifecycle for the editor tests.
 class ProcessorTestApplication final : public juce::JUCEApplication {
 public:
   ProcessorTestApplication(int argc, const char *const *argv)

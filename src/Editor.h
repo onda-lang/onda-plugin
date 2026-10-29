@@ -6,7 +6,7 @@
 #include "ScopeCapture.h"
 
 #include <juce_audio_processors/juce_audio_processors.h>
-#include <juce_gui_extra/juce_gui_extra.h>
+#include <juce_gui_basics/juce_gui_basics.h>
 
 #include <array>
 #include <memory>
@@ -14,9 +14,7 @@
 
 namespace onda::plugin {
 
-#if ONDA_PLUGIN_GPU_UI
 class GpuView;
-#endif
 class Processor;
 enum class ParamControlLayout : std::uint8_t;
 
@@ -37,7 +35,6 @@ public:
 
 private:
   friend struct EditorTestAccess;
-  class Browser;
 
   bool viewVisible() const;
   void viewReady();
@@ -52,11 +49,8 @@ private:
   void publishScope(bool force = false);
 
   Processor &processor_;
-  std::unique_ptr<Browser> browser_;
-#if ONDA_PLUGIN_GPU_UI
   std::unique_ptr<GpuView> gpu_;
   double publishedScopeTimeMs_{};
-#endif
   juce::Label loadingOverlay_;
   std::unique_ptr<juce::FileChooser> fileChooser_;
   std::uint64_t publishedRevision_{};
@@ -80,7 +74,7 @@ private:
   bool hasPublishedMidi_{};
   bool hasPublishedScope_{};
   bool scopeCaptureActive_{};
-  bool browserReady_{};
+  bool viewReady_{};
   std::array<bool, slotCount + controlCount> activeGestures_{};
   std::string actionError_;
 

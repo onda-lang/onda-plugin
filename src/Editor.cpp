@@ -1,7 +1,5 @@
-#if ONDA_PLUGIN_GPU_UI
-#include "GpuView.h"
-#endif
 #include "Editor.h"
+#include "GpuView.h"
 
 #include "AudioFile.h"
 #include "JucePath.h"
@@ -15,274 +13,11 @@
 #include <string_view>
 #include <system_error>
 
-#if JUCE_LINUX && !JUCE_USE_EXTERNAL_TEMPORARY_SUBPROCESS
-#error "Linux plugin editors require JUCE's external WebKit subprocess helper"
-#endif
-
 namespace onda::plugin {
 namespace {
 
 const auto editorBackground = juce::Colour::fromRGB(13, 25, 41);
 const auto editorMutedText = juce::Colour::fromRGB(146, 168, 191);
-
-constexpr auto juceHostBridgeScript = R"JS(
-(() => {
-  let parameterDomains = new Map();
-  let parameterPath = "";
-  const activeParameterGestures = new Set();
-  let blockSettingsKey = "";
-  let hostBlockSamples = 0;
-  let eventDefinitions = [];
-  let eventGeneration = "0";
-  const isBufferFile = name => window.__ondaBufferFileExtensions.some(
-    extension => name.toLowerCase().endsWith(extension));
-
-  // WebView2 preserves native paths when File objects cross as additional
-  // objects. Ordinary JSON messages only retain their names and contents.
-  const webview = window.chrome?.webview;
-  if (typeof webview?.postMessageWithAdditionalObjects === "function") {
-    // Run after the buffer view's document handlers so native source/project
-    // drops stay available throughout the editor, including outside cards.
-    window.addEventListener("dragover", (event) => {
-      if (!Array.from(event.dataTransfer?.types || []).includes("Files")) return;
-      event.preventDefault();
-      event.dataTransfer.dropEffect = "copy";
-    });
-    document.addEventListener("drop", (event) => {
-      if (!Array.from(event.dataTransfer?.types || []).includes("Files")) return;
-      event.preventDefault();
-      const files = Array.from(event.dataTransfer.files || []);
-      const sources = files.filter(file => /\.(?:onda|on|ondaproject)$/i.test(file.name));
-      const dropped = sources.length ? sources
-        : files.length === 1 && isBufferFile(files[0].name) ? files : [];
-      if (dropped.length) webview.postMessageWithAdditionalObjects(JSON.stringify({
-        type: "ondaFilesDropped", x: event.clientX, y: event.clientY,
-      }), dropped);
-    });
-  }
-
-  function parameterControlKey(parameter) {
-    const { value, normalizedValue, ...control } = parameter;
-    return JSON.stringify(control);
-  }
-
-  function updatePlainValue(parameter, domain, type = parameter.type) {
-    if (typeof parameter.value !== "number"
-        && !(type === "i64" && typeof parameter.value === "string"))
-      parameter.value = domain.normalizedToPlain(parameter.normalizedValue);
-  }
-
-  function createParameterDomain(parameter) {
-    if (parameter.rangeMin === parameter.rangeMax) return {
-      normalizedToPlain: () => parameter.rangeMin,
-      plainToNormalized: () => parameter.normalizedValue,
-    };
-    return globalThis.__ONDA_PARAM_CONTROL_V2__.createParamDomain({
-      name: parameter.name,
-      scalar: parameter.type,
-      minimum: parameter.rangeMin,
-      maximum: parameter.rangeMax,
-      scale: parameter.scale,
-      curve: parameter.curve,
-      unit: parameter.unit,
-      step: parameter.step,
-      stepCount: parameter.stepCount,
-    });
-  }
-
-  function defaultEventArgumentValue(argument) {
-    const structured = typeof argument?.type === "string"
-      && !/^(?:f32|f64|i32|i64|bool)(?:\[[0-9]*\])?$/.test(argument.type);
-    if (structured) {
-      const value = argument.default ?? {};
-      return typeof structuredClone === "function"
-        ? structuredClone(value)
-        : JSON.parse(JSON.stringify(value));
-    }
-    const isArray = Boolean(
-      argument?.isSlice
-      || (typeof argument?.arrayLength === "number" && argument.arrayLength !== 1)
-      || (typeof argument?.type === "string" && /\[[0-9]*\]$/.test(argument.type))
-    );
-    if (isArray) {
-      return Array.isArray(argument.default) ? argument.default.slice() : [];
-    }
-    if (argument?.type === "bool") {
-      return Boolean(argument.default);
-    }
-    if (argument?.type === "i64") {
-      return typeof argument.default === "string" ? argument.default : "0";
-    }
-    if ((argument?.type === "f32" || argument?.type === "f64")
-        && ["NaN", "Infinity", "-Infinity"].includes(argument.default)) {
-      return argument.default;
-    }
-    const value = Number(argument?.default);
-    return Number.isFinite(value) ? value : 0;
-  }
-
-  function resetEventArguments() {
-    if (typeof window._onHostMessage !== "function") {
-      return;
-    }
-    const events = eventDefinitions.map((event) => ({
-      ...event,
-      args: Array.isArray(event.args)
-        ? event.args.map((argument) => ({
-            ...argument,
-            value: defaultEventArgumentValue(argument),
-          }))
-        : [],
-    }));
-    window._onHostMessage({
-      type: "state", state: { events, resetEventArguments: true },
-    });
-  }
-
-  window.__hostBridge = { mode: "wry", isBufferFile };
-  window.ipc = {
-    postMessage(payload) {
-      let message;
-      try {
-        message = typeof payload === "string" ? JSON.parse(payload) : payload;
-      } catch {
-        return;
-      }
-
-      if (message?.type === "resetEventArguments") {
-        resetEventArguments();
-        return;
-      }
-      if (message?.type === "triggerEvent") {
-        message.engineGeneration = eventGeneration;
-      }
-      if (message?.type === "setRunSettings" && message.blockSamples === hostBlockSamples) {
-        message.blockSamples = 0;
-      }
-      if (message?.type === "setParam" || message?.type === "setInputControl") {
-        const binding = parameterDomains.get(message.name);
-        if (!binding) return;
-        message.value = binding.domain.plainToNormalized(message.value);
-        if (message.commit) activeParameterGestures.delete(message.name);
-        else activeParameterGestures.add(message.name);
-      }
-      window.__JUCE__.backend.emitEvent("ondaCommand", message);
-    },
-  };
-
-  document.addEventListener("DOMContentLoaded", () => {
-    const sampleRate = document.getElementById("run-sample-rate");
-    if (sampleRate) {
-      sampleRate.disabled = true;
-      sampleRate.closest(".param-setting").hidden = true;
-    }
-    const runSettings = document.getElementById("file-picker-settings");
-    if (runSettings) runSettings.style.gridTemplateColumns = "minmax(0, 1fr)";
-    const input = document.getElementById("param-smoothing-ms");
-    if (input) {
-      input.setAttribute("title", "Smooths editor changes. DAW automation updates at block boundaries. 0 disables smoothing.");
-    }
-    updateBlockSettings({ hostBlockSamples: 0, canSetBlockSize: false });
-  });
-
-  function updateBlockSettings(state) {
-    if (!Number.isInteger(state.hostBlockSamples)) return;
-    const select = document.getElementById("run-block-size");
-    if (!select) return;
-    const maximum = state.hostBlockSamples;
-    hostBlockSamples = maximum;
-    const preference = state.preferredBlockSamples ?? 0;
-    const key = `${maximum}:${preference}:${state.canSetBlockSize}`;
-    if (key !== blockSettingsKey) {
-      const options = [];
-      const add = (value, text) => {
-        const option = document.createElement("option");
-        option.value = String(value);
-        option.textContent = text;
-        options.push(option);
-        return option;
-      };
-      add(maximum, maximum > 0 ? `Host (${maximum} samples)` : "Host (waiting)");
-      const sizes = new Set([maximum]);
-      for (const divisor of [2, 4, 8]) {
-        const size = Math.floor(maximum / divisor);
-        if (size > 0 && !sizes.has(size)) {
-          sizes.add(size);
-          add(size, `${size} samples`);
-        }
-      }
-      // Host capacity changes can leave the active fixed size outside these
-      // choices. Display it without offering it as another menu choice.
-      if (preference > 0 && !sizes.has(preference)) {
-        const option = add(preference, preference > maximum
-          ? `${preference} (using ${maximum})` : `${preference} samples`);
-        option.hidden = option.disabled = true;
-      }
-      select.replaceChildren(...options);
-      blockSettingsKey = key;
-    }
-    select.value = String(preference || maximum);
-    select.disabled = state.canSetBlockSize !== true || maximum <= 0;
-    select.title = "Choose before loading a program. Smaller Onda blocks update automation more often and use more CPU.";
-  }
-
-  window.__JUCE__.backend.addEventListener("ondaState", (message) => {
-    if (message?.type === "parameterValues") {
-      for (const bank of ["params", "inputControls"]) {
-        message.state[bank] = (message.state[bank] || []).filter(parameter => {
-          const binding = parameterDomains.get(parameter.name);
-          if (!binding || binding.bank !== bank) return false;
-          updatePlainValue(parameter, binding.domain, binding.type);
-          return true;
-        });
-      }
-    }
-    if (message?.type === "state" && Array.isArray(message.state?.events)) {
-      eventDefinitions = message.state.events;
-      eventGeneration = message.state.engineGeneration;
-    }
-    if (message?.type === "state" && (Array.isArray(message.state?.params) || Array.isArray(message.state?.inputControls))) {
-      const nextPath = message.state.path ?? parameterPath;
-      const nextDomains = new Map([...parameterDomains].filter(([, binding]) =>
-        nextPath === parameterPath && !Array.isArray(message.state[binding.bank])));
-      for (const [bank, endCommand] of [["params", "endParamGesture"], ["inputControls", "endInputControlGesture"]]) {
-        for (const parameter of message.state[bank] || []) {
-          if (parameter.hostValueDomain !== "normalized") {
-            continue;
-          }
-          try {
-            const domain = createParameterDomain(parameter);
-            nextDomains.set(parameter.name, {
-              domain, type: parameter.type,
-              controlKey: parameterControlKey(parameter), endCommand, bank,
-            });
-            updatePlainValue(parameter, domain);
-          } catch {
-            // The shared view will surface malformed parameter metadata.
-          }
-        }
-      }
-      // The shared view discards obsolete drags without committing their value.
-      // Release the DAW gesture separately before the controls are replaced.
-      for (const name of activeParameterGestures) {
-        if (nextPath !== parameterPath || !nextDomains.has(name)
-            || nextDomains.get(name).controlKey !== parameterDomains.get(name)?.controlKey) {
-          activeParameterGestures.delete(name);
-          window.__JUCE__.backend.emitEvent("ondaCommand", {
-            type: parameterDomains.get(name)?.endCommand || "endParamGesture", name,
-          });
-        }
-      }
-      parameterDomains = nextDomains;
-      parameterPath = nextPath;
-    }
-    if (typeof window._onHostMessage === "function") {
-      window._onHostMessage(message);
-    }
-    if (message?.type === "state") updateBlockSettings(message.state);
-  });
-})();
-)JS";
 
 std::optional<double> number(const juce::var &value) {
   if (!value.isInt() && !value.isInt64() && !value.isDouble() &&
@@ -340,118 +75,20 @@ bool isBufferFile(const juce::File &file) {
       });
 }
 
-juce::WebBrowserComponent::Options browserOptions() {
-  juce::WebBrowserComponent::Options options;
-  juce::Array<juce::var> extensions;
-  for (const auto &extension : supportedAudioFileExtensions())
-    extensions.add(juce::String::fromUTF8(extension.c_str()));
-  options = options.withUserScript("window.__ondaBufferFileExtensions = " +
-                                   juce::JSON::toString(extensions) + ";\n" +
-                                   juceHostBridgeScript);
-#if JUCE_WINDOWS
-  const auto dataFolder =
-      juce::File::getSpecialLocation(juce::File::userApplicationDataDirectory)
-          .getChildFile("Onda/VST3/WebView2");
-  options =
-      options.withBackend(juce::WebBrowserComponent::Options::Backend::webview2)
-          .withWinWebView2Options(
-              juce::WebBrowserComponent::Options::WinWebView2{}
-                  .withUserDataFolder(dataFolder));
-#endif
-  return options;
-}
-
 } // namespace
-
-class Editor::Browser final : public juce::WebBrowserComponent,
-                              public juce::FileDragAndDropTarget {
-public:
-  explicit Browser(Editor &owner)
-      : WebBrowserComponent(
-            browserOptions()
-                .withNativeIntegrationEnabled()
-                .withKeepPageLoadedWhenBrowserIsHidden()
-                .withEventListener("ondaCommand",
-                                   [&owner](juce::var command) {
-                                     owner.handleCommand(command);
-                                   })
-                .withResourceProvider([](const juce::String &path) {
-                  return runViewResource(path);
-                })),
-        owner_(owner) {}
-
-  [[nodiscard]] juce::String initializationError() const {
-#if JUCE_WINDOWS
-    const auto options = browserOptions();
-    if (const auto result = options.getWinWebView2BackendOptions()
-                                .getUserDataFolder()
-                                .createDirectory();
-        result.failed())
-      return "Could not create the Onda browser data folder: " +
-             result.getErrorMessage();
-    if (!areOptionsSupported(options))
-      return "The Onda editor requires Microsoft Edge WebView2 Runtime";
-#endif
-    return {};
-  }
-
-  bool pageAboutToLoad(const juce::String &url) override {
-    return url.startsWith(getResourceProviderRoot());
-  }
-
-  void newWindowAttemptingToLoad(const juce::String &) override {}
-
-  bool isInterestedInFileDrag(const juce::StringArray &files) override {
-    return owner_.isInterestedInFileDrag(files);
-  }
-
-  void fileDragEnter(const juce::StringArray &files, int x, int y) override {
-    owner_.fileDragEnter(files, x, y);
-  }
-
-  void fileDragMove(const juce::StringArray &files, int x, int y) override {
-    owner_.fileDragMove(files, x, y);
-  }
-
-  void fileDragExit(const juce::StringArray &files) override {
-    owner_.fileDragExit(files);
-  }
-
-  void filesDropped(const juce::StringArray &files, int x, int y) override {
-    owner_.filesDropped(files, x, y);
-  }
-
-  bool pageLoadHadNetworkError(const juce::String &error) override {
-    owner_.loadingOverlay_.setText("Could not load the Onda editor: " + error,
-                                   juce::dontSendNotification);
-    owner_.loadingOverlay_.setVisible(true);
-    return false;
-  }
-
-private:
-  Editor &owner_;
-};
 
 Editor::Editor(Processor &owner)
     : AudioProcessorEditor(owner), processor_(owner) {
-#if ONDA_PLUGIN_GPU_UI
-  if (juce::SystemStats::getEnvironmentVariable("ONDA_GPU_UI", "") == "1")
-    gpu_ = std::make_unique<GpuView>(
-        [this](const juce::var &command) { handleCommand(command); },
-        [this] {
-          viewReady();
-          loadingOverlay_.setVisible(false);
-        });
-  else
-#endif
-    browser_ = std::make_unique<Browser>(*this);
+  gpu_ = std::make_unique<GpuView>(
+      [this](const juce::var &command) { handleCommand(command); },
+      [this] {
+        viewReady();
+        loadingOverlay_.setVisible(false);
+      });
   const auto [width, height] = processor_.editorSize();
   setAccessible(false);
   setOpaque(true);
-  if (browser_) addAndMakeVisible(*browser_);
-#if ONDA_PLUGIN_GPU_UI
-  if (gpu_) addAndMakeVisible(*gpu_);
-#endif
+  addAndMakeVisible(*gpu_);
   loadingOverlay_.setComponentID("onda-loading-overlay");
   loadingOverlay_.setText("Loading Onda...", juce::dontSendNotification);
   loadingOverlay_.setJustificationType(juce::Justification::centred);
@@ -462,24 +99,13 @@ Editor::Editor(Processor &owner)
   setResizable(true, true);
   setSize(width, height);
   setResizeLimits(360, 480, 1600, 1400);
-  if (browser_) {
-    if (const auto error = browser_->initializationError(); error.isNotEmpty())
-      loadingOverlay_.setText(error, juce::dontSendNotification);
-    else browser_->goToURL(juce::WebBrowserComponent::getResourceProviderRoot());
-  }
-#if ONDA_PLUGIN_GPU_UI
-  startTimerHz(gpu_ ? 60 : 20);
-#else
-  startTimerHz(20);
-#endif
+  startTimerHz(60);
 }
 
 Editor::~Editor() {
   stopTimer();
-#if ONDA_PLUGIN_GPU_UI
   // Release drafts and gestures while their command handlers are still alive.
   gpu_.reset();
-#endif
   processor_.releaseKeyboardNotes();
   processor_.setScopeCaptureEnabled(false);
   for (std::size_t index = 0; index < activeGestures_.size(); ++index)
@@ -514,7 +140,7 @@ bool Editor::isInterestedInFileDrag(const juce::StringArray &files) {
 
 void Editor::publishFileDrag(const char *phase, const juce::StringArray &files,
                              const int x, const int y) {
-  if (!browserReady_)
+  if (!viewReady_)
     return;
   juce::var message{new juce::DynamicObject};
   auto &object = *message.getDynamicObject();
@@ -560,35 +186,25 @@ void Editor::filesDropped(const juce::StringArray &files, int x, int y) {
 }
 
 void Editor::resized() {
-  if (browser_) browser_->setBounds(getLocalBounds());
-#if ONDA_PLUGIN_GPU_UI
-  if (gpu_) gpu_->setBounds(getLocalBounds());
-#endif
+  if (gpu_)
+    gpu_->setBounds(getLocalBounds());
   loadingOverlay_.setBounds(getLocalBounds());
   processor_.setEditorSize(getWidth(), getHeight());
 }
 
 bool Editor::viewVisible() const {
-#if ONDA_PLUGIN_GPU_UI
-  if (gpu_) return gpu_->isVisible();
-#endif
-  return browser_ && browser_->isVisible();
+  return gpu_ && gpu_->isVisible();
 }
 
 void Editor::emitState(juce::var message) {
-#if ONDA_PLUGIN_GPU_UI
-  if (gpu_) {
+  if (gpu_)
     gpu_->message(message);
-    return;
-  }
-#endif
-  if (browser_) browser_->emitEventIfBrowserIsVisible("ondaState", std::move(message));
 }
 
 void Editor::viewReady() {
   for (std::size_t index = 0; index < activeGestures_.size(); ++index)
     endParameterGesture(index);
-  browserReady_ = true;
+  viewReady_ = true;
   hasPublished_ = false;
   hasPublishedMidi_ = false;
   hasPublishedScope_ = false;
@@ -598,7 +214,6 @@ void Editor::viewReady() {
 }
 
 void Editor::timerCallback() {
-#if ONDA_PLUGIN_GPU_UI
   const auto tickGpu = [this] {
     gpu_->tick();
     if (gpu_->error().isNotEmpty()) {
@@ -606,13 +221,10 @@ void Editor::timerCallback() {
       loadingOverlay_.setVisible(true);
     }
   };
-  if (gpu_ && (!browserReady_ || !gpu_->isShowing())) tickGpu();
-#endif
-  const auto showing = browserReady_ && isShowing() && viewVisible();
-  bool captureScope=showing;
-#if ONDA_PLUGIN_GPU_UI
-  if (gpu_) captureScope=captureScope && gpu_->scopeVisible();
-#endif
+  if (!viewReady_ || !gpu_->isShowing())
+    tickGpu();
+  const auto showing = viewReady_ && isShowing() && viewVisible();
+  const auto captureScope = showing && gpu_->scopeVisible();
   if (scopeCaptureActive_ != captureScope) {
     scopeCaptureActive_ = captureScope;
     processor_.setScopeCaptureEnabled(captureScope);
@@ -626,9 +238,7 @@ void Editor::timerCallback() {
   publishState(false);
   publishMidiActivity();
   publishScope();
-#if ONDA_PLUGIN_GPU_UI
-  if (gpu_) tickGpu();
-#endif
+  tickGpu();
 }
 
 void Editor::publishMidiActivity(const bool force) {
@@ -647,7 +257,7 @@ void Editor::publishMidiActivity(const bool force) {
 }
 
 void Editor::publishState(const bool force) {
-  if (!browserReady_ || !isShowing() || !viewVisible()) {
+  if (!viewReady_ || !isShowing() || !viewVisible()) {
     hasPublished_ = false;
     return;
   }
@@ -752,30 +362,22 @@ void Editor::publishScope(const bool force) {
     hasPublishedScope_ = false;
     return;
   }
-#if ONDA_PLUGIN_GPU_UI
   // Scope capture targets 30 Hz; GPU input/rendering stays at 60 Hz.
   constexpr auto scopeIntervalMs = 1000.0 / 30.0;
   const auto now = juce::Time::getMillisecondCounterHiRes();
   const auto elapsed = !force && hasPublishedScope_
                            ? now - publishedScopeTimeMs_ : scopeIntervalMs;
-  if (gpu_ && elapsed < scopeIntervalMs)
+  if (elapsed < scopeIntervalMs)
     return;
-#endif
   const auto revision = processor_.scopeRevision();
   if (!force && hasPublishedScope_ && revision == publishedScopeRevision_)
     return;
   publishedScopeRevision_ = revision;
   hasPublishedScope_ = true;
-#if ONDA_PLUGIN_GPU_UI
-  if (gpu_) {
-    // Keep the capture clock's phase despite jitter in the 60 Hz editor timer.
-    publishedScopeTimeMs_ = now - std::fmod(elapsed, scopeIntervalMs);
-    const auto snapshot = processor_.scopeSnapshot();
-    gpu_->scope(snapshot.channels, snapshot.samples);
-    return;
-  }
-#endif
-  emitState(makeRunViewScope(processor_));
+  // Keep the capture clock's phase despite jitter in the 60 Hz editor timer.
+  publishedScopeTimeMs_ = now - std::fmod(elapsed, scopeIntervalMs);
+  const auto snapshot = processor_.scopeSnapshot();
+  gpu_->scope(snapshot.channels, snapshot.samples);
 }
 
 void Editor::handleCommand(const juce::var &command) {
@@ -784,14 +386,7 @@ void Editor::handleCommand(const juce::var &command) {
     return;
   const auto type = input->getProperty("type").toString();
 
-  if (type == "webviewReady") {
-    viewReady();
-  } else if (type == "runViewReady") {
-    const auto readyId = input->getProperty("readyId");
-    if (browserReady_ && (readyId.isInt() || readyId.isInt64()) &&
-        static_cast<juce::int64>(readyId) == publishedReadyId_)
-      loadingOverlay_.setVisible(false);
-  } else if (type == "viewState") {
+  if (type == "viewState") {
     processor_.setViewState(input->getProperty("state"));
   } else if (type == "midiNote") {
     const auto key = input->getProperty("key");

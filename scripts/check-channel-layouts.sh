@@ -33,7 +33,6 @@ for layout in '2 16 2 1' '0 16 2 32' '1 0 1 32' '4 4 4 64'; do
     -DONDA_PLUGIN_CONTROL_INPUTS="$controls" \
     -DONDA_PLUGIN_OUTPUT_CHANNELS="$outputs" \
     -DONDA_PLUGIN_PARAMETER_SLOTS="$slots" \
-    -DONDA_PLUGIN_BUILD_BROWSER_TESTS=OFF \
     -DONDA_PLUGIN_BUILD_VST3_AUDIT=OFF \
     -DONDA_VST3_VALIDATOR="$validator" \
     -DONDA_SDK_ARCHIVE="${sdk_archive:-$default_build/_deps/onda-$onda_version-linux-x64.tar.xz}" \

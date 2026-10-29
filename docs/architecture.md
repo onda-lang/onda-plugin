@@ -179,57 +179,39 @@ An export captures its image and request generation before background work
 begins. The worker checks both under its mutex before relinking; a newer user
 request leaves the exported files intact without changing the current project.
 
-`RunViewHost` owns embedded-resource routing and projection of processor state
-into the shared view's host-message schema. `Editor` owns the native browser
-lifetime, periodic publication, and command routing. Processor tests
-exercise the editor lifecycle through JUCE's real browser component; resource
-bytes and capability state are tested directly through `RunViewHost`.
-After the initial schema, parameter and input-control value changes publish a
-`parameterValues` message containing only names, normalized values, and any
-exact plain defaults. The bridge converts values through the existing domains;
-the shared view updates its existing bindings without rendering other sections.
+`RunViewHost` projects processor state into the shared UI's message schema.
+`Editor` owns the native `GpuView`, periodic publication, and command routing.
+`GpuView` loads the bundled `onda_ui` library, attaches its GPU surface to the
+JUCE native peer, and forwards pointer, keyboard, text, and file-drop input.
+The UI owns layout, rendering, interaction, and numeric drafts; the plugin owns
+DAW automation, file access, and DSP. Native tests exercise UI-to-DSP edits,
+automation, reopening, and exported editor attachment.
+
+After the initial schema, parameter and input-control changes publish a
+`parameterValues` message. `GpuView` converts normalized host values to plain
+values using the same domain metadata as the controls. Exact `i64` values cross
+the C boundary as decimal text. Unedited focus changes retain stored values;
+user edits apply the control domain before normalized host conversion.
 Worker, routing, settings, and restored-view changes still publish full state.
-The editor accepts native source/project drops and keeps their original paths
-for imports and live reload. Build copies of JUCE forward macOS webview drops
-and GTK subprocess drops to the browser's `FileDragAndDropTarget`. The GTK IPC
-decoder and JavaScriptCore callbacks read UTF-8 explicitly so filenames survive
-both directions of the subprocess boundary.
-Windows accepts DOM file drops through WebView2's additional-object messages,
-then reads their native `ICoreWebView2File` paths.
-Native drag positions and paths reach the shared buffer view as `bufferFileDrag`
-messages. It highlights the card under the cursor and emits `bindBufferFile`
-on a single supported audio or `.ondabuffer` drop. The editor validates the
-named buffer and absolute file path before using the same binding path as the
-file picker. Both use extensions from the registered audio decoders. A build
-adaptation makes the pinned buffer view delegate its format policy to the host,
-which receives that same extension list from native code.
-The shared run view, buffer cards, and number widget are embedded directly from
-the pinned Onda release sources; their fixes and behavior live upstream. Host publications
-and unedited blur retain plain values without applying the editor's range or
-step grid. Exact `i64` defaults cross
-the bridge as decimal text, preserving all 64 bits through display and focus.
-User edits still apply the control domain before normalized host conversion.
-Device-popover queries check selector support because REAPER's embedded WebKit
-can disable popovers. Unavailable device panels are hidden in their entirety,
-so an inert popover cannot appear as an empty floating panel. Layout toggle
-buttons center their labels explicitly, including when text exceeds the padded
-content width.
-Numeric fields display decimal dots independently of regional settings, while
-retaining native arithmetic for arrow-key steps and editing constraints.
-Worker failures are reported explicitly, independently of their status text.
-Waiting and retrying states leave the view's error empty, so restoration retains
-saved event arguments until their compiled schema arrives.
-The browser bridge ends DAW parameter gestures when a control is removed,
-its metadata changes, or another program is selected. Cancellation sends an
-`endParamGesture` command without writing a value; ordinary host automation
-updates retain ongoing gestures.
-Windows explicitly uses WebView2 with a writable per-user data folder, and its
-editor lifecycle test requires the native browser's ready handshake.
-The editor publishes its initial state on `webviewReady` and keeps the loading
-overlay until the shared view responds with `runViewReady`, after rendering the
-host state and restoring saved controls and the document scroll position.
-Each restore carries a `readyId` so an acknowledgment from an older render
-cannot uncover a newer one.
+
+Native source/project drops preserve original paths for imports and live reload.
+Buffer drops use the shared renderer's hit testing and highlights. The editor
+validates the named buffer and absolute path before using the same binding path
+as the file picker. Supported extensions come from the registered audio decoders.
+The Linux JUCE file-drop adaptation preserves XDND coordinates and Unicode paths.
+
+The shared UI ends DAW parameter gestures when a control is removed, its metadata
+changes, or another program is selected. Cancellation sends `endParamGesture`
+without writing a value; host automation retains ongoing gestures. Text input
+uses JUCE's native input interface with shared drafts, selection, and caret
+geometry. Unused keys return to the DAW, which owns computer-keyboard MIDI.
+
+Worker failures are reported independently of status text. Waiting and retrying
+states leave the error empty so restoration retains saved event arguments until
+their compiled schema arrives. The editor publishes state when the GPU surface
+is ready and removes its loading overlay after initialization. Each restore
+carries a `readyId` so reparenting or restoring a session reapplies saved
+controls and scroll even when the source has not changed.
 
 The view lists user-defined events but omits the canonical `plugin_midi` and
 `plugin_host` families, which the host drives. The host consumes Onda's
@@ -261,11 +243,11 @@ failed reload. This preserves the matching checkpoint even if adoption overlaps
 another build. Snapshot copying and destruction stay off the audio thread.
 
 Ordinary view updates send event defaults as metadata without overwriting the
-arguments edited in the browser. A new engine generation initializes the
+arguments edited in the UI. A new engine generation initializes the
 arguments; the explicit argument-reset command restores their defaults. Both
 send the shared view's `resetEventArguments` state flag, so even an incomplete
 draft is discarded when the canonical value has not changed. Unchanged event
-controls retain their DOM nodes, focus, and caret across ordinary updates.
+controls retain their focus and caret across ordinary updates.
 Focused numeric parameter fields retain their drafts until commit or blur;
 leaving a field without committing reconciles the latest host value.
 Log history is included only when its revision changes or a full view refresh
@@ -274,8 +256,8 @@ is requested, so parameter automation does not repeatedly serialize old logs.
 Editor dimensions and the parameter-control layout are processor-owned UI
 state. Changes notify the host that non-parameter state is dirty, are serialized
 with the project, and are restored before a recreated editor installs its size
-constraints. The browser bridge projects the saved layout into the shared view
-instead of relying on webview-local storage. Coherent project-image publication,
+constraints. The native adapter projects the saved layout into the shared view
+from processor-owned session state. Coherent project-image publication,
 buffer changes, export relinking, and unload also notify the host that saved
 state changed. Identical recompilation and initial host-state restoration do not
 mark the host dirty. Project-state notifications are delivered by the
@@ -285,7 +267,7 @@ The shared view reports its page and log scroll positions, keyboard octave and
 velocity, section and argument folds, and event argument drafts as one bounded
 snapshot.
 The processor retains that snapshot per plugin instance, serializes it with the
-project, and includes it with the first state sent to each recreated browser or
+project, and includes it with the first state sent to each recreated view or
 after a host state restore in an open editor.
 Event values are matched to their source path and argument schema when restored;
 audio parameters remain owned by the processor and host automation.
@@ -313,10 +295,9 @@ While an editor is showing, the callback writes interleaved output into a bounde
 lock-free scope ring owned by `Processor`. Reset generations avoid a
 read-modify-write in steady-state processing, and the editor only snapshots
 and publishes the scope after its frame revision changes. The snapshot uses its
-newest 1,024 frames at 20 Hz and publishes them through the shared view's
-separate `scopeData` message. Capturing is disabled when the editor closes or
+newest 1,024 frames at 30 Hz and sends them directly to the GPU adapter. Capturing is disabled when the editor closes or
 JUCE reports it hidden. The callback never allocates, locks, or interacts with
-the browser.
+the UI.
 
 Host note-on/off state is retained per MIDI channel in atomic bitsets and
 published separately as `midiActivity`. Notes remain lit while any host channel holds the corresponding key.

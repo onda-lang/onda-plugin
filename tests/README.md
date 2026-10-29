@@ -13,9 +13,9 @@ ctest --test-dir build -C Release --output-on-failure -L '^(core|native)$'
 Native editor checks require a desktop. Linux CI supplies an X11 display with
 `xvfb-run -a`; a local desktop also works. The processor executable uses
 `juce_add_console_app` for the Windows console entry point and normal JUCE
-message-loop and WebKit subprocess startup.
+message-loop startup.
 
-With `ONDA_PLUGIN_GPU_UI=ON`, `onda_gpu_editor_tests` closes a real GPU editor
+`onda_gpu_editor_tests` closes a real GPU editor
 with an unfinished smoothing edit, including after a host error, and verifies
 that teardown commits the draft while editor command handlers remain alive.
 It also verifies that repeated hidden timer ticks send no additional UI input
@@ -44,8 +44,7 @@ and, for `--nautilus`, Nautilus and `dbus-run-session`.
 | CTest label | Placement and purpose |
 | --- | --- |
 | `core` | All three toolchains: deterministic C++ DSP, state, automation and worker behavior; examples; exported VST3 behavior and protocol validation. |
-| `native` | All three platforms: filesystem notifications, native browser readiness and UI-to-DSP communication, and exported editor attachment/removal. |
-| `browser` | Manual Linux CI or local checks: the injected bridge and detailed DOM behavior in pinned Playwright/Chromium. |
+| `native` | All three platforms: filesystem notifications, native GPU readiness and UI-to-DSP communication, and exported editor attachment/removal. |
 | `audit` | Manual Linux CI or local Linux checks: exported callback interception, gated by the auditor's positive self-tests. |
 | `extended` | Manual CI or local checks: ancestor moves and symlink permutations on Linux/macOS; concurrent state/log stress on all three platforms. |
 
@@ -72,9 +71,7 @@ branch, as described in [GitHub's manual workflow documentation](https://docs.gi
 
 | Test selection | Platforms | Work performed |
 | --- | --- | --- |
-| `browser-audit` (default) | `linux-x64` | Browser and exported callback audit checks, sharing one plugin build. |
-| `browser` | `linux-x64` | Browser checks; skips plugin compilation. |
-| `audit` | `linux-x64` | Exported callback audit and its instrumentation self-tests. |
+| `audit` (default) | `linux-x64` | Exported callback audit and its instrumentation self-tests. |
 | `extended` | Any one platform, or `all` | Extended filesystem and concurrency cases. |
 | `channels` | `linux-x64` | Builds and validates four additional channel/parameter configurations; skips the default plugin build. |
 | `all` | Any one platform, or `all` | All applicable optional checks; Linux includes the four custom builds. |
@@ -82,7 +79,7 @@ branch, as described in [GitHub's manual workflow documentation](https://docs.gi
 The default platform is `linux-x64`. Unsupported test/platform combinations fail
 before dependencies are installed or plugins are built. Validator tooling is
 built only for release runs and Linux channel checks. Failures retain CTest logs,
-browser diagnostics and Windows test executables where available.
+Windows test executables where available.
 
 For example, to check the Windows test changes on `main`:
 
@@ -93,15 +90,6 @@ gh workflow run release.yml --ref main \
 
 Here `--ref main` selects the workflow definition; `source_ref` selects the
 code and tests to check out. No new version tag or plugin release is needed.
-
-To include the portable browser checks locally:
-
-```sh
-npm ci --prefix tests
-npm exec --prefix tests -- playwright install chromium --only-shell
-cmake -S . -B build -DONDA_PLUGIN_BUILD_BROWSER_TESTS=ON
-ctest --test-dir build --output-on-failure -L '^browser$'
-```
 
 Run extended cases with:
 
@@ -149,7 +137,7 @@ artifacts.
 controls, and events remain published and editable before binding and after
 clearing. Rendered values and the interface survive saving and restoring without
 the source file. `NativeEditor` also loads an unbound-buffer program and edits
-its parameter in the real webview.
+its parameter in the native GPU view.
 
 ## Coverage
 
@@ -159,23 +147,20 @@ its parameter in the real webview.
 | `onda_plugin_tests` | SDK ownership, DSP and MIDI behavior, buffer decoding, portable checkpoints, project export, worker replacement, file watching, and compiler serialization. Extended watcher permutations run separately. |
 | `onda_buffer_cache_tests` | Source/import edits before buffer binding or clearing, and shared buffer-file edits before rebinding. Uses real preparation and DSP with native notifications withheld to make cache invalidation races deterministic, including edits with unchanged size and modification time. |
 | `onda_processor_tests` | Host preparation, state persistence, defaults and automation, block-rate parameter smoothing, notifications, failure recovery, realtime callbacks, logs, scope/event adapters, editor lifecycle, and concurrent instances. |
-| `onda_native_editor_tests` | Both products: actual native browser handshake, visible file picker on fresh startup, visible checkbox edits reaching DSP, retained state on reopening, and exported `IPlugView` platform support, attachment and removal. |
+| `onda_native_editor_tests` | Both products: actual native GPU readiness, source picker on fresh startup, numeric edits reaching DSP, retained state on reopening, and exported `IPlugView` platform support, attachment and removal. |
 | `onda_vst3_smoke` | Built bundles expose expected metadata and parameters, instantiate independently, render through JUCE's VST3 host, and restore a saved program with imports after deleting its original files. Bundle lookup also exercises the Windows layout on other platforms. |
 | `onda_vst3_realtime_audit_tests` | Linux auditor startup, plugin loading, positive allocation/free/mutex detection, allocator semantics, callback budgets, and independent concurrent audit intervals. |
 | `onda_vst3_realtime` | The exported VST3 behavior checks with Linux allocation and mutex interception enabled, after the auditor's own tests pass. |
-| `onda_editor_bridge_tests` | The injected bridge ends cancelled parameter gestures without writing stale values, retains gestures across automation updates, and stamps events with the exact rendered generation. Enabled with browser tests. |
-| `onda_run_view_parameter_tests` | The shipped view and bridge preserve exact defaults across publications and focus/blur, retain focused drafts, clamp edits, render/clear logs, display monitored MIDI notes, and save/restore scroll position. Visible decimals use dots in an Italian document and arrow keys retain numeric stepping. Layout labels stay centered at narrow and wide editor sizes. Startup, loaded controls, resizing and scrolling also work when the webview rejects popover selectors and does not hide popovers automatically. Enabled with browser tests. |
 | VST3 validators | Steinberg's interface/protocol checks for both products. These complement the behavior checked by the smoke host. |
 
-Run bridge tests directly with `node tests/EditorBridgeTests.mjs`.
-Parameter publication tests also exercise the `parameterValues` path through
-the actual bridge, including exact defaults and focused drafts. `NativeEditor`
-requires real editor writes to publish values without replacing buffer cards.
+Parameter publication tests check exact defaults and focused drafts through
+the native adapter. `NativeEditor` requires real GPU edits to reach the DSP and
+retains values across closing and reopening the editor.
 The `EditorGestureCancellation` processor case checks the native command against
 JUCE's actual value and gesture notifications, including cancellation after a
 newer host automation value.
 `StaleEditorEvents` checks that same-name events with a replacement schema
-reject stale or invalid browser generations and accept the current generation.
+reject stale or invalid UI generations and accept the current generation.
 `ClickableMidiKeyboard` also holds a virtual key across replacement, starts a
 new host note, and checks that releasing the old virtual hold preserves it.
 `HostBypass` checks note presses and releases, virtual-key cancellation, audible
@@ -271,7 +256,7 @@ compiler, DSP, or notification implementation.
 
 `MessageThreadDelivery` deliberately does **not** use that helper. It checks that
 the real JUCE timer delivers project changes, parameter defaults, and logs through
-the native message loop, with a deadline. Native WebView2 readiness and asynchronous
+the native message loop, with a deadline. Native GPU readiness and asynchronous
 export completion also wait for their actual completion signals.
 
 For every state-notification assertion:
@@ -368,15 +353,13 @@ the `ControlInputs` processor case alongside the VST3 smoke test and validators.
   C++ allocation/deallocation auditing runs on all platforms; C allocation/free and mutex-lock
   interception use Linux linker wrapping. Passing on macOS or Windows does not
   establish the same interception coverage.
-- Native editor tests wait for the shipped view's readiness acknowledgment and
-  edit a real DOM control through the native bridge. Exported editor tests check
+- Native editor tests wait for the shipped GPU view to initialize and
+  edit a numeric field through the native adapter. Exported editor tests check
   `IPlugView` return values for platform support, attachment, and removal. These
   checks complement each other; VST3 validation does not replace real DAW testing.
   Linux builds guard JUCE's deferred XEmbed resize callback after its embedded
   window is destroyed. The exported editor reopening test exercises this lifetime.
-- Detailed focus/blur and DOM behavior runs in pinned Playwright/Chromium once.
-  It asserts that focus enables editing rather than waiting for OS window focus.
-  Failures retain a screenshot, DOM snapshot and command/scroll diagnostics.
+
 
 `MovedSourceAncestor` is disabled on Windows. Its directory watcher holds open
 handles that can prevent moving a containing folder, even with delete sharing,

@@ -195,13 +195,13 @@ def main():
         relocated = plugins / bundle.name
         shutil.copytree(bundle, relocated)
         if not (relocated / "Contents/Resources/onda_ui/libonda_ui.so").is_file():
-            raise RuntimeError("Build with ONDA_PLUGIN_GPU_UI=ON before running the DAW test")
+            raise RuntimeError("Build the GPU editor before running the DAW test")
         subprocess.run([str(build / "onda_vst3_smoke"), "--preset", str(relocated), str(source), str(root / f"{product}.vstpreset")], check=True)
     configuration = root / "reaper.ini"
     # REAPER appends ~/.vst3 if absent and selects the last duplicate plugin.
     # Keep the relocated test bundles last, ahead of installed Onda versions.
     configuration.write_text(f"[REAPER]\nvstpath=~/.vst3;{plugins}\nloadlastproj=0\nverchk=0\n")
-    environment = {**os.environ, "ONDA_GPU_UI": "1", "ONDA_GPU_REAPER_TEST_DIR": str(root)}
+    environment = {**os.environ, "ONDA_GPU_REAPER_TEST_DIR": str(root)}
     environment.pop("ONDA_GPU_UI_LIBRARY", None)
     if args.file_drops:
         environment["ONDA_GPU_REAPER_DROP_TEST"] = "1"

@@ -311,9 +311,8 @@ void exercise() {
   pump(view);
 }
 } // namespace
-int main(int argc, char **argv) {
+int runTests(int argc, const char *const *argv) {
   try {
-    juce::ScopedJuceInitialiser_GUI gui;
     exerciseKeyboardRouting();
     if (argc == 2 && juce::String(argv[1]) == "--keyboard") {
       std::cout << "GPU keyboard routing passed\n";
@@ -331,4 +330,32 @@ int main(int argc, char **argv) {
     std::cerr << error.what() << '\n';
     return 1;
   }
+}
+
+class GpuUiTestApplication final : public juce::JUCEApplication {
+public:
+  GpuUiTestApplication(int argc, const char *const *argv)
+      : argc_(argc), argv_(argv) {}
+  const juce::String getApplicationName() override { return "Onda GPU UI tests"; }
+  const juce::String getApplicationVersion() override { return "1"; }
+  bool moreThanOneInstanceAllowed() override { return true; }
+  void initialise(const juce::String &) override {
+    setApplicationReturnValue(runTests(argc_, argv_));
+    quit();
+  }
+  void shutdown() override {}
+
+private:
+  int argc_;
+  const char *const *argv_;
+};
+
+int main(int argc, const char **argv) {
+  static const auto testArgc = argc;
+  static const auto testArgv = argv;
+  juce::JUCEApplicationBase::createInstance =
+      []() -> juce::JUCEApplicationBase * {
+    return new GpuUiTestApplication(testArgc, testArgv);
+  };
+  return juce::JUCEApplicationBase::main(argc, argv);
 }

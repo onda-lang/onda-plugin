@@ -1,6 +1,7 @@
 #include "NativeEditorTests.h"
 
 #include "JucePath.h"
+#include "GpuView.h"
 #include "Processor.h"
 #include "ProcessorTestSupport.h"
 #include "TemporaryDirectory.h"
@@ -9,7 +10,6 @@
 #include "Vst3TestSupport.h"
 
 #include <juce_gui_basics/juce_gui_basics.h>
-#include <juce_gui_extra/juce_gui_extra.h>
 
 #include <algorithm>
 #include <chrono>
@@ -46,49 +46,31 @@ private:
   juce::DocumentWindow window_;
 };
 
-std::optional<juce::var> evaluateResult(juce::WebBrowserComponent &browser,
-                                        const juce::String &script) {
-  struct Result {
-    bool complete{};
-    std::optional<juce::var> value;
-    juce::String error;
-  };
-  const auto result = std::make_shared<Result>();
-  browser.evaluateJavascript(script, [result](auto evaluation) {
-    result->complete = true;
-    if (const auto *value = evaluation.getResult())
-      result->value = *value;
-    if (const auto *error = evaluation.getError())
-      result->error = error->message;
-  });
-  if (!test::waitForMessage([&] { return result->complete; }) ||
-      !result->value) {
-    std::cerr << "Native editor script failed: " << result->error << '\n';
-    return std::nullopt;
-  }
-  return result->value;
-}
-
-bool evaluate(juce::WebBrowserComponent &browser, const juce::String &script,
-              const bool expected) {
-  const auto result = evaluateResult(browser, script);
-  return result && result->isBool() && static_cast<bool>(*result) == expected;
-}
-
-juce::WebBrowserComponent *readyBrowser(juce::AudioProcessorEditor &editor) {
+onda::plugin::GpuView *readyGpu(juce::AudioProcessorEditor &editor) {
   const auto *overlay = dynamic_cast<juce::Label *>(
       editor.findChildWithID("onda-loading-overlay"));
   if (!overlay || !test::waitForMessage([&] { return !overlay->isVisible(); },
                                         std::chrono::seconds(30))) {
-    std::cerr << "Native editor did not acknowledge its initial state: "
-              << (overlay ? overlay->getText() : "missing loading overlay")
-              << '\n';
+    std::cerr << "Native GPU editor did not initialize: "
+              << (overlay ? overlay->getText() : "missing loading overlay") << '\n';
     return nullptr;
   }
   for (auto *child : editor.getChildren())
-    if (auto *browser = dynamic_cast<juce::WebBrowserComponent *>(child))
-      return browser;
+    if (auto *view = dynamic_cast<onda::plugin::GpuView *>(child))
+      return view;
   return nullptr;
+}
+
+bool focusLevel(onda::plugin::GpuView &view, const char *expected) {
+  view.keyPressed(juce::KeyPress(juce::KeyPress::escapeKey));
+  for (int step = 0; step < 32; ++step) {
+    view.keyPressed(juce::KeyPress(juce::KeyPress::tabKey));
+    if (view.isTextInputActive() &&
+        view.getTextInRange({0, view.getTotalNumChars()}) == expected)
+      return true;
+  }
+  std::cerr << "Native GPU editor did not expose the current parameter value\n";
+  return false;
 }
 
 } // namespace
@@ -100,10 +82,10 @@ bool exerciseNativeEditor() {
   if (!source.replaceWithText(R"(
 outs { out1 }
 buffers { clip: buffer<f32>, spare: buffer<f32> }
-params { enabled = false }
+params { level = 0.25 {0.0, 1.0} }
 event note_on(id: i32, channel: i32, key: i32, velocity: f32) {}
 event note_off(id: i32, channel: i32, key: i32, velocity: f32) {}
-sample { if enabled { out1 = 1.0 + clip[0] + spare[0] } else { out1 = 0.0 } }
+sample { out1 = level + clip[0] + spare[0] }
 )"))
     return false;
 
@@ -112,25 +94,16 @@ sample { if enabled { out1 = 1.0 + clip[0] + spare[0] } else { out1 = 0.0 } }
     processor.setNonRealtime(true);
     {
       EditorWindow host(processor);
-      auto *browser = readyBrowser(host.editor());
-      if (!browser || !evaluate(*browser, R"(
-        (() => {
-          const picker = document.querySelector('#file-picker');
-          const button = document.querySelector('#choose-onda-file');
-          return !document.documentElement.hasAttribute('data-run-view-pending')
-            && picker !== null && !picker.hidden
-            && getComputedStyle(picker).visibility === 'visible'
-            && button !== null && !button.disabled
-            && button.getBoundingClientRect().width > 0;
-        })()
-      )",
-                                true))
+      if (!readyGpu(host.editor()))
         return false;
     }
     processor.loadFile(source);
     processor.prepareToPlay(48'000.0, 64);
-    if (!processor.workerStatus().active)
+    if (!processor.workerStatus().active) {
+      std::cerr << "Native editor fixture did not compile: "
+                << processor.workerStatus().message << '\n';
       return false;
+    }
     juce::AudioBuffer<float> audio(
         std::max(pluginInputChannels, pluginOutputChannels), 64);
     juce::MidiBuffer midi;
@@ -139,89 +112,35 @@ sample { if enabled { out1 = 1.0 + clip[0] + spare[0] } else { out1 = 0.0 } }
       processor.processBlock(audio, midi);
       return std::all_of(audio.getReadPointer(0), audio.getReadPointer(0) + 64,
                          [&](float value) {
-                           return test::withinTolerance(value - expected,
-                                                        1.0e-6F);
+                           return test::withinTolerance(value - expected, 1.0e-6F);
                          });
     };
     for (const auto reopened : {false, true}) {
       EditorWindow host(processor);
-      auto &editor = host.editor();
-      if (!editor.getPeer() || !editor.getPeer()->getNativeHandle()) {
-        std::cerr
-            << "Native editor test host could not create a desktop window\n";
+      auto *view = readyGpu(host.editor());
+      if (!view)
+        return false;
+      if (!test::waitForMessage([&] { return renders(reopened ? 0.75F : 0.25F); })) {
+        std::cerr << "Native editor did not retain its parameter value\n";
         return false;
       }
-      auto *browser = readyBrowser(editor);
-      if (!browser)
+      if (!focusLevel(*view, reopened ? "0.75" : "0.25"))
         return false;
-      if (!renders(reopened ? 1.0F : 0.0F)) {
-        std::cerr << "Native editor started with incorrect DSP state\n";
-        return false;
-      }
-      if (!evaluate(*browser, R"(
-        (() => {
-          if (document.querySelector('#settings-popover').getClientRects().length)
-            throw new Error('Unavailable device panel is visible');
-          if (document.querySelector('#params-section [data-param-layout="knobs"]')
-                .getAttribute('data-pressed') !== 'true')
-            throw new Error('Params must default to knobs');
-          const buffers = document.querySelector('#buffers-section');
-          if (getComputedStyle(buffers).display === 'none'
-              || !document.querySelector('#buffers button'))
-            throw new Error('Unbound buffer picker is missing');
-          for (const button of document.querySelectorAll('#params-section [data-param-layout]')) {
-            const box = button.getBoundingClientRect();
-            const range = document.createRange();
-            range.selectNodeContents(button);
-            const text = range.getBoundingClientRect();
-            if (Math.abs(text.left + text.right - box.left - box.right) > 1)
-              throw new Error(button.textContent + ' layout label is not centered');
-          }
-          const input = document.querySelector('#params input[type=checkbox]');
-          if (!input || input.disabled) throw new Error('Missing editable checkbox');
-          if (getComputedStyle(input).visibility !== 'visible'
-              || input.getBoundingClientRect().width <= 0)
-            throw new Error('Checkbox is not visible');
-          window.__parameterUpdates = 0;
-          window.__bufferCard = document.querySelector('.buffer-card');
-          window.__JUCE__.backend.addEventListener('ondaState', message => {
-            if (message.type === 'parameterValues') ++window.__parameterUpdates;
-          });
-          const checked = input.checked;
-          input.click();
-          return checked;
-        })()
-      )",
-                    reopened))
-        return false;
-      const auto expected = reopened ? 0.0F : 1.0F;
+      view->insertTextAtCaret(reopened ? "0.25" : "0.75");
+      view->keyPressed(juce::KeyPress(juce::KeyPress::returnKey));
+      const auto expected = reopened ? 0.25F : 0.75F;
       if (!test::waitForMessage([&] { return renders(expected); })) {
-        std::cerr << "Native editor edit did not reach DSP\n";
-        return false;
-      }
-      if (!test::waitForMessage([&] {
-            return evaluate(*browser, R"(
-              window.__parameterUpdates > 0
-                && document.querySelector('.buffer-card') === window.__bufferCard
-            )",
-                            true);
-          })) {
-        std::cerr << "Native parameter edit did not use the values-only "
-                     "publication\n";
+        std::cerr << "Native GPU parameter edit did not reach DSP\n";
         return false;
       }
       for (const auto value : {1.0F - expected, expected}) {
         processor.getParameters()[0]->setValue(value);
+        test::dispatchMessages();
         if (!test::waitForMessage([&] {
-              return evaluate(*browser, R"(
-                document.querySelector('#params input[type=checkbox]').checked
-              )",
-                              value > 0.5F);
-            })) {
-          std::cerr
-              << "Host parameter change did not reach the native editor\n";
+              return focusLevel(*view, value > 0.5F ? "0.75" : "0.25");
+            }))
           return false;
-        }
+        view->keyPressed(juce::KeyPress(juce::KeyPress::escapeKey));
       }
     }
     processor.releaseResources();

@@ -110,19 +110,19 @@ files are unavailable when reopening it, the plugin restores the saved version.
 
 ## Build
 
-An experimental native Rust/wgpu editor is available in development builds.
-Build Onda's `onda_ui` crate with `cargo build --release -p onda_ui --features ffi`,
-then configure this project with `ONDA_PLUGIN_GPU_UI=ON`,
-`ONDA_DEVELOPMENT_SOURCE_DIR=/path/to/onda`, and
-`ONDA_GPU_UI_LIBRARY=/path/to/onda/target/release/libonda_ui.so` (or `.dylib`/`.dll`).
-Launch the DAW with `ONDA_GPU_UI=1` to use it. GPU-enabled builds copy the library
-and font license into each VST3 bundle's `Contents/Resources/onda_ui` directory;
-the editor resolves that location relative to its own plugin module. Bundles can
-be moved without keeping the checkout at its original path. `ONDA_GPU_UI_LIBRARY`
-provides an explicit development override. The shared renderer covers parameters,
-input controls, buffers/waveforms, typed events, logs, MIDI, and setup, with a
-collapsible scope. Native Run and the VS Code GPU panel use the same views.
-IME composition remains unfinished.
+The editor uses Onda's shared native Rust/wgpu renderer. The Onda SDK must
+include `onda_ui.h` and the `onda_ui` shared library. Until a release SDK includes
+these artifacts, use the development checkout configuration below. Each VST3 bundle carries
+the library and font licenses in `Contents/Resources/onda_ui`; the editor
+resolves that location relative to its own plugin module so bundles can move.
+
+For development, build Onda with
+`cargo build --release -p onda_api -p onda_ui --features onda_ui/ffi`, then
+configure this project with `ONDA_DEVELOPMENT_SOURCE_DIR=/path/to/onda`.
+`ONDA_GPU_UI_LIBRARY` optionally overrides the native UI library path at build
+or run time. The shared screen covers parameters, input controls,
+buffers/waveforms, typed events, logs, MIDI, and setup, with a collapsible scope.
+
 Run the `onda_gpu_ui_tests` CTest target on a desktop to verify the native adapter.
 On Linux, `xvfb-run -a python3 scripts/test-gpu-reaper.py build` checks both
 relocated bundles inside REAPER, including native parameter input, host automation,
@@ -136,7 +136,8 @@ printed artifact directory.
 Requirements:
 
 - CMake 3.22+, Ninja, and a C++20 compiler
-- Linux editor builds: GTK 3 and WebKitGTK 4.1 development packages
+- Linux editor builds: X11, Fontconfig, FreeType, and ALSA development packages;
+  a Vulkan driver for GPU rendering
 
 Configure and build the plugins:
 
@@ -152,7 +153,7 @@ ctest --test-dir build --output-on-failure -L '^(core|native)$'
 ```
 
 Native editor tests require a desktop; Linux CI uses `xvfb-run -a`.
-See [test placement and browser setup](tests/README.md) for manual CI and local checks.
+See [test placement and native editor setup](tests/README.md) for manual CI and local checks.
 
 Custom builds can change the fixed input, control, output, and parameter-slot counts:
 

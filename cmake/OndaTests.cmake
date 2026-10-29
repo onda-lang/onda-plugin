@@ -6,19 +6,20 @@ function(onda_add_test name group)
 endfunction()
 
 find_package(Threads REQUIRED)
-if(ONDA_PLUGIN_GPU_UI)
-    add_executable(onda_gpu_ui_tests tests/GpuViewTests.cpp src/GpuView.cpp src/GpuTextInput.cpp)
-    target_compile_features(onda_gpu_ui_tests PRIVATE cxx_std_20)
-    target_include_directories(onda_gpu_ui_tests PRIVATE src "${ONDA_RELEASE_SOURCE_DIR}/include")
-    target_compile_definitions(onda_gpu_ui_tests PRIVATE JUCE_MODAL_LOOPS_PERMITTED=1 JUCE_USE_CURL=0
-        ONDA_GPU_UI_LIBRARY_NAME="${ONDA_GPU_UI_LIBRARY_NAME}"
-        ONDA_GPU_UI_FIXTURE="${ONDA_RELEASE_SOURCE_DIR}/ui/gpu/fixtures/panels.json")
-    target_link_libraries(onda_gpu_ui_tests PRIVATE juce::juce_gui_basics juce::juce_recommended_config_flags)
-    onda_add_test(onda_gpu_ui_tests native onda_gpu_ui_tests)
-    onda_add_test(onda_gpu_keyboard_tests core onda_gpu_ui_tests --keyboard)
-    set_tests_properties(onda_gpu_ui_tests PROPERTIES
-        ENVIRONMENT "ONDA_GPU_UI_LIBRARY=${ONDA_GPU_UI_LIBRARY}")
-endif()
+juce_add_console_app(onda_gpu_ui_tests)
+set_target_properties(onda_gpu_ui_tests PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}")
+target_sources(onda_gpu_ui_tests PRIVATE tests/GpuViewTests.cpp src/GpuView.cpp src/GpuTextInput.cpp)
+target_compile_features(onda_gpu_ui_tests PRIVATE cxx_std_20)
+target_include_directories(onda_gpu_ui_tests PRIVATE src "${ONDA_SDK_ROOT}/include")
+target_compile_definitions(onda_gpu_ui_tests PRIVATE JUCE_MODAL_LOOPS_PERMITTED=1 JUCE_USE_CURL=0
+    ONDA_GPU_UI_LIBRARY_NAME="${ONDA_GPU_UI_LIBRARY_NAME}"
+    ONDA_GPU_UI_FIXTURE="${ONDA_RELEASE_SOURCE_DIR}/ui/gpu/fixtures/panels.json")
+target_link_libraries(onda_gpu_ui_tests PRIVATE juce::juce_gui_basics juce::juce_recommended_config_flags)
+onda_add_test(onda_gpu_ui_tests native onda_gpu_ui_tests)
+onda_add_test(onda_gpu_keyboard_tests core onda_gpu_ui_tests --keyboard)
+set_tests_properties(onda_gpu_ui_tests PROPERTIES
+    ENVIRONMENT "ONDA_GPU_UI_LIBRARY=${ONDA_GPU_UI_LIBRARY}")
 add_executable(onda_watcher_tests tests/FilesystemWatcherTests.cpp src/FilesystemWatcher.cpp)
 target_compile_features(onda_watcher_tests PRIVATE cxx_std_20)
 target_include_directories(onda_watcher_tests PRIVATE src)
@@ -30,19 +31,6 @@ else()
         -Wall -Wextra -Wpedantic -Wconversion -Wsign-conversion)
 endif()
 onda_add_test(onda_watcher_tests native onda_watcher_tests)
-
-if(ONDA_PLUGIN_BUILD_BROWSER_TESTS)
-    find_program(ONDA_NODE_EXECUTABLE NAMES node nodejs REQUIRED)
-    onda_add_test(onda_editor_bridge_tests browser
-        "${ONDA_NODE_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/EditorBridgeTests.mjs")
-    onda_add_test(onda_run_view_parameter_tests browser
-        "${ONDA_NODE_EXECUTABLE}"
-        "${CMAKE_CURRENT_SOURCE_DIR}/tests/RunViewParameterTests.mjs"
-        "${ONDA_RELEASE_SOURCE_DIR}/ui/run/run.html"
-        "${ONDA_RELEASE_SOURCE_DIR}/ui/number-input.js"
-        "${ONDA_RELEASE_SOURCE_DIR}/packages/onda_processor_abi/src/param-control.js"
-        "${onda_buffers_script}")
-endif()
 
 add_executable(onda_example_tests tests/ExampleTests.cpp)
 target_compile_features(onda_example_tests PRIVATE cxx_std_20)
@@ -135,55 +123,43 @@ target_sources(onda_processor_tests PRIVATE
     src/SpscQueue.h
 )
 target_compile_features(onda_processor_tests PRIVATE cxx_std_20)
-if(ONDA_PLUGIN_GPU_UI)
-    target_sources(onda_processor_tests PRIVATE tests/GpuEditorTests.cpp
-        src/GpuView.cpp src/GpuTextInput.cpp)
-    target_include_directories(onda_processor_tests PRIVATE "${ONDA_RELEASE_SOURCE_DIR}/include")
-    target_compile_definitions(onda_processor_tests PRIVATE ONDA_PLUGIN_GPU_UI=1
-        ONDA_GPU_UI_LIBRARY_NAME="${ONDA_GPU_UI_LIBRARY_NAME}")
-    onda_add_test(onda_gpu_editor_tests native onda_processor_tests --group gpu)
-    set_tests_properties(onda_gpu_editor_tests PROPERTIES
-        ENVIRONMENT "ONDA_GPU_UI=1;ONDA_GPU_UI_LIBRARY=${ONDA_GPU_UI_LIBRARY}")
-endif()
+target_sources(onda_processor_tests PRIVATE tests/GpuEditorTests.cpp
+    src/GpuView.cpp src/GpuTextInput.cpp)
+target_include_directories(onda_processor_tests PRIVATE "${ONDA_SDK_ROOT}/include")
+target_compile_definitions(onda_processor_tests PRIVATE
+    ONDA_GPU_UI_LIBRARY_NAME="${ONDA_GPU_UI_LIBRARY_NAME}")
+onda_add_test(onda_gpu_editor_tests native onda_processor_tests --group gpu)
+set_tests_properties(onda_gpu_editor_tests PROPERTIES
+    ENVIRONMENT "ONDA_GPU_UI_LIBRARY=${ONDA_GPU_UI_LIBRARY}")
 if(NOT MSVC)
     set_source_files_properties(tests/RealtimeAuditTests.cpp PROPERTIES
         COMPILE_OPTIONS "-fno-builtin;$<$<CXX_COMPILER_ID:Clang,AppleClang>:-fsized-deallocation>")
 endif()
 target_link_libraries(onda_processor_tests PRIVATE
     onda_plugin_engine
-    onda_run_resources
     juce::juce_audio_processors
-    juce::juce_gui_extra
     juce::juce_recommended_config_flags
     juce::juce_recommended_warning_flags
 )
 onda_treat_juce_headers_as_system(onda_processor_tests)
 target_compile_definitions(onda_processor_tests PRIVATE
-    JUCE_WEB_BROWSER=1
+    JUCE_WEB_BROWSER=0
     JUCE_PLUGINHOST_VST3=1
     JUCE_PLUGINHOST_VST=0
     JUCE_PLUGINHOST_AU=0
     ONDA_TEST_SYNTH_MODULE="$<TARGET_FILE:OndaSynth_VST3>"
     ONDA_TEST_EFFECT_MODULE="$<TARGET_FILE:OndaFX_VST3>"
     JUCE_USE_CURL=0
-    JUCE_USE_EXTERNAL_TEMPORARY_SUBPROCESS=1
     JUCE_MODAL_LOOPS_PERMITTED=1
     JUCE_VST3_CAN_REPLACE_VST2=0
-    JUCE_USE_WIN_WEBVIEW2_WITH_STATIC_LINKING=1
 )
-if(WIN32)
-    target_link_libraries(onda_processor_tests PRIVATE juce::juce_webview2)
-endif()
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-    target_link_libraries(onda_processor_tests PRIVATE
-        juce::pkgconfig_JUCE_BROWSER_LINUX_DEPS)
     target_link_options(onda_processor_tests PRIVATE
         "-Wl,--wrap=pthread_mutex_lock"
         "-Wl,--wrap=malloc,--wrap=calloc,--wrap=realloc,--wrap=free"
         "-Wl,--wrap=aligned_alloc,--wrap=posix_memalign,--wrap=memalign,--wrap=valloc,--wrap=pvalloc"
         "-Wl,--wrap=reallocarray,--wrap=strdup,--wrap=strndup"
         "-Wl,--wrap=free_sized,--wrap=free_aligned_sized")
-    juce_link_with_embedded_linux_subprocess(onda_processor_tests)
 endif()
 if(MSVC)
     target_compile_options(onda_processor_tests PRIVATE /W4 /permissive-)
@@ -201,6 +177,8 @@ if(ONDA_PLUGIN_INPUT_CHANNELS EQUAL 2 AND
         ONDA_PLUGIN_OUTPUT_CHANNELS EQUAL 2)
     onda_add_test(onda_processor_tests core onda_processor_tests --group core)
     onda_add_test(onda_native_editor_tests native onda_processor_tests --group native)
+    set_tests_properties(onda_native_editor_tests PROPERTIES
+        ENVIRONMENT "ONDA_GPU_UI_LIBRARY=${ONDA_GPU_UI_LIBRARY}")
     onda_add_test(onda_processor_stress_tests extended onda_processor_tests --group extended)
 else()
     onda_add_test(onda_realtime_audit_instrumentation_tests core onda_processor_tests RealtimeAuditInstrumentation)
