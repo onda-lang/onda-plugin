@@ -1,0 +1,388 @@
+name: Build and package Onda VST3
+
+on:
+  workflow_call:
+    inputs:
+      source_ref:
+        description: Plugin source commit, branch, or tag
+        required: true
+        type: string
+      tests:
+        description: package, audit, extended, channels, or all
+        type: string
+        default: package
+      platform:
+        type: string
+        default: all
+      release_tag:
+        type: string
+        default: ''
+      onda_source_ref:
+        description: Onda commit supplying SDK artifacts in the calling run; empty uses a release
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  MACOSX_DEPLOYMENT_TARGET: "14.0"
+
+jobs:
+  build:
+    name: ${{ matrix.platform }}
+    runs-on: ${{ matrix.platform == 'linux-x64' && 'ubuntu-24.04' || matrix.platform == 'windows-x64' && 'windows-latest' || 'macos-latest' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: ${{ fromJSON((inputs.platform == 'all') && '["linux-x64","windows-x64","macos-arm64"]' || format('["{0}"]', inputs.platform)) }}
+
+    env:
+      BUILD_PATH: ${{ github.workspace }}/build
+
+    steps:
+      - name: Select tests
+        id: tests
+        shell: bash
+        env:
+          TEST_SELECTION: ${{ inputs.tests }}
+          SOURCE_REF: ${{ inputs.source_ref }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          TARGET_PLATFORM: ${{ inputs.platform }}
+        run: |
+          if ! git check-ref-format --allow-onelevel "$SOURCE_REF"; then
+            echo "expected a source tag, branch, or full commit SHA, got $SOURCE_REF" >&2
+            exit 1
+          fi
+          if [[ -n "$RELEASE_TAG" && ! "$RELEASE_TAG" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "expected a version tag, got $RELEASE_TAG" >&2
+            exit 1
+          fi
+          case "$TARGET_PLATFORM" in
+            linux-x64|windows-x64|macos-arm64|all) ;;
+            *) echo "unknown platform: $TARGET_PLATFORM" >&2; exit 1 ;;
+          esac
+
+          audit=false
+          extended=false
+          channels=false
+          build=false
+          validator=false
+          labels=''
+          targets=()
+          case "$TEST_SELECTION" in
+            package) labels='core|native'; build=true; validator=true ;;
+            audit) audit=true ;;
+            extended) extended=true ;;
+            channels) channels=true ;;
+            all) audit=true; extended=true; channels=true ;;
+            *) echo "unknown test selection: $TEST_SELECTION" >&2; exit 1 ;;
+          esac
+
+          if [[ "$TEST_SELECTION" != package ]]; then
+            if [[ "$TARGET_PLATFORM" != linux-x64 && "$TEST_SELECTION" != extended && "$TEST_SELECTION" != all ]]; then
+              echo "$TEST_SELECTION requires platform linux-x64; use extended or all for other platforms" >&2
+              exit 1
+            fi
+            if [[ "$RUNNER_OS" != Linux ]]; then
+              audit=false
+              channels=false
+            fi
+            if [[ "$audit" == true ]]; then
+              labels+='audit|'
+              targets+=(onda_vst3_realtime_audit_tests onda_vst3_smoke)
+            fi
+            if [[ "$extended" == true ]]; then
+              labels+='extended|'
+              targets+=(onda_plugin_tests onda_processor_tests)
+            fi
+            labels="${labels%|}"
+            validator="$channels"
+            if [[ "${#targets[@]}" -gt 0 ]]; then build=true; fi
+          fi
+          if [[ -n "$labels" ]]; then labels="^($labels)$"; fi
+          printf '%s\n' "source_ref=$SOURCE_REF" "release_tag=$RELEASE_TAG" \
+            "audit=$audit" \
+            "channels=$channels" "build=$build" "validator=$validator" \
+            "labels=$labels" "targets=${targets[*]}" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          repository: onda-lang/onda-plugin
+          ref: ${{ steps.tests.outputs.source_ref }}
+
+      - name: Read and validate version
+        id: version
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ steps.tests.outputs.release_tag }}
+          PACKAGE_PLATFORM: ${{ matrix.platform }}
+        run: |
+          version="$(tr -d '\r\n' < plugin-version)"
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "invalid plugin version: $version" >&2
+            exit 1
+          fi
+
+          if [[ -n "$RELEASE_TAG" ]]; then
+            tag_version="${RELEASE_TAG#v}"
+            if [[ "$tag_version" != "$version" ]]; then
+              echo "tag $RELEASE_TAG does not match plugin-version $version" >&2
+              exit 1
+            fi
+          fi
+
+          package_name="Onda-VST3-$version-$PACKAGE_PLATFORM"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "package_name=$package_name" >> "$GITHUB_OUTPUT"
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            pkg-config xvfb xauth \
+            libasound2-dev \
+            libfontconfig1-dev \
+            libfreetype6-dev \
+            libvulkan1 mesa-vulkan-drivers \
+            libx11-dev \
+            libxcomposite-dev \
+            libxcursor-dev \
+            libxext-dev \
+            libxinerama-dev \
+            libxrandr-dev \
+            libxrender-dev
+
+      - name: Checkout VST3 validator SDK
+        if: steps.tests.outputs.validator == 'true'
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          repository: steinbergmedia/vst3sdk
+          ref: 9fad9770f2ae8542ab1a548a68c1ad1ac690abe0 # v3.8.0_build_66
+          path: build-validator-sdk
+          persist-credentials: false
+
+      - name: Build VST3 validator
+        if: steps.tests.outputs.validator == 'true'
+        shell: bash
+        run: |
+          git -C build-validator-sdk submodule update --init --depth 1 \
+            base cmake pluginterfaces public.sdk
+          cmake -S build-validator-sdk -B build-validator \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DSMTG_ENABLE_VST3_PLUGIN_EXAMPLES=OFF \
+            -DSMTG_ENABLE_VST3_HOSTING_EXAMPLES=OFF \
+            -DSMTG_ENABLE_VSTGUI_SUPPORT=OFF
+          cmake --build build-validator --config Release --target validator --parallel 2
+          validator="$GITHUB_WORKSPACE/build-validator/bin/Release/validator"
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            validator="$validator.exe"
+          fi
+          test -f "$validator"
+          echo "ONDA_VST3_VALIDATOR=$validator" >> "$GITHUB_ENV"
+
+      - name: Download unpublished Onda SDK
+        if: inputs.onda_source_ref != ''
+        uses: actions/download-artifact@v7
+        with:
+          name: onda-${{ matrix.platform }}
+          path: .onda-sdk
+
+      - name: Checkout matching Onda resources
+        if: inputs.onda_source_ref != ''
+        uses: actions/checkout@v6
+        with:
+          repository: onda-lang/onda
+          ref: ${{ inputs.onda_source_ref }}
+          path: .onda-source
+
+      - name: Select and verify unpublished SDK provenance
+        if: inputs.onda_source_ref != ''
+        shell: bash
+        env:
+          ONDA_SOURCE_REF: ${{ inputs.onda_source_ref }}
+          SDK_PLATFORM: ${{ matrix.platform }}
+        run: |
+          test "$(cat .onda-sdk/onda-source.txt)" = "$ONDA_SOURCE_REF"
+          test "$(git -C .onda-source rev-parse HEAD)" = "$ONDA_SOURCE_REF"
+          version="$(tr -d '\r\n' < onda-version)"
+          extension=tar.xz
+          if [[ "$RUNNER_OS" == Windows ]]; then extension=zip; fi
+          archive="$GITHUB_WORKSPACE/.onda-sdk/onda-$version-$SDK_PLATFORM.$extension"
+          test -f "$archive"
+          echo "ONDA_SDK_ARCHIVE=$archive" >> "$GITHUB_ENV"
+          echo "ONDA_SDK_CHECKSUMS=$GITHUB_WORKSPACE/.onda-sdk/SHA256SUMS.txt" >> "$GITHUB_ENV"
+          echo "ONDA_RELEASE_SOURCE_DIR=$GITHUB_WORKSPACE/.onda-source" >> "$GITHUB_ENV"
+          echo "ONDA_RELEASE_SOURCE_REVISION=$ONDA_SOURCE_REF" >> "$GITHUB_ENV"
+
+      - name: Configure CMake on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          cmake -S . -B $env:BUILD_PATH -A x64 `
+            "-DONDA_SDK_ARCHIVE=$env:ONDA_SDK_ARCHIVE" `
+            "-DONDA_SDK_CHECKSUMS=$env:ONDA_SDK_CHECKSUMS" `
+            "-DONDA_RELEASE_SOURCE_DIR=$env:ONDA_RELEASE_SOURCE_DIR" `
+            "-DONDA_RELEASE_SOURCE_REVISION=$env:ONDA_RELEASE_SOURCE_REVISION" `
+            "-DONDA_VST3_VALIDATOR=$env:ONDA_VST3_VALIDATOR" `
+            "-DONDA_PLUGIN_BUILD_VST3_AUDIT=OFF"
+
+      - name: Configure CMake on Unix
+        if: runner.os != 'Windows'
+        shell: bash
+        run: >
+          cmake -S . -B "$BUILD_PATH"
+          -DCMAKE_BUILD_TYPE=Release
+          -DONDA_SDK_ARCHIVE="${ONDA_SDK_ARCHIVE:-}"
+          -DONDA_SDK_CHECKSUMS="${ONDA_SDK_CHECKSUMS:-}"
+          -DONDA_RELEASE_SOURCE_DIR="${ONDA_RELEASE_SOURCE_DIR:-}"
+          -DONDA_RELEASE_SOURCE_REVISION="${ONDA_RELEASE_SOURCE_REVISION:-}"
+          -DONDA_VST3_VALIDATOR="${ONDA_VST3_VALIDATOR:-}"
+          -DONDA_PLUGIN_BUILD_VST3_AUDIT=${{ steps.tests.outputs.audit == 'true' && 'ON' || 'OFF' }}
+
+      - name: Build
+        if: steps.tests.outputs.build == 'true'
+        shell: bash
+        env:
+          CMAKE_BUILD_PARALLEL_LEVEL: 2
+          BUILD_TARGETS: ${{ steps.tests.outputs.targets }}
+        run: |
+          read -r -a targets <<< "$BUILD_TARGETS"
+          build_args=()
+          if [[ "${#targets[@]}" -gt 0 ]]; then build_args=(--target "${targets[@]}"); fi
+          cmake --build "$BUILD_PATH" --config Release "${build_args[@]}"
+
+      - name: Test selected groups
+        if: steps.tests.outputs.labels != ''
+        shell: bash
+        env:
+          TEST_LABELS: ${{ steps.tests.outputs.labels }}
+        run: |
+          if [[ "$RUNNER_OS" == "Linux" ]]; then
+            xvfb-run -a ctest --test-dir "$BUILD_PATH" -C Release \
+              --output-on-failure --no-tests=error -L "$TEST_LABELS"
+          else
+            ctest --test-dir "$BUILD_PATH" -C Release \
+              --output-on-failure --no-tests=error -L "$TEST_LABELS"
+          fi
+
+      - name: Test channel layouts
+        if: steps.tests.outputs.channels == 'true'
+        shell: bash
+        run: xvfb-run -a bash scripts/check-channel-layouts.sh "$BUILD_PATH"
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: plugin-tests-${{ matrix.platform }}
+          path: build/Testing/Temporary/*.log
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Upload test failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: test-failure-${{ matrix.platform }}
+          path: |
+            build/Testing/Temporary/
+            build/test-artifacts/
+            build-layout-*/Testing/Temporary/
+            build/Release/onda_plugin_tests.exe
+            build/Release/onda_processor_tests.exe
+            build/Release/*.pdb
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Verify macOS deployment targets
+        if: inputs.tests == 'package' && runner.os == 'macOS'
+        shell: bash
+        run: |
+          bash scripts/check-macos-deployment-target.sh \
+            "$MACOSX_DEPLOYMENT_TARGET" \
+            "$BUILD_PATH/OndaSynth_artefacts/Release/VST3/OndaSynth.vst3/Contents/MacOS/OndaSynth" \
+            "$BUILD_PATH/OndaFX_artefacts/Release/VST3/OndaFX.vst3/Contents/MacOS/OndaFX"
+
+      - name: Package Unix bundles
+        if: inputs.tests == 'package' && runner.os != 'Windows'
+        shell: bash
+        env:
+          PACKAGE_NAME: ${{ steps.version.outputs.package_name }}
+        run: |
+          package_root="$RUNNER_TEMP/$PACKAGE_NAME"
+          archive="$GITHUB_WORKSPACE/dist/$PACKAGE_NAME.zip"
+          mkdir -p "$package_root" "$(dirname "$archive")"
+          cp -R "$BUILD_PATH/OndaSynth_artefacts/Release/VST3/OndaSynth.vst3" "$package_root/"
+          cp -R "$BUILD_PATH/OndaFX_artefacts/Release/VST3/OndaFX.vst3" "$package_root/"
+          cp -R examples "$package_root/"
+          cp README.md LICENSE THIRD_PARTY_NOTICES.md "$package_root/"
+          cp -R "$BUILD_PATH/release-licenses" "$package_root/licenses"
+          if [[ "${{ runner.os }}" == "Linux" ]]; then
+            find "$package_root" -type f -name '*.so' -exec strip --strip-unneeded {} +
+            binary_directory="x86_64-linux"
+            binary_suffix=".so"
+          else
+            binary_directory="MacOS"
+            binary_suffix=""
+          fi
+          "$BUILD_PATH/onda_vst3_smoke" \
+            "$package_root/OndaSynth.vst3/Contents/$binary_directory/OndaSynth$binary_suffix" \
+            "$package_root/OndaFX.vst3/Contents/$binary_directory/OndaFX$binary_suffix"
+          for bundle in "$package_root"/*.vst3; do
+            "$ONDA_VST3_VALIDATOR" -q "$bundle"
+          done
+          cd "$RUNNER_TEMP"
+          cmake -E tar cf "$archive" --format=zip "$PACKAGE_NAME"
+
+      - name: Package Windows bundles
+        if: inputs.tests == 'package' && runner.os == 'Windows'
+        shell: pwsh
+        env:
+          PACKAGE_NAME: ${{ steps.version.outputs.package_name }}
+        run: |
+          $packageRoot = Join-Path $env:RUNNER_TEMP $env:PACKAGE_NAME
+          $distDir = Join-Path $env:GITHUB_WORKSPACE "dist"
+          $archive = Join-Path $distDir ($env:PACKAGE_NAME + ".zip")
+
+          New-Item -ItemType Directory -Force -Path $packageRoot | Out-Null
+          New-Item -ItemType Directory -Force -Path $distDir | Out-Null
+          Copy-Item -Recurse -Force `
+            (Join-Path $env:BUILD_PATH "OndaSynth_artefacts\Release\VST3\OndaSynth.vst3") `
+            $packageRoot
+          Copy-Item -Recurse -Force `
+            (Join-Path $env:BUILD_PATH "OndaFX_artefacts\Release\VST3\OndaFX.vst3") `
+            $packageRoot
+          Copy-Item -Recurse -Force `
+            (Join-Path $env:GITHUB_WORKSPACE "examples") `
+            $packageRoot
+          Copy-Item README.md $packageRoot
+          Copy-Item LICENSE $packageRoot
+          Copy-Item THIRD_PARTY_NOTICES.md $packageRoot
+          Copy-Item -Recurse -Force `
+            (Join-Path $env:BUILD_PATH "release-licenses") `
+            (Join-Path $packageRoot "licenses")
+          & (Join-Path $env:BUILD_PATH "Release/onda_vst3_smoke.exe") `
+            (Join-Path $packageRoot "OndaSynth.vst3/Contents/x86_64-win/OndaSynth.vst3") `
+            (Join-Path $packageRoot "OndaFX.vst3/Contents/x86_64-win/OndaFX.vst3")
+          if ($LASTEXITCODE -ne 0) { throw "Packaged VST3 smoke test failed" }
+          foreach ($bundle in Get-ChildItem $packageRoot -Filter *.vst3) {
+            & $env:ONDA_VST3_VALIDATOR -q $bundle.FullName
+            if ($LASTEXITCODE -ne 0) { throw "Packaged VST3 validation failed" }
+          }
+          Compress-Archive -Path $packageRoot -DestinationPath $archive -Force
+
+      - name: Upload build artifact
+        if: inputs.tests == 'package'
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: ${{ steps.version.outputs.package_name }}
+          path: dist/${{ steps.version.outputs.package_name }}.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+

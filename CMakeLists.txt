@@ -109,6 +109,8 @@ set(ONDA_SDK_CHECKSUMS "" CACHE FILEPATH
     "Optional pre-downloaded SHA256SUMS.txt for the pinned Onda release")
 set(ONDA_RELEASE_SOURCE_DIR "" CACHE PATH
     "Optional checkout of the pinned Onda release, used for GPU fixtures and font licenses")
+set(ONDA_RELEASE_SOURCE_REVISION "" CACHE STRING
+    "Expected Onda resource commit for an unpublished SDK; empty verifies the release tag")
 set(ONDA_DEVELOPMENT_SOURCE_DIR "" CACHE PATH
     "Use a local Onda checkout and its target/release libraries for development")
 set(ONDA_JUCE_ROOT "" CACHE PATH "Optional local JUCE checkout")
@@ -257,8 +259,18 @@ else()
         set(ONDA_RELEASE_SOURCE_DIR "${ondareleasesource_SOURCE_DIR}")
     endif()
 
+    if(ONDA_RELEASE_SOURCE_REVISION)
+        string(LENGTH "${ONDA_RELEASE_SOURCE_REVISION}" onda_revision_length)
+        if(NOT ONDA_RELEASE_SOURCE_REVISION MATCHES "^[0-9a-f]+$"
+                OR NOT onda_revision_length EQUAL 40)
+            message(FATAL_ERROR "ONDA_RELEASE_SOURCE_REVISION must be a full commit SHA")
+        endif()
+        set(onda_resource_ref "${ONDA_RELEASE_SOURCE_REVISION}")
+    else()
+        set(onda_resource_ref "${ONDA_VERSION}")
+    endif()
     execute_process(
-        COMMAND git rev-parse "${ONDA_VERSION}^{commit}"
+        COMMAND git rev-parse "${onda_resource_ref}^{commit}"
         WORKING_DIRECTORY "${ONDA_RELEASE_SOURCE_DIR}"
         OUTPUT_VARIABLE ONDA_RELEASE_TAG_REVISION
         OUTPUT_STRIP_TRAILING_WHITESPACE
@@ -273,7 +285,7 @@ else()
             OR NOT ONDA_RELEASE_HEAD_GIT_RESULT EQUAL 0
             OR NOT ONDA_RELEASE_SOURCE_HEAD STREQUAL ONDA_RELEASE_TAG_REVISION)
         message(FATAL_ERROR
-            "Onda release resources are not at tag ${ONDA_VERSION}: "
+            "Onda resources are not at ${onda_resource_ref}: "
             "got ${ONDA_RELEASE_SOURCE_HEAD}")
     endif()
 

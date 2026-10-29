@@ -174,3 +174,19 @@ Versions are pinned in [plugin-version](plugin-version),
 [onda-version](onda-version), and [juce-version](juce-version).
 See [architecture](docs/architecture.md) and [test documentation](tests/README.md)
 for implementation and validation details.
+
+## Integration builds without a release
+
+Onda's **Build Onda Releases** workflow can call this repository's reusable
+`build.yml` with a pinned plugin commit and unpublished SDK artifacts from the
+same run. It uses the ordinary release build, core/native tests, VST3 validator,
+and packaging steps on Linux x64, Windows x64, and macOS ARM64. The calling run
+retains plugin archives and test logs; this workflow cannot publish releases.
+
+For a local SDK archive, pass `ONDA_SDK_ARCHIVE`, `ONDA_SDK_CHECKSUMS`,
+`ONDA_RELEASE_SOURCE_DIR`, and `ONDA_RELEASE_SOURCE_REVISION` to CMake. The last
+value must be the full Onda commit matching the archive. Without that override,
+resource verification still requires the pinned release tag.
+
+The manual **Build Onda VST3** workflow also accepts `tests=package` to produce
+artifacts from an existing released SDK without publishing a plugin release.
