@@ -111,8 +111,9 @@ files are unavailable when reopening it, the plugin restores the saved version.
 ## Build
 
 The editor uses Onda's shared native Rust/wgpu renderer. The Onda SDK must
-include `onda_ui.h` and the `onda_ui` shared library. Until a release SDK includes
-these artifacts, use the development checkout configuration below. Each VST3 bundle carries
+include `onda_ui.h` and the `onda_ui` shared library. The `onda-version` pin is
+0.9.0; publish that Onda release before building release plugins. For local
+validation, use the development checkout configuration below. Each VST3 bundle carries
 the library and font licenses in `Contents/Resources/onda_ui`; the editor
 resolves that location relative to its own plugin module so bundles can move.
 
