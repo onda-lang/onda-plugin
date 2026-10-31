@@ -6,11 +6,19 @@ function(onda_add_test name group)
 endfunction()
 
 find_package(Threads REQUIRED)
-if(APPLE)
-    onda_add_test(onda_mac_plugin_symbols_tests core
-        bash "${CMAKE_CURRENT_SOURCE_DIR}/tests/MacPluginSymbols.sh"
-        "$<TARGET_FILE:OndaSynth_VST3>" "$<TARGET_FILE:OndaFX_VST3>")
+if(WIN32)
+    get_filename_component(ONDA_LINKER_DIRECTORY "${CMAKE_LINKER}" DIRECTORY)
+    find_program(ONDA_SYMBOL_TOOL NAMES dumpbin
+        HINTS "${ONDA_LINKER_DIRECTORY}" REQUIRED)
+else()
+    set(ONDA_SYMBOL_TOOL "${CMAKE_NM}")
 endif()
+onda_add_test(onda_plugin_symbols_tests core
+    "${CMAKE_COMMAND}" "-DSYSTEM_NAME=${CMAKE_SYSTEM_NAME}"
+    "-DSYMBOL_TOOL=${ONDA_SYMBOL_TOOL}"
+    "-DSYNTH_MODULE=$<TARGET_FILE:OndaSynth_VST3>"
+    "-DFX_MODULE=$<TARGET_FILE:OndaFX_VST3>"
+    -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/PluginSymbols.cmake")
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     onda_add_test(onda_channel_layout_script_tests core
         bash "${CMAKE_CURRENT_SOURCE_DIR}/tests/ChannelLayoutTests.sh")

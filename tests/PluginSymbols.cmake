@@ -1,0 +1,41 @@
+# Inspect the finished modules, including JUCE translation units compiled in
+# different languages. Compiler flags alone cannot guarantee symbol isolation.
+if(SYSTEM_NAME STREQUAL "Darwin")
+    set(arguments -gUj)
+    set(entries _GetPluginFactory _bundleEntry _bundleExit)
+elseif(SYSTEM_NAME STREQUAL "Linux")
+    set(arguments -D --defined-only --format=posix)
+    set(entries GetPluginFactory ModuleEntry ModuleExit)
+elseif(SYSTEM_NAME STREQUAL "Windows")
+    set(arguments /exports)
+    set(entries GetPluginFactory InitDll ExitDll)
+else()
+    message(FATAL_ERROR "Unsupported platform: ${SYSTEM_NAME}")
+endif()
+if(NOT SYMBOL_TOOL OR NOT SYNTH_MODULE OR NOT FX_MODULE)
+    message(FATAL_ERROR "SYMBOL_TOOL, SYNTH_MODULE, and FX_MODULE are required")
+endif()
+
+foreach(module IN ITEMS "${SYNTH_MODULE}" "${FX_MODULE}")
+    execute_process(COMMAND "${SYMBOL_TOOL}" ${arguments} "${module}"
+        RESULT_VARIABLE result OUTPUT_VARIABLE symbols ERROR_VARIABLE errors)
+    if(NOT result STREQUAL "0")
+        message(FATAL_ERROR "Cannot inspect ${module}: ${errors}")
+    endif()
+    foreach(entry IN LISTS entries)
+        if(NOT symbols MATCHES "(^|[ \t\r\n])${entry}([ \t\r\n]|$)")
+            message(FATAL_ERROR "${module} is missing VST3 entry point ${entry}")
+        endif()
+    endforeach()
+
+    # Itanium and MSVC namespace encodings cover JUCE members and template
+    # instantiations containing JUCE types without requiring a demangler.
+    string(REGEX MATCHALL "[^\r\n]*(4juce|@juce@)[^\r\n]*" leaked "${symbols}")
+    if(leaked)
+        list(LENGTH leaked count)
+        list(SUBLIST leaked 0 10 sample)
+        string(JOIN "\n" sample ${sample})
+        message(FATAL_ERROR "${module} exports ${count} private JUCE symbols:\n${sample}")
+    endif()
+    message(STATUS "${module}: VST3 entry points exported; JUCE symbols private")
+endforeach()

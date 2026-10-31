@@ -276,6 +276,40 @@ void exerciseCompositionCancellation() {
           "Canceled composition blocked typing or Enter in the next field");
   }
 }
+void exerciseZeroSizeSuspension() {
+  std::vector<juce::var> commands;
+  Window window;
+  onda::plugin::GpuView view(
+      [&](const auto &command) { commands.push_back(command); }, [] {});
+  window.setSize(720, 840);
+  window.addAndMakeVisible(view);
+  view.setBounds(window.getLocalBounds());
+  window.addToDesktop(0);
+  window.setVisible(true);
+  pump(view);
+  view.message(juce::JSON::parse(
+      R"({"type":"state","state":{"path":"hidden.onda","running":true,"supportsScope":false,"supportsTransport":false,"midi":{"noteOn":true,"noteOff":true}}})"));
+  view.mouseDown(mouse(view, {30.0f, 800.0f}));
+  check(std::any_of(commands.begin(), commands.end(), [](const auto &command) {
+          return command["type"].toString() == "midiNote" &&
+                 static_cast<bool>(command["pressed"]);
+        }),
+        "Zero-size fixture did not acquire a MIDI note");
+  commands.clear();
+  view.setSize(0, 0);
+  check(std::any_of(commands.begin(), commands.end(), [](const auto &command) {
+          return command["type"].toString() == "midiNote" &&
+                 !static_cast<bool>(command["pressed"]);
+        }),
+        "Zero-size surface retained a held MIDI note");
+  commands.clear();
+  view.setBounds(window.getLocalBounds());
+  view.mouseUp(mouse(view, {30.0f, 800.0f}));
+  check(std::none_of(commands.begin(), commands.end(), [](const auto &command) {
+          return command["type"].toString() == "midiNote";
+        }),
+        "Restoring the surface released the same note twice");
+}
 void exerciseRenderFailure() {
   struct Scenario {
     const char *bank;
@@ -541,6 +575,7 @@ int runTests(int argc, const char *const *argv) {
     checkWindowsRendererOwnership();
 #endif
     exerciseCompositionCancellation();
+    exerciseZeroSizeSuspension();
     exerciseRenderFailure();
     exerciseSurfaceOwnership();
     exercise();

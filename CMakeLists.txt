@@ -56,6 +56,9 @@ endif()
 project(onda-plugin VERSION "${ONDA_PLUGIN_VERSION}" LANGUAGES C CXX)
 if(APPLE)
     enable_language(OBJCXX)
+    set(CMAKE_OBJCXX_STANDARD 20)
+    set(CMAKE_OBJCXX_STANDARD_REQUIRED YES)
+    set(CMAKE_OBJCXX_EXTENSIONS OFF)
     # JUCE's C/C++ visibility settings do not cover Objective-C++ modules.
     # Keep their helpers private so host/plugin JUCE copies cannot mix state.
     set(CMAKE_OBJCXX_VISIBILITY_PRESET hidden)
@@ -373,8 +376,6 @@ function(onda_add_gpu_view target)
     if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
         target_link_libraries(${target} PRIVATE X11::X11 X11::Xext)
     elseif(APPLE)
-        set_target_properties(${target} PROPERTIES
-            OBJCXX_STANDARD 20 OBJCXX_STANDARD_REQUIRED YES)
         target_compile_definitions(${target} PRIVATE
             ONDA_GPU_NS_VIEW_CLASS=${target}GpuSurfaceView)
     endif()

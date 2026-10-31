@@ -206,6 +206,8 @@ void GpuView::draw() {
 }
 void GpuView::componentMovedOrResized(bool, bool) {
   if (ui_) {
+    if (getLocalBounds().isEmpty())
+      suspend();
     updateSurface();
     draw();
   }
