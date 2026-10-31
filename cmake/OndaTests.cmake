@@ -6,6 +6,11 @@ function(onda_add_test name group)
 endfunction()
 
 find_package(Threads REQUIRED)
+if(APPLE)
+    onda_add_test(onda_mac_plugin_symbols_tests core
+        bash "${CMAKE_CURRENT_SOURCE_DIR}/tests/MacPluginSymbols.sh"
+        "$<TARGET_FILE:OndaSynth_VST3>" "$<TARGET_FILE:OndaFX_VST3>")
+endif()
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     onda_add_test(onda_channel_layout_script_tests core
         bash "${CMAKE_CURRENT_SOURCE_DIR}/tests/ChannelLayoutTests.sh")
