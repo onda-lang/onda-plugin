@@ -56,6 +56,9 @@ endif()
 project(onda-plugin VERSION "${ONDA_PLUGIN_VERSION}" LANGUAGES C CXX)
 if(APPLE)
     enable_language(OBJCXX)
+    # JUCE's C/C++ visibility settings do not cover Objective-C++ modules.
+    # Keep their helpers private so host/plugin JUCE copies cannot mix state.
+    set(CMAKE_OBJCXX_VISIBILITY_PRESET hidden)
 endif()
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/juce-version"
