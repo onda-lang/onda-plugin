@@ -75,6 +75,11 @@ bool isBufferFile(const juce::File &file) {
       });
 }
 
+bool isSourcePath(const juce::String &path) {
+  return juce::File::isAbsolutePath(path) &&
+         juce::File(path).hasFileExtension("onda;on;ondaproject");
+}
+
 } // namespace
 
 Editor::Editor(Processor &owner)
@@ -108,6 +113,7 @@ Editor::~Editor() {
   gpu_.reset();
   processor_.releaseKeyboardNotes();
   processor_.setScopeCaptureEnabled(false);
+  processor_.setMeterCaptureEnabled(false);
   for (std::size_t index = 0; index < activeGestures_.size(); ++index)
     endParameterGesture(index);
   processor_.setEditorSize(getWidth(), getHeight());
@@ -128,10 +134,7 @@ void Editor::paint(juce::Graphics &graphics) {
 }
 
 bool Editor::isInterestedInFileDrag(const juce::StringArray &files) {
-  if (std::any_of(files.begin(), files.end(), [](const auto &path) {
-        return juce::File::isAbsolutePath(path) &&
-               juce::File(path).hasFileExtension("onda;on;ondaproject");
-      }))
+  if (std::any_of(files.begin(), files.end(), isSourcePath))
     return true;
   return files.size() == 1 && juce::File::isAbsolutePath(files[0]) &&
          isBufferFile(juce::File(files[0])) &&
@@ -144,11 +147,16 @@ void Editor::publishFileDrag(const char *phase, const juce::StringArray &files,
     return;
   juce::var message{new juce::DynamicObject};
   auto &object = *message.getDynamicObject();
-  object.setProperty("type", "bufferFileDrag");
+  const auto source = std::find_if(files.begin(), files.end(), isSourcePath);
+  object.setProperty("type", source != files.end() ? "sourceFileDrag"
+                                                   : "bufferFileDrag");
   object.setProperty("phase", phase);
   juce::Array<juce::var> paths;
-  for (const auto &path : files)
-    paths.add(path);
+  if (source != files.end())
+    paths.add(*source);
+  else
+    for (const auto &path : files)
+      paths.add(path);
   object.setProperty("paths", std::move(paths));
   juce::var position{new juce::DynamicObject};
   position.getDynamicObject()->setProperty("x", x);
@@ -172,10 +180,10 @@ void Editor::fileDragExit(const juce::StringArray &files) {
 void Editor::filesDropped(const juce::StringArray &files, int x, int y) {
   fileDragExit(files);
   for (const auto &path : files) {
-    if (!juce::File::isAbsolutePath(path))
+    if (!isSourcePath(path))
       continue;
     const juce::File file(path);
-    if (!file.hasFileExtension("onda;on;ondaproject") || !file.existsAsFile())
+    if (!file.existsAsFile())
       continue;
     actionError_.clear();
     processor_.loadFile(file, true);
@@ -210,7 +218,7 @@ void Editor::viewReady() {
   hasPublishedScope_ = false;
   publishState(true);
   publishMidiActivity(true);
-  publishScope(true);
+  publishVisualization(true);
 }
 
 void Editor::timerCallback() {
@@ -224,10 +232,17 @@ void Editor::timerCallback() {
   if (!viewReady_ || !gpu_->isShowing())
     tickGpu();
   const auto showing = viewReady_ && isShowing() && viewVisible();
+  const auto captureMeter = showing && gpu_->meterVisible();
+  if (meterCaptureActive_ != captureMeter) {
+    meterCaptureActive_ = captureMeter;
+    processor_.setMeterCaptureEnabled(captureMeter);
+    publishedVisualizationTimeMs_ = 0;
+  }
   const auto captureScope = showing && gpu_->scopeVisible();
   if (scopeCaptureActive_ != captureScope) {
     scopeCaptureActive_ = captureScope;
     processor_.setScopeCaptureEnabled(captureScope);
+    publishedVisualizationTimeMs_ = 0;
   }
   if (!showing) {
     hasPublished_ = false;
@@ -237,7 +252,7 @@ void Editor::timerCallback() {
   }
   publishState(false);
   publishMidiActivity();
-  publishScope();
+  publishVisualization();
   tickGpu();
 }
 
@@ -286,13 +301,14 @@ void Editor::publishState(const bool force) {
   if (!force && hasPublished_ && revision == publishedRevision_ &&
       currentBuses == publishedBuses_ &&
       currentInputLayout == publishedInputLayout_ &&
-      std::is_eq(currentInputSmoothing <=> publishedInputSmoothing_) &&
       currentKnobLayout == publishedKnobLayout_ &&
-      std::is_eq(currentSmoothingSeconds <=> publishedSmoothingSeconds_) &&
       currentHostBlockSize == publishedHostBlockSize_ &&
       currentBlockPreference == publishedBlockPreference_ &&
       currentFastMath == publishedFastMath_ &&
       viewStateRestoreRevision == publishedViewStateRestoreRevision_) {
+    if (!std::is_eq(currentInputSmoothing <=> publishedInputSmoothing_) ||
+        !std::is_eq(currentSmoothingSeconds <=> publishedSmoothingSeconds_))
+      publishSmoothing();
     if (currentSlots != publishedSlotStamps_ ||
         currentControls != publishedControlStamps_) {
       publishedSlotStamps_ = currentSlots;
@@ -316,6 +332,7 @@ void Editor::publishState(const bool force) {
       !hasPublished_ ||
       viewStateRestoreRevision != publishedViewStateRestoreRevision_;
   publishedEngineGeneration_ = status.engineGeneration;
+  publishedWorkerError_ = status.hasError ? status.message : std::string{};
   publishedRevision_ = status.revision;
   publishedLogRevision_ = logRevision;
   publishedSlotStamps_ = currentSlots;
@@ -357,25 +374,46 @@ void Editor::publishState(const bool force) {
   emitState(message);
 }
 
-void Editor::publishScope(const bool force) {
-  if (!isShowing() || !viewVisible()) {
-    hasPublishedScope_ = false;
+void Editor::publishSmoothing() {
+  if (!viewReady_ || !isShowing() || !viewVisible()) {
+    hasPublished_ = false;
     return;
   }
-  // Scope capture targets 30 Hz; GPU input/rendering stays at 60 Hz.
-  constexpr auto scopeIntervalMs = 1000.0 / 30.0;
+  if (!hasPublished_) {
+    publishState(true);
+    return;
+  }
+  publishedSmoothingSeconds_ = processor_.paramSmoothingSeconds();
+  publishedInputSmoothing_ = processor_.inputControlSmoothingSeconds();
+  emitState(makeRunViewSmoothing(
+      publishedSmoothingSeconds_, publishedInputSmoothing_,
+      actionError_.empty() ? publishedWorkerError_ : actionError_));
+}
+
+void Editor::publishVisualization(const bool force) {
+  if (!isShowing() || !viewVisible() ||
+      (!scopeCaptureActive_ && !meterCaptureActive_))
+    return;
+  // Meters and waveform share one clock; GPU input remains at 60 Hz.
+  constexpr auto intervalMs = 1000.0 / 30.0;
   const auto now = juce::Time::getMillisecondCounterHiRes();
-  const auto elapsed = !force && hasPublishedScope_
-                           ? now - publishedScopeTimeMs_ : scopeIntervalMs;
-  if (elapsed < scopeIntervalMs)
+  const auto elapsed = !force && publishedVisualizationTimeMs_ > 0.0
+                           ? now - publishedVisualizationTimeMs_
+                           : intervalMs;
+  if (elapsed < intervalMs)
+    return;
+  publishedVisualizationTimeMs_ = now - std::fmod(elapsed, intervalMs);
+  if (meterCaptureActive_) {
+    const auto levels = processor_.meterSnapshot();
+    gpu_->meter(pluginOutputChannels, levels.peaks.data(), levels.peaks.size());
+  }
+  if (!scopeCaptureActive_)
     return;
   const auto revision = processor_.scopeRevision();
   if (!force && hasPublishedScope_ && revision == publishedScopeRevision_)
     return;
   publishedScopeRevision_ = revision;
   hasPublishedScope_ = true;
-  // Keep the capture clock's phase despite jitter in the 60 Hz editor timer.
-  publishedScopeTimeMs_ = now - std::fmod(elapsed, scopeIntervalMs);
   const auto snapshot = processor_.scopeSnapshot();
   gpu_->scope(snapshot.channels, snapshot.samples);
 }
@@ -458,7 +496,7 @@ void Editor::handleCommand(const juce::var &command) {
                        ? std::string{}
                        : "Input control smoothing duration must be finite and "
                          "non-negative";
-    publishState(true);
+    publishSmoothing();
   } else if (type == "setInputControlLayout") {
     const auto layout = input->getProperty("layout").toString();
     if (layout == "sliders" || layout == "knobs")
@@ -487,7 +525,7 @@ void Editor::handleCommand(const juce::var &command) {
                        ? std::string{}
                        : "Smoothing duration must be finite, non-negative, and "
                          "fit the host sample counter";
-    publishState(true);
+    publishSmoothing();
   } else if (type == "reset") {
     processor_.requestUserReset();
   } else if (type == "triggerEvent") {

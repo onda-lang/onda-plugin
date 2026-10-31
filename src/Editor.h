@@ -45,12 +45,13 @@ private:
                        int y);
   void endParameterGesture(std::size_t index);
   void publishState(bool force);
+  void publishSmoothing();
   void publishMidiActivity(bool force = false);
-  void publishScope(bool force = false);
+  void publishVisualization(bool force = false);
 
   Processor &processor_;
   std::unique_ptr<GpuView> gpu_;
-  double publishedScopeTimeMs_{};
+  double publishedVisualizationTimeMs_{};
   juce::Label loadingOverlay_;
   std::unique_ptr<juce::FileChooser> fileChooser_;
   std::uint64_t publishedRevision_{};
@@ -74,9 +75,12 @@ private:
   bool hasPublishedMidi_{};
   bool hasPublishedScope_{};
   bool scopeCaptureActive_{};
+  bool meterCaptureActive_{};
   bool viewReady_{};
   std::array<bool, slotCount + controlCount> activeGestures_{};
   std::string actionError_;
+  // Small settings acknowledgments must not copy the worker's interface snapshot.
+  std::string publishedWorkerError_;
 
   JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(Editor)
 };

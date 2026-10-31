@@ -63,12 +63,12 @@ controls should cover other values, for example `frequency = 440.0 {20.0, 20000.
 
 Continuous `params` automation follows the DAW's normalized linear curve,
 sampled at the start of each Onda block. Discrete parameters hold the latest
-point at that boundary. 
+point at that boundary.
 
 **Block Size** controls how often params automation updates.
 
-The **Smooth** value only affects changes made in the UI editor. 
-DAW automation normally bypasses smoothing. 
+The **Smooth** value only affects changes made in the UI editor.
+DAW automation normally bypasses smoothing.
 
 ## Audio inputs and outputs
 
@@ -82,8 +82,8 @@ layout, declare the two main input channels first; subsequent `ins` map to
 `Control 1`, `Control 2`, and so on. See
 [external_control.onda](examples/effects/external_control.onda) for an example.
 
-Each control appears as a named, automatable DAW parameter. Unlike `params`, control input automation is sample-accurate. 
-To supply an external signal, enable and route the corresponding bus through your DAW’s sidechain or auxiliary inputs. 
+Each control appears as a named, automatable DAW parameter. Unlike `params`, control input automation is sample-accurate.
+To supply an external signal, enable and route the corresponding bus through your DAW’s sidechain or auxiliary inputs.
 The routed signal takes precedence over the parameter value.
 
 Controls start at their declared input default, or zero. Declare an input range
@@ -110,83 +110,52 @@ files are unavailable when reopening it, the plugin restores the saved version.
 
 ## Build
 
-The editor uses Onda's shared native Rust/wgpu renderer. The Onda SDK must
-include `onda_ui.h` and the `onda_ui` shared library. The `onda-version` pin is
-0.9.0; publish that Onda release before building release plugins. For local
-validation, use the development checkout configuration below. Each VST3 bundle carries
-the library and font licenses in `Contents/Resources/onda_ui`; the editor
-resolves that location relative to its own plugin module so bundles can move.
-
-For development, build Onda with
-`cargo build --release -p onda_api -p onda_ui --features onda_ui/ffi`, then
-configure this project with `ONDA_DEVELOPMENT_SOURCE_DIR=/path/to/onda`.
-`ONDA_GPU_UI_LIBRARY` optionally overrides the native UI library path at build
-or run time. The shared screen covers parameters, input controls,
-buffers/waveforms, typed events, logs, MIDI, and setup, with a collapsible scope.
-
-Run the `onda_gpu_ui_tests` CTest target on a desktop to verify the native adapter.
-On Linux, `xvfb-run -a python3 scripts/test-gpu-reaper.py build` checks both
-relocated bundles inside REAPER, including native parameter input, host automation,
-resize, and reopening. Build `onda_vst3_smoke` first; its `--preset` mode generates
-test presets using the exported plugin's real state format. The DAW test needs
-REAPER, X11/XTest, and ImageMagick's `import`. An isolated X11 display avoids
-desktop focus interference. It uses a temporary profile and tracks
-with master sends disabled, and leaves screenshots and JSON results in its
-printed artifact directory.
-
-Requirements:
-
-- CMake 3.22+, Ninja, and a C++20 compiler
-- Linux editor builds: X11, Fontconfig, FreeType, and ALSA development packages;
-  a Vulkan driver for GPU rendering
-
-Configure and build the plugins:
+Requires CMake 3.22+, Ninja, and a C++20 compiler. Linux also needs X11,
+Fontconfig, FreeType, and ALSA development packages and a Vulkan driver.
 
 ```sh
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 ```
 
-To run tests:
+The build uses the SDK pinned in `onda-version` and JUCE revision in `juce-version`.
+Each VST3 bundle includes its `onda_ui` library and font notices under
+`Contents/Resources/onda_ui`, so it can be moved as a complete bundle.
+
+For development against a local Onda checkout, first build its libraries there:
 
 ```sh
-ctest --test-dir build --output-on-failure -L '^(core|native)$'
+cargo build --release -p onda_api -p onda_ui --features onda_ui/ffi
 ```
 
-Native editor tests require a desktop; Linux CI uses `xvfb-run -a`.
-See [test placement and native editor setup](tests/README.md) for manual CI and local checks.
-
-Custom builds can change the fixed input, control, output, and parameter-slot counts:
+Then configure this repository with that checkout:
 
 ```sh
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
-  -DONDA_PLUGIN_INPUT_CHANNELS=4 \
-  -DONDA_PLUGIN_CONTROL_INPUTS=8 \
-  -DONDA_PLUGIN_OUTPUT_CHANNELS=8 \
-  -DONDA_PLUGIN_PARAMETER_SLOTS=64
+  -DONDA_DEVELOPMENT_SOURCE_DIR=/path/to/onda
+cmake --build build
 ```
 
-Main and control inputs together must not exceed 64 channels; outputs support
-1 to 64 channels. Set `ONDA_PLUGIN_CONTROL_INPUTS=0` to omit control inputs.
-Parameter slots support counts from 1 to 64, matching the automation bank's capacity.
+`ONDA_GPU_UI_LIBRARY` optionally overrides the UI library path at build or run time.
+Use a library/header from the same Onda build.
 
-Versions are pinned in [plugin-version](plugin-version),
-[onda-version](onda-version), and [juce-version](juce-version).
-See [architecture](docs/architecture.md) and [test documentation](tests/README.md)
-for implementation and validation details.
+Custom layouts use `ONDA_PLUGIN_INPUT_CHANNELS`, `ONDA_PLUGIN_CONTROL_INPUTS`,
+`ONDA_PLUGIN_OUTPUT_CHANNELS`, and `ONDA_PLUGIN_PARAMETER_SLOTS`. Main and control
+inputs together must not exceed 64; outputs and parameter slots support 1–64.
+Set control inputs to zero to omit those buses.
 
-## Integration builds without a release
+```sh
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+  -DONDA_PLUGIN_INPUT_CHANNELS=4 -DONDA_PLUGIN_CONTROL_INPUTS=8 \
+  -DONDA_PLUGIN_OUTPUT_CHANNELS=8 -DONDA_PLUGIN_PARAMETER_SLOTS=64
+```
 
-Onda's **Build Onda Releases** workflow can call this repository's reusable
-`build.yml` with a pinned plugin commit and unpublished SDK artifacts from the
-same run. It uses the ordinary release build, core/native tests, VST3 validator,
-and packaging steps on Linux x64, Windows x64, and macOS ARM64. The calling run
-retains plugin archives and test logs; this workflow cannot publish releases.
+Run the release test groups on a desktop (or under `xvfb-run -a` on Linux):
 
-For a local SDK archive, pass `ONDA_SDK_ARCHIVE`, `ONDA_SDK_CHECKSUMS`,
-`ONDA_RELEASE_SOURCE_DIR`, and `ONDA_RELEASE_SOURCE_REVISION` to CMake. The last
-value must be the full Onda commit matching the archive. Without that override,
-resource verification still requires the pinned release tag.
+```sh
+ctest --test-dir build -C Release --output-on-failure -L '^(core|native)$'
+```
 
-The manual **Build Onda VST3** workflow also accepts `tests=package` to produce
-artifacts from an existing released SDK without publishing a plugin release.
+See [architecture](docs/architecture.md) for implementation invariants and
+[test contracts](tests/README.md) for CI selections, native editor checks, and
+DAW validation. `plugin-version` controls the plugin release version.

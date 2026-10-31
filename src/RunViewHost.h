@@ -22,6 +22,10 @@ struct WorkerStatus;
 
 [[nodiscard]] juce::var makeRunViewLog(Processor &processor);
 
+[[nodiscard]] juce::var makeRunViewSmoothing(double parameterSeconds,
+                                            double inputControlSeconds,
+                                            const std::string &error);
+
 [[nodiscard]] juce::var
 makeRunViewMidiActivity(const MidiActivitySnapshot &activity);
 

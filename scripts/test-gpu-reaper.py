@@ -306,8 +306,10 @@ def main():
             x11.x.XFlush(x11.display)
             time.sleep(1)
             subprocess.run(['import', '-window', str(file_window), str(root/'file-manager.png')], check=True)
+        expected = (880.0 - 20.0) / (20000.0 - 20.0)
         for product in products:
             command(product)
+            parameter_index = 2 if product == 'OndaSynth' else 4
             handle = wait(lambda: window(product), f"{product} GPU editor")
             peer = wait(lambda: x11.peer(handle), f"{product} attached native peer")
             x11.x.XMoveWindow(x11.display, handle, 20, 20)
@@ -318,6 +320,7 @@ def main():
             libraries = wait(loaded_libraries, "bundled UI library mappings")
             assert all(str(plugins) in path for path in libraries), libraries
             if args.file_drops:
+                subprocess.run(['import', '-window', str(handle), str(root / f'{product}-empty.png')], check=True)
                 # Move the host after the native peer was attached. Drop
                 # coordinates must use its current position, not JUCE's cache.
                 x11.x.XMoveWindow(x11.display, handle, 550, 20)
@@ -329,7 +332,6 @@ def main():
                     x11.drag_file(file_window, peer)
                 else:
                     drop_files(x11, peer, [source], width // 2, height // 2)
-                parameter_index = 2 if product == 'OndaSynth' else 4
                 expected_loaded = (440.0 - 20.0) / (20000.0 - 20.0)
                 wait(lambda: abs(float(command('query')[parameter_index]) - expected_loaded) < 1e-6,
                      f"{product} loading a dropped patch from the empty editor", timeout=5)
@@ -341,23 +343,17 @@ def main():
             time.sleep(0.2)
             width, _ = x11.size(peer)
             time.sleep(0.1)
-            # Choose the slider layout and focus its only numeric field. Tab
-            # starts at header actions now that all controls are focusable.
-            x11.click(peer, width - 100, 337)
-            x11.click(peer, 178, 378)
+            # The scope starts closed; Params sits directly below the header.
+            # Select Sliders, then focus the numeric field in its first card.
+            x11.click(peer, width - 64, 100)
+            x11.click(peer, 178, 140)
             time.sleep(0.1)
             for symbol in [ord('8'), ord('8'), ord('0'), 0xff0d]:
                 x11.key(symbol)
                 time.sleep(0.05)
-            time.sleep(0.15)
+            wait(lambda: abs(float(command('query')[parameter_index]) - expected) < 1e-6,
+                 f"{product} UI edit reaching REAPER", timeout=5)
             subprocess.run(["import", "-window", str(handle), str(root / f"{product}-edited.png")], check=True)
-            x11.click(peer, width - 112, 48)  # Settings action in the loaded header.
-            x11.key(0xff09)  # Read-only sample rate is skipped; focus block size.
-            x11.key(0xff0d)  # Enter opens the block-size dropdown above the panel.
-            time.sleep(0.1)
-            subprocess.run(["import", "-window", str(handle), str(root / f"{product}-settings.png")], check=True)
-            x11.key(0xff1b)  # Escape closes the dropdown, then the settings popup.
-            x11.key(0xff1b)
         if args.file_drops:
             result = {"passed": True, "reaper": ready[1], "products": products,
                       "loaded_ui_libraries": libraries,
@@ -365,7 +361,6 @@ def main():
                                  "spaces and Unicode in file paths"],
                       "drop_source": "Nautilus" if args.nautilus else "XDND with text and URI offers"}
         else:
-            expected = (880.0 - 20.0) / (20000.0 - 20.0)
             initial_edit = command('query')
             (root / 'edited-parameters.json').write_text(json.dumps(initial_edit))
             edited = wait(lambda: (values if all(abs(float(values[i]) - expected) < 1e-6 for i in (2, 4)) else None)

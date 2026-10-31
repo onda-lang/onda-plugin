@@ -1131,6 +1131,14 @@ void Processor::setScopeCaptureEnabled(const bool enabled) noexcept {
   scopeCapture_.setEnabled(enabled);
 }
 
+void Processor::setMeterCaptureEnabled(const bool enabled) noexcept {
+  scopeCapture_.setMeterEnabled(enabled);
+}
+
+MeterSnapshot Processor::meterSnapshot() noexcept {
+  return scopeCapture_.meterSnapshot();
+}
+
 ScopeRevision Processor::scopeRevision() const noexcept {
   return scopeCapture_.revision();
 }

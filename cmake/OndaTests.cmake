@@ -6,10 +6,26 @@ function(onda_add_test name group)
 endfunction()
 
 find_package(Threads REQUIRED)
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    onda_add_test(onda_channel_layout_script_tests core
+        bash "${CMAKE_CURRENT_SOURCE_DIR}/tests/ChannelLayoutTests.sh")
+endif()
+foreach(channels IN ITEMS 1 2 8 64)
+    set(target onda_scope_capture_${channels}_tests)
+    add_executable(${target} tests/ScopeCaptureTests.cpp)
+    target_compile_features(${target} PRIVATE cxx_std_20)
+    target_include_directories(${target} PRIVATE src)
+    target_compile_definitions(${target} PRIVATE
+        ONDA_PLUGIN_INPUT_CHANNELS=0 ONDA_PLUGIN_CONTROL_INPUTS=0
+        ONDA_PLUGIN_OUTPUT_CHANNELS=${channels})
+    onda_add_test(${target} core ${target})
+endforeach()
+
 juce_add_console_app(onda_gpu_ui_tests)
 set_target_properties(onda_gpu_ui_tests PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}")
-target_sources(onda_gpu_ui_tests PRIVATE tests/GpuViewTests.cpp src/GpuView.cpp src/GpuTextInput.cpp)
+target_sources(onda_gpu_ui_tests PRIVATE tests/GpuViewTests.cpp)
+onda_add_gpu_view(onda_gpu_ui_tests)
 target_compile_features(onda_gpu_ui_tests PRIVATE cxx_std_20)
 target_include_directories(onda_gpu_ui_tests PRIVATE src "${ONDA_SDK_ROOT}/include")
 target_compile_definitions(onda_gpu_ui_tests PRIVATE JUCE_MODAL_LOOPS_PERMITTED=1 JUCE_USE_CURL=0
@@ -123,8 +139,8 @@ target_sources(onda_processor_tests PRIVATE
     src/SpscQueue.h
 )
 target_compile_features(onda_processor_tests PRIVATE cxx_std_20)
-target_sources(onda_processor_tests PRIVATE tests/GpuEditorTests.cpp
-    src/GpuView.cpp src/GpuTextInput.cpp)
+target_sources(onda_processor_tests PRIVATE tests/GpuEditorTests.cpp)
+onda_add_gpu_view(onda_processor_tests)
 target_include_directories(onda_processor_tests PRIVATE "${ONDA_SDK_ROOT}/include")
 target_compile_definitions(onda_processor_tests PRIVATE
     ONDA_GPU_UI_LIBRARY_NAME="${ONDA_GPU_UI_LIBRARY_NAME}")

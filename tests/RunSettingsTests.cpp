@@ -11,6 +11,52 @@
 #include <algorithm>
 #include <iostream>
 
+bool exerciseRunViewSchemaReadiness() {
+  using namespace onda::plugin;
+  const juce::File source{
+      pathToJuce(testTemporaryRoot() / "schema-ready.onda")};
+  if (!source.replaceWithText(
+          "event send(value: i64) {}\nsample { out1 = 0.0 }\n"))
+    return false;
+  const auto ready = [](Processor &processor) {
+    return static_cast<bool>(makeRunViewState(processor,
+                                              processor.workerStatus(), false,
+                                              {})["state"]["schemaReady"]);
+  };
+  Processor original(Product::effect);
+  if (!ready(original))
+    return false;
+  original.loadFile(source);
+  if (ready(original)) {
+    std::cerr << "Queued compilation exposed an empty schema as ready\n";
+    return false;
+  }
+  juce::MemoryBlock state;
+  original.getStateInformation(state);
+  Processor restored(Product::effect);
+  restored.setNonRealtime(true);
+  restored.setStateInformation(state.getData(),
+                               static_cast<int>(state.getSize()));
+  if (ready(restored)) {
+    std::cerr << "Waiting restoration exposed an empty schema as ready\n";
+    return false;
+  }
+  restored.prepareToPlay(48'000.0, 64);
+  if (!restored.workerStatus().active || !ready(restored)) {
+    std::cerr << "Prepared schema was not ready: "
+              << restored.workerStatus().message << '\n';
+    return false;
+  }
+  restored.unload();
+  if (!ready(restored))
+    return false;
+  if (!source.replaceWithText("this is not valid Onda\n"))
+    return false;
+  restored.loadFile(source);
+  restored.prepareToPlay(48'000.0, 64);
+  return restored.workerStatus().hasError && ready(restored);
+}
+
 bool exerciseFastMath() {
   using namespace onda::plugin;
   const juce::File source{pathToJuce(testTemporaryRoot() / "fast-math.onda")};
@@ -65,6 +111,11 @@ bool exerciseFastMath() {
                 << '\n';
       return false;
     }
+    if (static_cast<bool>(makeRunViewState(processor, processor.workerStatus(),
+                                         false, {})["state"]["supportsRunSettings"])) {
+      std::cerr << "Loaded plugin exposed unavailable run settings\n";
+      return false;
+    }
     if (processor.setFastMath(!enabled) || processor.fastMath() != enabled)
       return false;
 
@@ -97,6 +148,9 @@ bool exerciseFastMath() {
       return false;
     }
     restored.unload();
+    if (!static_cast<bool>(makeRunViewState(restored, restored.workerStatus(),
+                                          false, {})["state"]["supportsRunSettings"]))
+      return false;
     if (!restored.setFastMath(!enabled))
       return false;
   }

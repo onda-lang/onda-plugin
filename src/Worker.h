@@ -31,6 +31,8 @@ struct WorkerStatus {
   std::filesystem::path path;
   std::string message{"No Onda file loaded"};
   bool compiling{};
+  // False while preparation is queued, compiling, or waiting for the host.
+  bool schemaReady{true};
   // A load error can coexist with a retained, active engine.
   bool hasError{};
   bool active{};

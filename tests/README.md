@@ -1,45 +1,15 @@
 # Test contracts
 
-`onda_watcher_tests` exercises the native notification backend without JUCE or the compiler.
-It covers missing paths and inode replacement. On Linux it also verifies that fallback retries
-and recovery retain healthy inotify subscriptions.
+## Run locally
 
-Run the release contracts with:
+Configure/build as described in the [root README](../README.md#build), then run:
 
 ```sh
 ctest --test-dir build -C Release --output-on-failure -L '^(core|native)$'
 ```
 
-Native editor checks require a desktop. Linux CI supplies an X11 display with
-`xvfb-run -a`; a local desktop also works. The processor executable uses
-`juce_add_console_app` for the Windows console entry point and normal JUCE
-message-loop startup.
-
-`onda_gpu_editor_tests` closes a real GPU editor
-with an unfinished smoothing edit, including after a host error, and verifies
-that teardown commits the draft while editor command handlers remain alive.
-It also verifies that repeated hidden timer ticks send no additional UI input
-after suspension, and that showing the editor rearms the next suspension.
-Reparenting a visible GPU editor between native peers must restore saved
-presentation with a fresh readiness ID and replay MIDI activity and scope data.
-`onda_gpu_keyboard_tests` runs without a native surface and checks that unused
-keys reach the DAW, consumed keys stay in the UI, and input errors remain distinct.
-`onda_gpu_ui_tests` also checks that an idle instrument leaves computer-key MIDI
-to the DAW, and checks the framebuffer scale against the display density on macOS.
-On Windows it also checks that GPU presentation disables JUCE's composition
-layer and restores each peer's previous renderer on close or reparenting,
-including when the old peer has already been destroyed.
-
-On Linux, run `xvfb-run -a python3 scripts/test-gpu-reaper.py build --file-drops`
-to drop a source file into each empty GPU editor through the real X11 protocol.
-The file offer puts text before file URIs, matching Nautilus, and the path contains
-spaces and Unicode. The host window moves after the editor is attached, and
-data requests must preserve the drag event's timestamp. Add `--nautilus` to
-exercise the file manager's actual drag gesture instead. These checks use a
-temporary REAPER profile and relocated bundles, verify the loaded UI library
-paths, and confirm that each dropped patch
-publishes its parameter to the DAW. They require REAPER, X11/XTest, ImageMagick,
-and, for `--nautilus`, Nautilus and `dbus-run-session`.
+Native checks require a desktop. Linux CI uses `xvfb-run -a`; a local X11 desktop
+also works. Use the `core` label for tests that do not require a native surface.
 
 | CTest label | Placement and purpose |
 | --- | --- |
@@ -64,13 +34,13 @@ a branch such as `main`, a tag such as `0.1.30`, or a full 40-character commit S
 The workflow checks out that source ref, including its tests, and reads
 `plugin-version` from that checkout. Use `main` to test changes since a release;
 an old tag still uses its original tests. Tag/version matching is required for
-automatic releases. Manual runs have read-only repository permissions and do
-not package or publish releases.
-The manual trigger becomes available after this workflow is on the default
-branch, as described in [GitHub's manual workflow documentation](https://docs.github.com/en/actions/how-tos/manage-workflow-runs/manually-run-a-workflow).
+automatic releases. Manual runs have read-only repository permissions and never
+publish a release.
+The `package` selection builds and retains archives as workflow artifacts.
 
 | Test selection | Platforms | Work performed |
 | --- | --- | --- |
+| `package` | Any one platform, or `all` | Default builds, `core`/`native`, VST3 validation, and package artifacts; publishing occurs only for a matching version tag. |
 | `audit` (default) | `linux-x64` | Exported callback audit and its instrumentation self-tests. |
 | `extended` | Any one platform, or `all` | Extended filesystem and concurrency cases. |
 | `channels` | `linux-x64` | Builds and validates four additional channel/parameter configurations; skips the default plugin build. |
@@ -78,7 +48,7 @@ branch, as described in [GitHub's manual workflow documentation](https://docs.gi
 
 The default platform is `linux-x64`. Unsupported test/platform combinations fail
 before dependencies are installed or plugins are built. Validator tooling is
-built only for release runs and Linux channel checks. Failures retain CTest logs,
+built for package runs and Linux channel checks. Failures retain CTest logs,
 Windows test executables where available.
 
 For example, to check the Windows test changes on `main`:
@@ -90,6 +60,10 @@ gh workflow run release.yml --ref main \
 
 Here `--ref main` selects the workflow definition; `source_ref` selects the
 code and tests to check out. No new version tag or plugin release is needed.
+
+The reusable `build.yml` also accepts `onda_source_ref` from an Onda integration
+workflow. It verifies unpublished SDK artifacts and resource checkout against
+that commit. Additional channel builds retain the same resource revision pin.
 
 Run extended cases with:
 
@@ -139,10 +113,32 @@ clearing. Rendered values and the interface survive saving and restoring without
 the source file. `NativeEditor` also loads an unbound-buffer program and edits
 its parameter in the native GPU view.
 
+## Real DAW checks
+
+On Linux, use an isolated X11 display:
+
+```sh
+xvfb-run -a python3 scripts/test-gpu-reaper.py build
+xvfb-run -a python3 scripts/test-gpu-reaper.py build --file-drops
+```
+
+The script uses a temporary REAPER profile and relocated bundles. It checks
+library loading, native edits, DAW automation, resize, reopening, and optional
+source drops. Requirements are REAPER, X11/XTest, and ImageMagick. `--nautilus`
+also needs Nautilus and `dbus-run-session` and exercises its actual file drag.
+These are X11 checks; native Wayland-to-X11 drops additionally depend on the
+compositor's bridge and are not established by this suite.
+
 ## Coverage
 
 | Test | Contract |
 | --- | --- |
+| `onda_watcher_tests` | Native filesystem notifications, missing paths, inode replacement, and Linux subscription recovery without JUCE/compiler setup. |
+| `onda_scope_capture_{1,2,8,64}_tests` | Per-channel peak retention/reset, non-finite samples, and meter-only capture without waveform writes. |
+| `onda_channel_layout_script_tests` | Linux layout driver preserves the SDK resource checkout and revision for all configurations, including release-tag mode. |
+| `onda_gpu_ui_tests` | Dedicated native surface, input/IME, immediate resize presentation, reparenting/parent destruction, and hide/show. Linux pixels survive JUCE repaints; macOS density and Windows parent-renderer ownership are checked. |
+| `onda_gpu_keyboard_tests` | Surface-free consumed/unused/error distinctions and forwarding unused keys to the DAW. |
+| `onda_gpu_editor_tests` | Smoothing acknowledgments carry accepted values and errors without resending schemas; teardown resolves drafts before handlers die; hidden input suspension and presentation/capture restoration after reparenting. |
 | `onda_example_tests` | Shipped examples compile and render finite, meaningful output. |
 | `onda_plugin_tests` | SDK ownership, DSP and MIDI behavior, buffer decoding, portable checkpoints, project export, worker replacement, file watching, and compiler serialization. Extended watcher permutations run separately. |
 | `onda_buffer_cache_tests` | Source/import edits before buffer binding or clearing, and shared buffer-file edits before rebinding. Uses real preparation and DSP with native notifications withheld to make cache invalidation races deterministic, including edits with unchanged size and modification time. |
@@ -359,7 +355,6 @@ the `ControlInputs` processor case alongside the VST3 smoke test and validators.
   checks complement each other; VST3 validation does not replace real DAW testing.
   Linux builds guard JUCE's deferred XEmbed resize callback after its embedded
   window is destroyed. The exported editor reopening test exercises this lifetime.
-
 
 `MovedSourceAncestor` is disabled on Windows. Its directory watcher holds open
 handles that can prevent moving a containing folder, even with delete sharing,

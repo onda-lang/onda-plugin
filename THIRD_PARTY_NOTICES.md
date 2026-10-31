@@ -7,6 +7,7 @@ the corresponding terms in the `licenses` directory.
 | --- | --- | --- |
 | [Onda](https://github.com/onda-lang/onda) | Same as `onda-version` | `Onda/LICENSE` |
 | Onda native dependencies, including LLVM and statically linked Rust crates | Supplied by the Onda SDK | `Onda/THIRD_PARTY_NOTICES.md` and `Onda/licenses/` |
+| Inter, JetBrains Mono, and Noto fallback fonts | Supplied by the Onda UI library | `Onda/licenses/OFL-*.txt`; also bundled with each UI library |
 | [JUCE](https://github.com/juce-framework/JUCE) | Same as `juce-version` | `JUCE-LICENSE.md` |
 | Steinberg VST3 SDK | Vendored by JUCE | `VST3-SDK-LICENSE.txt` |
 | FLAC | Vendored by JUCE | `FLAC-LICENSE.txt` |

@@ -552,6 +552,8 @@ HostParameterValues Worker::parameterValuesLocked() const {
 }
 
 void Worker::advanceGeneration() noexcept {
+  status_.schemaReady =
+      desired_.path.empty() && !desired_.fallbackProjectImage.valid();
   desired_.reuseCompilation = false;
   desired_.changedBuffers.clear();
   ++desired_.generation;
@@ -609,6 +611,7 @@ void Worker::reportFailure(const char *const message) noexcept {
     std::lock_guard lock(mutex_);
     status_.compiling = false;
     status_.hasError = true;
+    status_.schemaReady = true;
     incrementStatusRevision();
     try {
       status_.message = message;
@@ -678,6 +681,7 @@ bool Worker::updateStatus(const Request &request, std::string message,
   status_.path = desired_.path;
   status_.message = std::move(message);
   status_.compiling = compiling;
+  status_.schemaReady = !compiling && hasError;
   status_.hasError = hasError;
   incrementStatusRevision();
   return true;
@@ -1245,6 +1249,7 @@ void Worker::build(const Request &request) {
                           : "Active";
     status_.compiling = false;
     status_.hasError = usingProjectImage && !desired_.path.empty();
+    status_.schemaReady = true;
     status_.active = true;
     hasPreparedEngine_.store(true, std::memory_order_release);
     status_.usingProjectImage = usingProjectImage;

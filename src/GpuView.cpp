@@ -1,6 +1,6 @@
 #include "GpuView.h"
+#include "NativeGpuSurface.h"
 #include <array>
-#include <cmath>
 #include <utility>
 #if JUCE_WINDOWS
 #include <windows.h>
@@ -73,41 +73,25 @@ juce::var pointer(const char *type, const juce::MouseEvent &mouse) {
 } // namespace
 
 GpuView::GpuView(Command command, std::function<void()> ready)
-    : command_(std::move(command)), ready_(std::move(ready)) {
+    : ComponentMovementWatcher(this), command_(std::move(command)),
+      ready_(std::move(ready)) {
   setWantsKeyboardFocus(true);
   setOpaque(false);
 }
 GpuView::~GpuView() { release(); }
 void GpuView::release() {
+  cancelPendingUpdate();
   if (ui_)
     input(event("focusLost"));
   if (ui_)
     destroy_(std::exchange(ui_, nullptr));
-#if JUCE_WINDOWS
-  if (previousRenderingEngine_ >= 0) {
-    // The view may already belong to another peer, or the old peer may be gone.
-    for (int index = 0; index < juce::ComponentPeer::getNumPeers(); ++index) {
-      auto *peer = juce::ComponentPeer::getPeer(index);
-      if (peer->getUniqueID() == renderingPeerId_) {
-        peer->setCurrentRenderingEngine(previousRenderingEngine_);
-        break;
-      }
-    }
-    previousRenderingEngine_ = -1;
-  }
-#endif
-#if JUCE_LINUX
-  if (display_) {
-    if (auto close = reinterpret_cast<int (*)(void *)>(
-            x11_.getFunction("XCloseDisplay")))
-      close(display_);
-    display_ = nullptr;
-  }
-#endif
-  peer_ = nullptr;
+  surface_.reset();
+  peerId_ = 0;
+  framebufferSize_ = {};
 }
 bool GpuView::initialize() {
-  if (!getPeer() || !isShowing() || !error_.isEmpty())
+  if (!getPeer() || !isShowing() || getLocalBounds().isEmpty() ||
+      !error_.isEmpty())
     return false;
   if (!create_) {
     const auto path = juce::SystemStats::getEnvironmentVariable(
@@ -129,6 +113,8 @@ bool GpuView::initialize() {
     ONDA_LOAD(input_, "onda_ui_input")
     ONDA_LOAD(cursor_, "onda_ui_cursor")
     ONDA_LOAD(render_, "onda_ui_render")
+    ONDA_LOAD(meter_, "onda_ui_meter")
+    ONDA_LOAD(meter_visible_, "onda_ui_meter_visible")
     ONDA_LOAD(scope_, "onda_ui_scope")
     ONDA_LOAD(scope_visible_, "onda_ui_scope_visible")
     ONDA_LOAD(commands_, "onda_ui_commands")
@@ -138,34 +124,23 @@ bool GpuView::initialize() {
     ONDA_LOAD(text_hit_, "onda_ui_text_hit")
 #undef ONDA_LOAD
   }
-  peer_ = getPeer()->getNativeHandle();
-  unsigned platform{};
-#if JUCE_LINUX
-  platform = 1;
-  if (!x11_.open("libX11.so.6")) {
-    error_ = "Could not load X11 for GPU UI";
+  surface_ = NativeGpuSurface::create(
+      *getPeer(),
+      [this] {
+        exposed_ = true;
+        triggerAsyncUpdate();
+      },
+      error_);
+  if (!surface_)
     return false;
-  }
-  auto open = reinterpret_cast<void *(*)(const char *)>(
-      x11_.getFunction("XOpenDisplay"));
-  display_ = open ? open(nullptr) : nullptr;
-#elif JUCE_WINDOWS
-  platform = 2;
-  // JUCE's Direct2D composition layer covers wgpu's HWND swap chain. Keep
-  // JUCE's background paint on GDI while Rust owns GPU presentation.
-  renderingPeerId_ = getPeer()->getUniqueID();
-  previousRenderingEngine_ = getPeer()->getCurrentRenderingEngine();
-  getPeer()->setCurrentRenderingEngine(0);
-#elif JUCE_MAC
-  platform = 3;
-#endif
-  scale_ = nativeScale(*getPeer());
+  peerId_ = getPeer()->getUniqueID();
+  updateSurface();
+  const auto handles = surface_->handles();
   std::array<char, 2048> error{};
-  ui_ = create_(platform, reinterpret_cast<uintptr_t>(peer_),
-                reinterpret_cast<uintptr_t>(display_),
-                static_cast<uint32_t>(std::lround(getWidth() * scale_)),
-                static_cast<uint32_t>(std::lround(getHeight() * scale_)),
-                scale_, error.data(), error.size());
+  ui_ = create_(handles.platform, handles.window, handles.display,
+                static_cast<uint32_t>(framebufferSize_.x),
+                static_cast<uint32_t>(framebufferSize_.y), scale_, error.data(),
+                error.size());
   if (!ui_) {
     error_ = error[0] ? juce::String::fromUTF8(error.data())
                       : "GPU UI initialization failed";
@@ -176,39 +151,78 @@ bool GpuView::initialize() {
   return true;
 }
 void GpuView::tick() {
-  if (ui_ && (!getPeer() || getPeer()->getNativeHandle() != peer_)) {
-    input(event("focusLost"));
+  if (ui_ && (!getPeer() || getPeer()->getUniqueID() != peerId_)) {
     release();
   }
   if (!isShowing()) {
-    if (wasShowing_) {
-      input(event("focusLost"));
-    }
-    wasShowing_ = false;
+    if (surface_)
+      surface_->setVisible(false);
     return;
   }
-  wasShowing_ = true;
   if (!ui_ && !initialize())
     return;
+  updateSurface();
+  draw();
+}
+void GpuView::updateSurface() {
+  if (!surface_ || !getPeer())
+    return;
   const auto scale = nativeScale(*getPeer());
-  if (!juce::approximatelyEqual(scale, scale_)) {
+  const auto size =
+      surface_->setBounds(getPeer()->getAreaCoveredBy(*this), scale);
+  if (size != framebufferSize_ || !juce::approximatelyEqual(scale, scale_)) {
+    framebufferSize_ = size;
     scale_ = scale;
-    resized();
+    exposed_ = true;
   }
+}
+void GpuView::draw() {
+  if (!ui_ || drawing_ || !isShowing())
+    return;
+  const juce::ScopedValueSetter<bool> drawing(drawing_, true);
   if (exposed_) {
-    resized();
     exposed_ = false;
+    resize_(ui_, static_cast<uint32_t>(framebufferSize_.x),
+            static_cast<uint32_t>(framebufferSize_.y), scale_);
   }
-  if (render_(ui_) < 0)
+  if (getLocalBounds().isEmpty()) {
+    surface_->setVisible(false);
+    drain();
+    return;
+  }
+  const auto result = render_(ui_);
+  if (result < 0) {
     error_ = juce::String::fromUTF8(error_fn_(ui_));
+    if (error_.isEmpty())
+      error_ = "GPU UI rendering failed; reopen the editor";
+  }
+  if (!error_.isEmpty()) {
+    release();
+    return;
+  }
+  if (result > 0)
+    surface_->setVisible(true);
   drain();
 }
-void GpuView::resized() {
-  if (ui_)
-    resize_(ui_, static_cast<uint32_t>(std::lround(getWidth() * scale_)),
-            static_cast<uint32_t>(std::lround(getHeight() * scale_)), scale_);
+void GpuView::componentMovedOrResized(bool, bool) {
+  if (ui_) {
+    updateSurface();
+    draw();
+  }
 }
-void GpuView::paint(juce::Graphics &) { exposed_ = true; }
+void GpuView::componentPeerChanged() {
+  release();
+  triggerAsyncUpdate();
+}
+void GpuView::componentVisibilityChanged() {
+  if (!isShowing()) {
+    suspend();
+    if (surface_)
+      surface_->setVisible(false);
+  }
+  exposed_ = true;
+  triggerAsyncUpdate();
+}
 void GpuView::message(const juce::var &value) {
   if (!ui_)
     return;
@@ -217,6 +231,11 @@ void GpuView::message(const juce::var &value) {
     error_ = juce::String::fromUTF8(error_fn_(ui_));
   drain();
 }
+void GpuView::meter(int channels, const float *peaks, std::size_t count) {
+  if (ui_)
+    meter_(ui_, static_cast<uint32_t>(channels), peaks, count);
+}
+
 void GpuView::scope(int channels, const std::vector<float> &samples) {
   if (ui_)
     scope_(ui_, static_cast<uint32_t>(channels), samples.data(),
@@ -235,6 +254,9 @@ bool GpuView::input(juce::var value) {
 void GpuView::drain() {
   if (!ui_)
     return;
+  // Schema replacement can cancel the draft without a native IME callback.
+  if (composing_ && !isTextInputActive())
+    composing_ = false;
   if (auto *peer = getPeer())
     peer->refreshTextInputTarget();
   const auto cursorName = juce::String::fromUTF8(cursor_(ui_));

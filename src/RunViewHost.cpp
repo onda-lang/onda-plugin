@@ -142,7 +142,7 @@ juce::var makeRunViewState(Processor &processor, const WorkerStatus &status,
   auto state = object();
   set(state, "running", status.active);
   set(state, "connected", status.active);
-  set(state, "schemaReady", !status.compiling);
+  set(state, "schemaReady", status.schemaReady);
   // Use decimal text to preserve the full generation through JavaScript.
   set(state, "engineGeneration",
       juce::String(std::to_string(status.engineGeneration)));
@@ -161,7 +161,7 @@ juce::var makeRunViewState(Processor &processor, const WorkerStatus &status,
   set(state, "canExportProject", canExportProject);
   set(state, "supportsTransport", false);
   set(state, "supportsDeviceSelection", false);
-  set(state, "supportsRunSettings", true);
+  set(state, "supportsRunSettings", status.path.empty());
   set(state, "supportsFastMath", true);
   set(state, "fastMath", processor.fastMath());
   set(state, "canSetBlockSize", processor.canSetBlockSize());
@@ -307,6 +307,19 @@ juce::var makeRunViewState(Processor &processor, const WorkerStatus &status,
 juce::var makeRunViewLog(Processor &processor) {
   auto state = object();
   appendRuntimeLog(state, processor.runtimeLogSnapshot());
+  auto message = object();
+  set(message, "type", "state");
+  set(message, "state", std::move(state));
+  return message;
+}
+
+juce::var makeRunViewSmoothing(const double parameterSeconds,
+                               const double inputControlSeconds,
+                               const std::string &error) {
+  auto state = object();
+  set(state, "paramSmoothingMs", parameterSeconds * 1000.0);
+  set(state, "inputControlSmoothingMs", inputControlSeconds * 1000.0);
+  set(state, "error", juce::String(error));
   auto message = object();
   set(message, "type", "state");
   set(message, "state", std::move(state));

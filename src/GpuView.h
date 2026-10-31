@@ -1,26 +1,32 @@
 #pragma once
 #include <functional>
 #include <juce_gui_basics/juce_gui_basics.h>
+#include <memory>
 #include <onda_ui.h>
 #include <vector>
 
 namespace onda::plugin {
 
-// The editor owns the native peer and message thread. Rust owns its UI state,
-// graphics resources, and commands; it never starts another event loop.
-class GpuView final : public juce::Component, public juce::TextInputTarget {
+class NativeGpuSurface;
+
+// JUCE owns input and the message thread. A dedicated native child belongs
+// exclusively to Rust's renderer; neither starts another event loop.
+class GpuView final : public juce::Component,
+                      public juce::TextInputTarget,
+                      private juce::ComponentMovementWatcher,
+                      private juce::AsyncUpdater {
 public:
   using Command = std::function<void(const juce::var &)>;
   GpuView(Command command, std::function<void()> ready);
   ~GpuView() override;
   void tick();
   void suspend();
+  bool meterVisible() const { return ui_ && meter_visible_(ui_); }
+  void meter(int channels, const float *peaks, std::size_t count);
   bool scopeVisible() const { return ui_ && scope_visible_(ui_); }
   void message(const juce::var &message);
   void scope(int channels, const std::vector<float> &samples);
   const juce::String &error() const { return error_; }
-  void resized() override;
-  void paint(juce::Graphics &) override;
   void mouseDown(const juce::MouseEvent &) override;
   void mouseMove(const juce::MouseEvent &) override;
   void mouseExit(const juce::MouseEvent &) override;
@@ -45,19 +51,21 @@ public:
 private:
   friend struct GpuViewTestAccess;
   bool initialize();
+  void draw();
+  void updateSurface();
+  void componentMovedOrResized(bool, bool) override;
+  void componentPeerChanged() override;
+  void componentVisibilityChanged() override;
+  void handleAsyncUpdate() override { tick(); }
   bool input(juce::var event);
   void drain();
   void release();
   juce::var editorState() const;
   void editText(const juce::String &, int anchor, int caret);
   juce::DynamicLibrary library_;
-  juce::DynamicLibrary x11_;
-  void *display_{};
-  void *peer_{};
-#if JUCE_WINDOWS
-  juce::uint32 renderingPeerId_{};
-  int previousRenderingEngine_{-1};
-#endif
+  std::unique_ptr<NativeGpuSurface> surface_;
+  juce::uint32 peerId_{};
+  juce::Point<int> framebufferSize_;
   OndaUi *ui_{};
   decltype(&onda_ui_create) create_{};
   decltype(&onda_ui_destroy) destroy_{};
@@ -66,6 +74,8 @@ private:
   decltype(&onda_ui_input) input_{};
   decltype(&onda_ui_cursor) cursor_{};
   decltype(&onda_ui_render) render_{};
+  decltype(&onda_ui_meter) meter_{};
+  decltype(&onda_ui_meter_visible) meter_visible_{};
   decltype(&onda_ui_scope) scope_{};
   decltype(&onda_ui_scope_visible) scope_visible_{};
   decltype(&onda_ui_commands) commands_{};
@@ -78,7 +88,7 @@ private:
   juce::String error_;
   float scale_{1.0f};
   bool exposed_{true};
-  bool wasShowing_{};
   bool composing_{};
+  bool drawing_{};
 };
 } // namespace onda::plugin

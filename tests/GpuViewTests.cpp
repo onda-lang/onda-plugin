@@ -3,6 +3,12 @@
 #include <iostream>
 #include <juce_gui_basics/juce_gui_basics.h>
 #include <stdexcept>
+#if JUCE_LINUX
+#include <X11/Xlib.h>
+#include <X11/Xutil.h>
+#include <X11/extensions/shape.h>
+#undef KeyPress
+#endif
 
 namespace {
 void check(bool success, const char *message) {
@@ -63,6 +69,98 @@ void pump(onda::plugin::GpuView &view) {
   view.tick();
   check(view.error().isEmpty(), view.error().toRawUTF8());
 }
+#if JUCE_LINUX
+void checkNativePixels(juce::Component &parent, onda::plugin::GpuView &view) {
+  auto *display = XOpenDisplay(nullptr);
+  check(display != nullptr, "Could not capture the native editor");
+  const auto window = static_cast<::Window>(
+      reinterpret_cast<uintptr_t>(parent.getPeer()->getNativeHandle()));
+  const auto child = static_cast<::Window>(
+      onda::plugin::GpuViewTestAccess::surfaceWindow(view));
+  int count{}, ordering{};
+  auto *shape =
+      XShapeGetRectangles(display, child, ShapeInput, &count, &ordering);
+  XFree(shape);
+  check(count == 0, "GPU child intercepted JUCE's native input");
+  parent.repaint();
+  // Process the ordinary JUCE painter without any publication timer/tick.
+  juce::MessageManager::getInstance()->runDispatchLoopUntil(30);
+  XWindowAttributes attributes{};
+  XGetWindowAttributes(display, window, &attributes);
+  const auto bounds = parent.getPeer()->getAreaCoveredBy(view).toFloat() *
+                      onda::plugin::GpuViewTestAccess::scale(view);
+  const auto capture = bounds.getSmallestIntegerContainer().getIntersection(
+      juce::Rectangle<int>{0, 0, attributes.width, attributes.height});
+  auto *image =
+      XGetImage(display, window, capture.getX(), capture.getY(),
+                static_cast<unsigned>(capture.getWidth()),
+                static_cast<unsigned>(capture.getHeight()), AllPlanes, ZPixmap);
+  check(image != nullptr, "Native editor capture failed");
+  int erased = 0;
+  for (int y = 0; y < image->height; ++y)
+    for (int x = 0; x < image->width; ++x)
+      erased += (XGetPixel(image, x, y) & 0xffffff) == 0xff00ff;
+  XDestroyImage(image);
+  XCloseDisplay(display);
+  check(erased == 0, "JUCE's parent painter erased GPU pixels");
+}
+#endif
+void exerciseSurfaceOwnership() {
+  Window first, second;
+  for (auto *window : {&first, &second}) {
+    window->setSize(720, 840);
+    window->addToDesktop(0);
+    window->setVisible(true);
+  }
+  int ready = 0;
+  onda::plugin::GpuView view([](const auto &) {}, [&] { ++ready; });
+  first.addAndMakeVisible(view);
+  view.setBounds(first.getLocalBounds());
+  pump(view);
+  check(ready == 1, "Dedicated surface did not initialize");
+  check(onda::plugin::GpuViewTestAccess::surfaceWindow(view) !=
+            reinterpret_cast<uintptr_t>(first.getPeer()->getNativeHandle()),
+        "GPU and JUCE still paint into the same native surface");
+#if JUCE_LINUX
+  checkNativePixels(first, view);
+#endif
+  auto &render = onda::plugin::GpuViewTestAccess::render(view);
+  static decltype(&onda_ui_render) nativeRender;
+  nativeRender = render;
+  static int renders;
+  // A temporarily unavailable swapchain must leave the last image visible.
+  render = [](OndaUi *) { return 0; };
+  view.tick();
+#if JUCE_LINUX
+  checkNativePixels(first, view);
+#endif
+  renders = 0;
+  render = [](OndaUi *ui) {
+    ++renders;
+    return nativeRender(ui);
+  };
+  view.setSize(900, 700);
+  check(renders > 0, "Resize waited for the publication timer to draw");
+  render = nativeRender;
+#if JUCE_LINUX
+  checkNativePixels(first, view);
+  // Moving the view must move its native child, preserving parent coordinates.
+  view.setBounds(24, 30, 600, 600);
+  checkNativePixels(first, view);
+#endif
+  view.setSize(0, 0);
+  view.setBounds(first.getLocalBounds());
+#if JUCE_LINUX
+  checkNativePixels(first, view);
+#endif
+  second.addAndMakeVisible(view);
+  pump(view);
+  check(ready == 2, "Reparenting did not recreate the dedicated surface");
+  second.removeFromDesktop();
+  pump(view);
+  check(!onda::plugin::GpuViewTestAccess::initialized(view),
+        "GPU retained a destroyed parent window");
+}
 #if JUCE_WINDOWS
 void checkWindowsRendererOwnership() {
   Window first, second;
@@ -84,19 +182,19 @@ void checkWindowsRendererOwnership() {
     view.setBounds(first.getLocalBounds());
     pump(view);
     check(ready == 1 &&
-              first.getPeer()->getCurrentRenderingEngine() == software,
-          "JUCE composition still covers the GPU surface");
+              first.getPeer()->getCurrentRenderingEngine() == direct2D,
+          "GPU surface changed the parent's rendering engine");
     first.repaint();
     pump(view);
     second.addAndMakeVisible(view);
     pump(view);
     check(ready == 2 &&
               first.getPeer()->getCurrentRenderingEngine() == direct2D &&
-              second.getPeer()->getCurrentRenderingEngine() == software,
-          "Reparenting did not transfer GPU presentation ownership");
+              second.getPeer()->getCurrentRenderingEngine() == direct2D,
+          "Reparenting changed a parent's rendering engine");
   }
   check(second.getPeer()->getCurrentRenderingEngine() == direct2D,
-        "Closing the GPU view did not restore the previous renderer");
+        "Closing the GPU view changed the parent's renderer");
   first.getPeer()->setCurrentRenderingEngine(software);
   {
     onda::plugin::GpuView view([](const auto &) {}, [] {});
@@ -136,6 +234,126 @@ juce::MouseEvent mouse(juce::Component &view, juce::Point<float> position,
           now,
           1,
           false};
+}
+void exerciseCompositionCancellation() {
+  Window window;
+  onda::plugin::GpuView view([](const auto &) {}, [] {});
+  window.setSize(720, 840);
+  window.addAndMakeVisible(view);
+  view.setBounds(window.getLocalBounds());
+  window.addToDesktop(0);
+  window.setVisible(true);
+  pump(view);
+  for (
+      const char *replacement :
+      {R"({"path":"replacement.onda"})",
+       R"({"params":[{"name":"cutoff","type":"f64","value":440,"rangeMin":20,"rangeMax":20000,"scale":"log"}]})"}) {
+    view.message(juce::JSON::parse(
+        R"({"type":"state","state":{"path":"composition.onda","running":true,"supportsScope":false,"paramLayout":"knobs",
+          "params":[{"name":"frequency","type":"f64","value":440,"rangeMin":20,"rangeMax":20000,"scale":"log"}]}})"));
+    const auto edit = [&] {
+      view.mouseDown(mouse(view, {102.0f, 237.0f}));
+      view.mouseUp(mouse(view, {102.0f, 237.0f}));
+      check(view.isTextInputActive(), "Composition field did not activate");
+    };
+    edit();
+    view.setTemporaryUnderlining({juce::Range<int>{0, 1}});
+    view.message(juce::JSON::parse(
+        R"({"type":"parameterValues","state":{"params":[{"name":"frequency","value":500}]}})"));
+    check(!view.keyPressed(juce::KeyPress(juce::KeyPress::returnKey)) &&
+              view.isTextInputActive(),
+          "A value update interrupted native composition");
+    auto message = juce::JSON::parse(R"({"type":"state"})");
+    message.getDynamicObject()->setProperty("state",
+                                            juce::JSON::parse(replacement));
+    view.message(message);
+    check(!view.isTextInputActive(),
+          "Replacement retained the composing draft");
+    edit();
+    check(view.keyPressed(juce::KeyPress('5', {}, '5')) &&
+              view.keyPressed(juce::KeyPress(juce::KeyPress::returnKey)) &&
+              !view.isTextInputActive(),
+          "Canceled composition blocked typing or Enter in the next field");
+  }
+}
+void exerciseRenderFailure() {
+  struct Scenario {
+    const char *bank;
+    const char *update;
+    const char *terminal;
+  };
+  for (const auto &[bank, update, terminal] :
+       {Scenario{"midi", "midiNote", "midiNote"},
+        Scenario{"params", "setParam", "endParamGesture"},
+        Scenario{"inputControls", "setInputControl", "endInputControlGesture"}}) {
+    const bool piano = juce::String(bank) == "midi";
+    std::vector<juce::var> commands;
+    Window window;
+    onda::plugin::GpuView view(
+        [&](const auto &command) { commands.push_back(command); }, [] {});
+    window.setSize(720, 840);
+    window.addAndMakeVisible(view);
+    view.setBounds(window.getLocalBounds());
+    window.addToDesktop(0);
+    window.setVisible(true);
+    pump(view);
+    auto message = juce::JSON::parse(
+        R"({"type":"state","state":{"path":"failure.onda","running":true,"supportsTransport":false,"outputChannels":2,"midi":{"noteOn":true,"noteOff":true}}})");
+    auto &state = *message["state"].getDynamicObject();
+    state.setProperty("supportsScope", piano);
+    if (!piano)
+      state.setProperty(
+          bank, juce::JSON::parse(
+                    R"([{"name":"gain","type":"f64","value":0.5,"rangeMin":0,"rangeMax":1}])"));
+    view.message(message);
+    pump(view);
+    if (piano) {
+      check(view.scopeVisible() && view.meterVisible(),
+            "Failure fixture has no visible visualization");
+      view.mouseDown(mouse(view, {30.0f, 800.0f}));
+    } else {
+      view.mouseDown(mouse(view, {102.0f, 179.0f}));
+      view.mouseDrag(mouse(view, {102.0f, 159.0f}));
+    }
+    check(std::any_of(commands.begin(), commands.end(), [&](const auto &c) {
+            return c["type"].toString() == update &&
+                   (piano ? static_cast<bool>(c["pressed"])
+                          : !static_cast<bool>(c["commit"]));
+          }),
+          "Failure fixture did not acquire input ownership");
+    commands.clear();
+    static int renders;
+    renders = 0;
+    onda::plugin::GpuViewTestAccess::render(view) = [](OndaUi *) {
+      ++renders;
+      return -1;
+    };
+    onda::plugin::GpuViewTestAccess::error(view) = [](const OndaUi *) {
+      return "injected surface loss";
+    };
+    if (!piano)
+      onda::plugin::GpuViewTestAccess::error(view) = [](const OndaUi *) {
+        return "";
+      };
+    view.tick();
+    check(std::any_of(commands.begin(), commands.end(), [&](const auto &c) {
+            return c["type"].toString() == terminal &&
+                   (piano ? !static_cast<bool>(c["pressed"])
+                          : c["name"].toString() == "gain");
+          }),
+          "Fatal render error retained a MIDI note or automation gesture");
+    check(!onda::plugin::GpuViewTestAccess::initialized(view) &&
+              onda::plugin::GpuViewTestAccess::surfaceWindow(view) == 0 &&
+              !view.scopeVisible() && !view.meterVisible(),
+          "Fatal render error retained GPU resources or capture");
+    for (int tick = 0; tick < 60; ++tick)
+      view.tick();
+    const auto expectedError = piano ? "injected surface loss"
+                                    : "GPU UI rendering failed; reopen the editor";
+    check(renders == 1 && view.error() == expectedError &&
+              !view.keyPressed(juce::KeyPress(juce::KeyPress::returnKey)),
+          "Failed view retried rendering or accepted new input");
+  }
 }
 void exercise() {
   std::vector<juce::var> commands;
@@ -177,11 +395,11 @@ void exercise() {
   pump(view);
   commands.clear();
   view.mouseDown(
-      mouse(view, {102.0f, 253.0f}, juce::ModifierKeys::rightButtonModifier));
+      mouse(view, {102.0f, 237.0f}, juce::ModifierKeys::rightButtonModifier));
   view.mouseDrag(
-      mouse(view, {154.0f, 253.0f}, juce::ModifierKeys::rightButtonModifier));
+      mouse(view, {154.0f, 237.0f}, juce::ModifierKeys::rightButtonModifier));
   view.mouseUp(
-      mouse(view, {154.0f, 253.0f}, juce::ModifierKeys::rightButtonModifier));
+      mouse(view, {154.0f, 237.0f}, juce::ModifierKeys::rightButtonModifier));
   check(commands.empty(), "Right-click changed a parameter or started editing");
   view.keyPressed(juce::KeyPress('8', {}, '8'));
   view.keyPressed(juce::KeyPress(juce::KeyPress::returnKey));
@@ -191,17 +409,17 @@ void exercise() {
                      }),
         "Right-click entered a numeric draft");
   commands.clear();
-  view.mouseMove(mouse(view, {102.0f, 195.0f}));
+  view.mouseMove(mouse(view, {102.0f, 179.0f}));
   check(view.getMouseCursor() == juce::MouseCursor::UpDownResizeCursor,
         "Knob hover did not update the native cursor");
-  view.mouseMove(mouse(view, {102.0f, 253.0f}));
+  view.mouseMove(mouse(view, {102.0f, 237.0f}));
   check(view.getMouseCursor() == juce::MouseCursor::LeftRightResizeCursor,
         "Number hover did not expose horizontal dragging");
-  view.mouseExit(mouse(view, {102.0f, 253.0f}));
+  view.mouseExit(mouse(view, {102.0f, 237.0f}));
   check(view.getMouseCursor() == juce::MouseCursor::NormalCursor,
         "Leaving the view retained a control cursor");
-  view.mouseDown(mouse(view, {102.0f, 253.0f}));
-  view.mouseUp(mouse(view, {102.0f, 253.0f}));
+  view.mouseDown(mouse(view, {102.0f, 237.0f}));
+  view.mouseUp(mouse(view, {102.0f, 237.0f}));
   for (const char key : std::string("880"))
     view.keyPressed(
         juce::KeyPress(key, {}, static_cast<juce::juce_wchar>(key)));
@@ -220,8 +438,8 @@ void exercise() {
   check(static_cast<bool>(commands[0]["commit"]),
         "Numeric editing left a DAW gesture open");
   commands.clear();
-  view.mouseDown(mouse(view, {102.0f, 253.0f}));
-  view.mouseUp(mouse(view, {102.0f, 253.0f}));
+  view.mouseDown(mouse(view, {102.0f, 237.0f}));
+  view.mouseUp(mouse(view, {102.0f, 237.0f}));
   check(view.isTextInputActive(), "Native text input did not activate");
   view.insertTextAtCaret("123");
   view.setTemporaryUnderlining({juce::Range<int>{0, 3}});
@@ -249,8 +467,8 @@ void exercise() {
         "Native text bounds lost the selected width");
   view.keyPressed(juce::KeyPress(juce::KeyPress::escapeKey));
   check(!view.isTextInputActive(), "Escape left native text input active");
-  view.mouseDown(mouse(view, {102.0f, 253.0f}));
-  view.mouseUp(mouse(view, {102.0f, 253.0f}));
+  view.mouseDown(mouse(view, {102.0f, 237.0f}));
+  view.mouseUp(mouse(view, {102.0f, 237.0f}));
   view.keyPressed(juce::KeyPress(juce::KeyPress::homeKey));
   view.keyPressed(juce::KeyPress(juce::KeyPress::rightKey,
                                  juce::ModifierKeys::shiftModifier, 0));
@@ -264,9 +482,9 @@ void exercise() {
         "Cut lost the selected substring");
   view.keyPressed(juce::KeyPress(juce::KeyPress::escapeKey));
   commands.clear();
-  view.mouseDown(mouse(view, {102.0f, 253.0f}));
-  view.mouseDrag(mouse(view, {154.0f, 253.0f}));
-  view.mouseUp(mouse(view, {154.0f, 253.0f}));
+  view.mouseDown(mouse(view, {102.0f, 237.0f}));
+  view.mouseDrag(mouse(view, {154.0f, 237.0f}));
+  view.mouseUp(mouse(view, {154.0f, 237.0f}));
   check(std::any_of(commands.begin(), commands.end(),
                     [](const auto &command) {
                       return command["type"].toString() == "setParam" &&
@@ -288,6 +506,7 @@ void exercise() {
                                           juce::String(panel) + ".onda");
     juce::var presentation{new juce::DynamicObject};
     presentation.getDynamicObject()->setProperty("activePanel", panel);
+    presentation.getDynamicObject()->setProperty("scopePinned", true);
     state.getDynamicObject()->setProperty("viewState", presentation);
     juce::var message{new juce::DynamicObject};
     message.getDynamicObject()->setProperty("type", "state");
@@ -299,7 +518,7 @@ void exercise() {
           "Expanded scope did not request capture through the C interface");
   }
   view.message(juce::JSON::parse(
-      R"({"type":"state","state":{"path":"collapsed.onda","viewState":{"sections":{"scope":false}}}})"));
+      R"({"type":"state","state":{"path":"collapsed.onda","viewState":{"scopePinned":true,"sections":{"scope":false}}}})"));
   pump(view);
   check(!view.scopeVisible(), "Collapsed scope continued requesting capture");
   window.setSize(960, 720);
@@ -321,6 +540,9 @@ int runTests(int argc, const char *const *argv) {
 #if JUCE_WINDOWS
     checkWindowsRendererOwnership();
 #endif
+    exerciseCompositionCancellation();
+    exerciseRenderFailure();
+    exerciseSurfaceOwnership();
     exercise();
     exercise();
     std::cout << "Native GPU surface, parameter editing, scope, resize, "
@@ -336,7 +558,9 @@ class GpuUiTestApplication final : public juce::JUCEApplication {
 public:
   GpuUiTestApplication(int argc, const char *const *argv)
       : argc_(argc), argv_(argv) {}
-  const juce::String getApplicationName() override { return "Onda GPU UI tests"; }
+  const juce::String getApplicationName() override {
+    return "Onda GPU UI tests";
+  }
   const juce::String getApplicationVersion() override { return "1"; }
   bool moreThanOneInstanceAllowed() override { return true; }
   void initialise(const juce::String &) override {

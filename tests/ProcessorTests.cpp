@@ -1128,6 +1128,32 @@ bool exerciseScopeCapture() {
     return false;
   }
 
+  processor.setMeterCaptureEnabled(true);
+  juce::AudioBuffer<float> metered(2, 64);
+  metered.clear();
+  metered.setSample(0, 7, -0.8f);
+  metered.setSample(1, 19, 0.6f);
+  juce::MidiBuffer meterMidi;
+  allocation_audit::count.store(0, std::memory_order_relaxed);
+  lock_audit::count.store(0, std::memory_order_relaxed);
+  allocation_audit::enabled = true;
+  lock_audit::enabled = true;
+  processor.processBlock(metered, meterMidi);
+  allocation_audit::enabled = false;
+  lock_audit::enabled = false;
+  if (allocation_audit::count.load() || lock_audit::count.load()) {
+    std::cerr << "meter-only capture allocated or locked on the audio thread\n";
+    return false;
+  }
+  const auto levels = processor.meterSnapshot();
+  if (std::abs(levels.peaks[0] - 0.2f) > 0.0001f ||
+      std::abs(levels.peaks[1] - 0.15f) > 0.0001f ||
+      !processor.scopeSnapshot().samples.empty()) {
+    std::cerr << "meter-only capture lost peaks or retained waveform history\n";
+    return false;
+  }
+  processor.setMeterCaptureEnabled(false);
+
   processor.setScopeCaptureEnabled(true);
   const auto pendingScope = processor.scopeRevision();
   if (!pendingScope.enabled || pendingScope.frames != 0U) {
@@ -1534,6 +1560,7 @@ bool exerciseStateRestore() {
     original.setParamControlLayout(onda::plugin::ParamControlLayout::sliders);
     juce::var viewState{new juce::DynamicObject};
     viewState.getDynamicObject()->setProperty("octave", 2);
+    viewState.getDynamicObject()->setProperty("scopePinned", true);
     StateChangeListener viewStateChanges{original};
     original.setViewState(viewState);
     original.setViewState(viewState);
@@ -1551,6 +1578,7 @@ bool exerciseStateRestore() {
                  onda::plugin::ParamControlLayout::sliders &&
              static_cast<int>(juce::JSON::parse(original.viewState())
                                   .getProperty("octave", {})) == 2 &&
+             static_cast<bool>(juce::JSON::parse(original.viewState())["scopePinned"]) &&
              original.workerStatus().path == source.path();
     };
     const auto reject = [&](const juce::MemoryBlock &candidate) {
@@ -1660,6 +1688,7 @@ bool exerciseStateRestore() {
         width != 777 || height != 888 ||
         static_cast<int>(juce::JSON::parse(restored.viewState())
                              .getProperty("octave", {})) != 2 ||
+        !static_cast<bool>(juce::JSON::parse(restored.viewState())["scopePinned"]) ||
         restored.paramControlLayout() !=
             onda::plugin::ParamControlLayout::sliders ||
         restored.workerStatus().path != source.path()) {
@@ -4674,6 +4703,7 @@ int runProcessorCases(const int argc, const char *const *argv) {
       {"MessageThreadDelivery", exerciseMessageThreadDelivery},
       {"ProjectDirtyNotifications", exerciseProjectDirtyNotifications},
       {"RunViewAdapter", exerciseRunViewAdapter},
+      {"RunViewSchemaReadiness", exerciseRunViewSchemaReadiness},
       {"FastMath", exerciseFastMath},
       {"ScopeCapture", exerciseScopeCapture},
       {"UserEvents", exerciseUserEvents},
@@ -4687,8 +4717,11 @@ int runProcessorCases(const int argc, const char *const *argv) {
       {"StateRestore", exerciseStateRestore},
       {"EditorLifecycle", exerciseEditorLifecycle},
       {"NativeEditor", exerciseNativeEditor, "native"},
+      {"GpuEditorSmoothingPublications", exerciseGpuEditorSmoothingPublications, "gpu"},
       {"GpuEditorTeardown", exerciseGpuEditorTeardown, "gpu"},
       {"GpuEditorPeerRecreation", exerciseGpuEditorPeerRecreation, "gpu"},
+      {"GpuEditorRestoreBeforePreparation", exerciseGpuEditorRestoreBeforePreparation, "gpu"},
+      {"GpuEditorFileDrag", exerciseGpuEditorFileDrag, "gpu"},
       {"Vst3EditorAttachment", exerciseVst3EditorAttachment, "native"},
       {"EditorGestureCancellation", exerciseEditorGestureCancellation},
       {"StaleEditorEvents", exerciseStaleEditorEvents},

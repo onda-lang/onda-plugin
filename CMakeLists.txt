@@ -54,6 +54,9 @@ if(CMAKE_HOST_APPLE AND NOT DEFINED CMAKE_OSX_DEPLOYMENT_TARGET)
     set(CMAKE_OSX_DEPLOYMENT_TARGET "14.0" CACHE STRING "Minimum macOS version")
 endif()
 project(onda-plugin VERSION "${ONDA_PLUGIN_VERSION}" LANGUAGES C CXX)
+if(APPLE)
+    enable_language(OBJCXX)
+endif()
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/juce-version"
     "${CMAKE_CURRENT_SOURCE_DIR}/onda-version"
@@ -352,6 +355,28 @@ function(onda_treat_juce_headers_as_system target)
         "${ONDA_JUCE_SOURCE_DIR}/modules")
 endfunction()
 
+if(WIN32)
+    set(ONDA_GPU_SURFACE_SOURCE src/NativeGpuSurface_windows.cpp)
+elseif(APPLE)
+    set(ONDA_GPU_SURFACE_SOURCE src/NativeGpuSurface_mac.mm)
+else()
+    find_package(X11 REQUIRED COMPONENTS Xext)
+    set(ONDA_GPU_SURFACE_SOURCE src/NativeGpuSurface_linux.cpp)
+endif()
+
+function(onda_add_gpu_view target)
+    target_sources(${target} PRIVATE src/GpuView.cpp src/GpuView.h
+        src/GpuTextInput.cpp src/NativeGpuSurface.h ${ONDA_GPU_SURFACE_SOURCE})
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        target_link_libraries(${target} PRIVATE X11::X11 X11::Xext)
+    elseif(APPLE)
+        set_target_properties(${target} PROPERTIES
+            OBJCXX_STANDARD 20 OBJCXX_STANDARD_REQUIRED YES)
+        target_compile_definitions(${target} PRIVATE
+            ONDA_GPU_NS_VIEW_CLASS=${target}GpuSurfaceView)
+    endif()
+endfunction()
+
 add_library(onda_lto_flags INTERFACE)
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
     target_compile_options(onda_lto_flags INTERFACE
@@ -521,7 +546,7 @@ function(add_onda_plugin target product_name plugin_code is_synth)
         src/StateFormat.h
         src/SpscQueue.h
     )
-    target_sources(${target} PRIVATE src/GpuView.cpp src/GpuView.h src/GpuTextInput.cpp)
+    onda_add_gpu_view(${target})
     target_include_directories(${target} PRIVATE "${ONDA_SDK_ROOT}/include")
     target_compile_definitions(${target} PRIVATE
         ONDA_GPU_UI_LIBRARY_NAME="${ONDA_GPU_UI_LIBRARY_NAME}")

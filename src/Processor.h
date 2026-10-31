@@ -135,6 +135,8 @@ public:
   void releaseKeyboardNotes() noexcept;
   void clearRuntimeLog();
   void setScopeCaptureEnabled(bool enabled) noexcept;
+  void setMeterCaptureEnabled(bool enabled) noexcept;
+  [[nodiscard]] MeterSnapshot meterSnapshot() noexcept;
   [[nodiscard]] ScopeRevision scopeRevision() const noexcept;
   [[nodiscard]] ScopeSnapshot scopeSnapshot() const;
   [[nodiscard]] juce::File lastBrowseDirectory() const;
