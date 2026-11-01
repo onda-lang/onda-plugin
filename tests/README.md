@@ -10,6 +10,8 @@ ctest --test-dir build -C Release --output-on-failure -L '^(core|native)$'
 
 Native checks require a desktop. Linux CI uses `xvfb-run -a`; a local X11 desktop
 also works. Use the `core` label for tests that do not require a native surface.
+Native scheduling checks wait for bounded completion and verify a return to
+idle; OS exposure events and transient swapchains can add presentation attempts.
 
 | CTest label | Placement and purpose |
 | --- | --- |

@@ -69,6 +69,12 @@ void pump(onda::plugin::GpuView &view) {
   view.tick();
   check(view.error().isEmpty(), view.error().toRawUTF8());
 }
+bool dispatchUntil(const std::function<bool()> &complete) {
+  const auto deadline = juce::Time::getMillisecondCounterHiRes() + 2000.0;
+  while (!complete() && juce::Time::getMillisecondCounterHiRes() < deadline)
+    juce::MessageManager::getInstance()->runDispatchLoopUntil(10);
+  return complete();
+}
 #if JUCE_LINUX
 void checkNativePixels(juce::Component &parent, onda::plugin::GpuView &view) {
   auto *display = XOpenDisplay(nullptr);
@@ -307,11 +313,9 @@ void exerciseScheduling() {
   for (int i = 1; i <= 20; ++i)
     view.mouseDrag(mouse(view, {102.0f, 179.0f - static_cast<float>(i)}));
   check(renders == 0, "Input rendered synchronously instead of coalescing");
-  messages->runDispatchLoopUntil(30);
-  // Native focus/exposure events may require another frame in this interval.
-  if (renders != 1)
-    std::cout << "Native input/exposure frames: " << renders << '\n';
-  check(renders > 0, "Input burst did not draw without a polling tick");
+  // Native focus and exposure may independently request more frames.
+  check(dispatchUntil([&] { return renders > 0; }),
+        "Input burst did not draw without a polling tick");
   view.mouseUp(mouse(view, {102.0f, 159.0f}));
   view.mouseExit(mouse(view, {}));
   messages->runDispatchLoopUntil(150);
@@ -325,26 +329,40 @@ void exerciseScheduling() {
   check(GpuViewTestAccess::wakePending(view),
         "Hover did not schedule a wakeup");
   renders = 0;
-  messages->runDispatchLoopUntil(600);
-  check(renders == 1 && !GpuViewTestAccess::wakePending(view),
-        "Idle tooltip failed to draw once and return to sleep");
+  check(dispatchUntil([&] {
+          return renders > 0 && !GpuViewTestAccess::wakePending(view) &&
+                 !GpuViewTestAccess::timedUpdatePending(view);
+        }),
+        "Idle tooltip failed to draw and return to sleep");
+  check(view.error().isEmpty(), view.error().toRawUTF8());
   view.mouseExit(mouse(view, {}));
   messages->runDispatchLoopUntil(30);
 
   // A temporary presentation failure must recover without a data polling timer.
-  static int attempts;
+  static int attempts, presented;
   attempts = 0;
+  presented = 0;
   GpuViewTestAccess::render(view) = [](OndaUi *ui) {
     if (++attempts == 1)
       return 0;
-    return nativeRender(ui);
+    const auto result = nativeRender(ui);
+    if (result > 0)
+      ++presented;
+    return result;
   };
   GpuViewTestAccess::expose(view);
   view.tick();
   check(attempts == 1 && GpuViewTestAccess::wakePending(view),
         "Unavailable presentation did not schedule a bounded retry");
-  messages->runDispatchLoopUntil(100);
-  check(attempts == 2 && !GpuViewTestAccess::wakePending(view),
+  const auto recovered = dispatchUntil([&] {
+    return attempts >= 2 && presented > 0 &&
+           !GpuViewTestAccess::wakePending(view);
+  });
+  if (!recovered || attempts != 2)
+    std::cerr << "Presentation retry: attempts=" << attempts
+              << ", presented=" << presented
+              << ", wake=" << GpuViewTestAccess::wakePending(view) << '\n';
+  check(recovered && view.error().isEmpty(),
         "Unavailable presentation did not recover and return to sleep");
   GpuViewTestAccess::render(view) = nativeRender;
 
@@ -367,12 +385,18 @@ void exerciseScheduling() {
   };
   view.mouseWheelMove(mouse(view, {700.0f, 400.0f}), wheel);
   view.mouseExit(mouse(view, {}));
-  messages->runDispatchLoopUntil(250);
-  if (saves != 1 || renders != 1 || GpuViewTestAccess::wakePending(view))
+  const auto saved = dispatchUntil([&] {
+    return saves == 1 && !GpuViewTestAccess::wakePending(view);
+  });
+  if (!saved || renders == 0)
     std::cerr << "Scroll scheduling: saves=" << saves << ", frames=" << renders
               << ", wake=" << GpuViewTestAccess::wakePending(view) << '\n';
-  check(saves == 1 && renders == 1 && !GpuViewTestAccess::wakePending(view),
-        "Scroll and its deferred save did not complete with one frame");
+  check(saved && renders > 0,
+        "Scroll and its deferred save did not complete without polling");
+  renders = 0;
+  messages->runDispatchLoopUntil(100);
+  check(saves == 1 && renders == 0 && !GpuViewTestAccess::wakePending(view),
+        "Deferred save kept drawing or waking after it completed");
   view.mouseMove(mouse(view, {100.0f, 35.0f}));
   messages->runDispatchLoopUntil(30);
   window.setVisible(false);

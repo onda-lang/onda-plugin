@@ -21,6 +21,9 @@ struct GpuViewTestAccess {
   static auto &render(GpuView &view) { return view.render_; }
   static auto &error(GpuView &view) { return view.error_fn_; }
   static bool wakePending(const GpuView &view) { return view.isTimerRunning(); }
+  static bool timedUpdatePending(const GpuView &view) {
+    return view.ui_ && view.wake_delay_(view.ui_) >= 0;
+  }
   static void expose(GpuView &view) { view.exposed_ = true; }
   static void connectInput(GpuView &view, decltype(&onda_ui_input) input) {
     view.ui_ = reinterpret_cast<OndaUi *>(&view);
