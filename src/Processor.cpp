@@ -336,7 +336,10 @@ double Processor::getTailLengthSeconds() const {
                                       : 0.0;
 }
 
+void Processor::releaseResources() { scopeCapture_.clearMeter(); }
+
 void Processor::reset() {
+  scopeCapture_.clearMeter();
   clearMidiActivity();
   if (runtimeFaulted_.load(std::memory_order_acquire))
     runtimeRecoveryRequested_.store(true, std::memory_order_release);

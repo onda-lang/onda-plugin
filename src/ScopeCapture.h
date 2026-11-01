@@ -46,20 +46,28 @@ public:
 
   void setMeterEnabled(const bool enabled) noexcept {
     meterEnabled_.store(enabled, std::memory_order_release);
+    clearMeter();
+  }
+
+  void clearMeter() noexcept {
     for (auto &peak : peaks_)
       peak.store(0.0f, std::memory_order_relaxed);
   }
 
   [[nodiscard]] MeterSnapshot meterSnapshot() noexcept {
-    MeterSnapshot result;
-    for (std::size_t i = 0; i < result.count; ++i)
-      result.peaks[i] = peaks_[i].exchange(0.0f, std::memory_order_relaxed);
-    return result;
+    if (!meterEnabled_.load(std::memory_order_acquire))
+      return {};
+    for (std::size_t i = 0; i < lastMeter_.count; ++i) {
+      // Negative means no new block; a captured zero is genuine silence.
+      const auto peak = peaks_[i].exchange(-1.0f, std::memory_order_relaxed);
+      if (peak >= 0.0f)
+        lastMeter_.peaks[i] = peak;
+    }
+    return lastMeter_;
   }
 
   void requestReset() noexcept {
-    for (auto &peak : peaks_)
-      peak.store(0.0f, std::memory_order_relaxed);
+    clearMeter();
     requestedReset_.fetch_add(1U, std::memory_order_release);
   }
 
@@ -158,6 +166,7 @@ private:
   std::atomic<bool> enabled_{};
   std::atomic<bool> meterEnabled_{};
   std::array<std::atomic<float>, MeterSnapshot::count> peaks_{};
+  MeterSnapshot lastMeter_{}; // Owned by the UI snapshot consumer.
 };
 
 } // namespace onda::plugin

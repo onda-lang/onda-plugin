@@ -4029,6 +4029,35 @@ bool exerciseHostPreparation() {
   return !failed.workerStatus().active && rendersImmediately(failed, 64, 1.0F);
 }
 
+bool exerciseMeterLifecycle() {
+  using namespace onda::plugin;
+  TemporarySource source;
+  if (!source.write("sample { out1 = 0.25; out2 = 0.25 }\n"))
+    return false;
+  Processor processor(Product::effect);
+  processor.setNonRealtime(true);
+  processor.loadFile(juce::File(pathToJuce(source.path())), false);
+  processor.prepareToPlay(48'000.0, 64);
+  processor.setMeterCaptureEnabled(true);
+  for (const bool release : {false, true}) {
+    if (!processWithoutAllocation(processor, 0.25F) ||
+        processor.meterSnapshot().peaks[0] != 0.25F ||
+        processor.meterSnapshot().peaks[0] != 0.25F)
+      return false;
+    if (release)
+      processor.releaseResources();
+    else
+      processor.reset();
+    for (const auto peak : processor.meterSnapshot().peaks) {
+      if (peak != 0.0F) {
+        std::cerr << "Host reset/release left a stale meter reading\n";
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
 bool exercisePreparedParameterInitialization() {
   using namespace onda::plugin;
   constexpr auto patch = R"(
@@ -4690,6 +4719,7 @@ int runProcessorCases(const int argc, const char *const *argv) {
       {"AlignedAllocation", exerciseAlignedAllocation},
       {"NewControlDefaults", exerciseNewControlDefaults},
       {"HostPreparation", exerciseHostPreparation},
+      {"MeterLifecycle", exerciseMeterLifecycle},
       {"PreparedParameterInitialization",
        exercisePreparedParameterInitialization},
       {"StateSaveDuringNotification", exerciseStateSaveDuringNotification},

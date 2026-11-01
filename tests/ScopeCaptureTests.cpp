@@ -43,14 +43,32 @@ int main() {
     return 1;
   }
   const auto empty = capture->meterSnapshot();
+  for (std::size_t channel = 0; channel < channels; ++channel) {
+    if (empty.peaks[channel] != levels.peaks[channel]) {
+      std::cerr << "Empty meter poll reported silence without a new audio block\n";
+      return 1;
+    }
+  }
+  capture->push(pointers, 4);
+  const auto silence = capture->meterSnapshot();
   capture->setMeterEnabled(false);
   for (auto &channel : samples)
     channel.fill(1.0f);
   capture->push(pointers, 4);
   const auto disabled = capture->meterSnapshot();
   for (std::size_t channel = 0; channel < channels; ++channel) {
-    if (empty.peaks[channel] != 0.0f || disabled.peaks[channel] != 0.0f) {
-      std::cerr << "Consumed or disabled meters retained peaks\n";
+    if (silence.peaks[channel] != 0.0f || disabled.peaks[channel] != 0.0f) {
+      std::cerr << "Silent or disabled meters retained peaks\n";
+      return 1;
+    }
+  }
+  capture->setMeterEnabled(true);
+  capture->push(pointers, 4);
+  static_cast<void>(capture->meterSnapshot());
+  capture->requestReset();
+  for (const auto peak : capture->meterSnapshot().peaks) {
+    if (peak != 0.0f) {
+      std::cerr << "Reset meter retained a previously displayed peak\n";
       return 1;
     }
   }

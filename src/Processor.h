@@ -73,7 +73,7 @@ public:
   ~Processor() override;
 
   void prepareToPlay(double sampleRate, int maximumBlockSize) override;
-  void releaseResources() override {}
+  void releaseResources() override;
   void reset() override;
   [[nodiscard]] bool
   isBusesLayoutSupported(const BusesLayout &layouts) const override;
