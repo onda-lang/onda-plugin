@@ -35,6 +35,7 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event_name }}-${{ inputs.source_ref || github.ref }}-${{ inputs.tests || 'release' }}-${{ inputs.platform || 'all' }}

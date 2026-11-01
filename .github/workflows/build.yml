@@ -21,9 +21,14 @@ on:
         description: Onda commit supplying SDK artifacts in the calling run; empty uses a release
         type: string
         default: ''
+      onda_run_id:
+        description: Existing Onda SDK build run; zero uses the calling run
+        type: number
+        default: 0
 
 permissions:
   contents: read
+  actions: read
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -50,6 +55,8 @@ jobs:
           SOURCE_REF: ${{ inputs.source_ref }}
           RELEASE_TAG: ${{ inputs.release_tag }}
           TARGET_PLATFORM: ${{ inputs.platform }}
+          ONDA_SOURCE_REF: ${{ inputs.onda_source_ref }}
+          ONDA_RUN_ID: ${{ inputs.onda_run_id }}
         run: |
           if ! git check-ref-format --allow-onelevel "$SOURCE_REF"; then
             echo "expected a source tag, branch, or full commit SHA, got $SOURCE_REF" >&2
@@ -63,6 +70,14 @@ jobs:
             linux-x64|windows-x64|macos-arm64|all) ;;
             *) echo "unknown platform: $TARGET_PLATFORM" >&2; exit 1 ;;
           esac
+          if [[ -n "$ONDA_SOURCE_REF" && ! "$ONDA_SOURCE_REF" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "expected a full Onda SDK source commit" >&2
+            exit 1
+          fi
+          if [[ ! "$ONDA_RUN_ID" =~ ^[0-9]+$ || ( "$ONDA_RUN_ID" != 0 && -z "$ONDA_SOURCE_REF" ) ]]; then
+            echo "an existing SDK run requires its exact Onda source commit" >&2
+            exit 1
+          fi
 
           audit=false
           extended=false
@@ -191,6 +206,9 @@ jobs:
         with:
           name: onda-${{ matrix.platform }}
           path: .onda-sdk
+          repository: onda-lang/onda
+          run-id: ${{ inputs.onda_run_id || github.run_id }}
+          github-token: ${{ inputs.onda_run_id && github.token || '' }}
 
       - name: Checkout matching Onda resources
         if: inputs.onda_source_ref != ''

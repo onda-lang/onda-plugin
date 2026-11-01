@@ -64,6 +64,9 @@ code and tests to check out. No new version tag or plugin release is needed.
 The reusable `build.yml` also accepts `onda_source_ref` from an Onda integration
 workflow. It verifies unpublished SDK artifacts and resource checkout against
 that commit. Additional channel builds retain the same resource revision pin.
+Onda integration runs can also supply `onda_run_id` to reuse an existing SDK
+build in `onda-lang/onda`. The caller grants `actions: read`; the same source
+and archive checks apply without rebuilding the SDK.
 
 Run extended cases with:
 
