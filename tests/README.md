@@ -136,7 +136,7 @@ compositor's bridge and are not established by this suite.
 | `onda_watcher_tests` | Native filesystem notifications, missing paths, inode replacement, and Linux subscription recovery without JUCE/compiler setup. |
 | `onda_scope_capture_{1,2,8,64}_tests` | Per-channel peak retention/reset, non-finite samples, and meter-only capture without waveform writes. |
 | `onda_channel_layout_script_tests` | Linux layout driver preserves the SDK resource checkout and revision for all configurations, including release-tag mode. |
-| `onda_gpu_ui_tests` | Dedicated native surface, input/IME, immediate resize presentation, reparenting/parent destruction, and hide/show. Linux pixels survive JUCE repaints; macOS density and Windows parent-renderer ownership are checked. |
+| `onda_gpu_ui_tests` | Dedicated native surface, input/IME, coalesced input redraws without polling, idle wakeups and presentation retries, immediate resize presentation, reparenting/parent destruction, and hide/show. Linux pixels survive JUCE repaints; macOS density and Windows parent-renderer ownership are checked. |
 | `onda_gpu_keyboard_tests` | Surface-free consumed/unused/error distinctions and forwarding unused keys to the DAW. |
 | `onda_gpu_editor_tests` | Smoothing acknowledgments carry accepted values and errors without resending schemas; teardown resolves drafts before handlers die; hidden input suspension and presentation/capture restoration after reparenting. |
 | `onda_example_tests` | Shipped examples compile and render finite, meaningful output. |

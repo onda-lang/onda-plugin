@@ -318,7 +318,18 @@ bool exerciseGpuEditorPeerRecreation() {
     messages.clear();
     scopeCalls = 0;
     window->addAndMakeVisible(editor);
-    EditorTestAccess::tick(editor);
+    if (!test::waitForMessage([&] {
+          return !view->error().isEmpty() ||
+                 std::any_of(messages.begin(), messages.end(),
+                             [](const auto &message) {
+                               return message["type"].toString() == "state" &&
+                                      message["state"]["viewState"].isObject();
+                             });
+        })) {
+      std::cerr
+          << "Recreated GPU editor did not restore through the event loop\n";
+      return false;
+    }
     if (!view->error().isEmpty() || view->scopeVisible()) {
       std::cerr << "Recreated GPU editor lost its collapsed scope: "
                 << view->error() << '\n';

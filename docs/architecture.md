@@ -193,8 +193,13 @@ IME, cursor, and file-drop handling. Peer/movement/visibility changes keep the
 child attached. Destroy the renderer before the child or its borrowed display.
 Resize draws immediately; native exposure schedules a draw through JUCE's event
 loop. The child stays hidden until the first frame and hides on rendering errors.
-The 60 Hz editor timer publishes state and advances the view; visualization has
-its own 30 Hz publication budget.
+The 60 Hz editor timer polls processor state; visualization has its own 30 Hz
+publication budget. Input and state changes request a coalesced redraw through
+JUCE's event loop, independently of that polling timer. The UI advances timed
+state without drawing and reports its next wakeup delay. A one-shot view timer
+services that deadline, including deferred persistence that needs no frame, and
+bounded retries for temporarily unavailable presentation. Hidden views cancel
+their wakeups; exposure forces presentation even when UI state is unchanged.
 
 Parameter and input-control values use `parameterValues` after the initial
 schema. The shared Rust UI converts normalized values using published domain

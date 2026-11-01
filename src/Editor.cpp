@@ -222,15 +222,10 @@ void Editor::viewReady() {
 }
 
 void Editor::timerCallback() {
-  const auto tickGpu = [this] {
-    gpu_->tick();
-    if (gpu_->error().isNotEmpty()) {
-      loadingOverlay_.setText(gpu_->error(), juce::dontSendNotification);
-      loadingOverlay_.setVisible(true);
-    }
-  };
-  if (!viewReady_ || !gpu_->isShowing())
-    tickGpu();
+  if (gpu_->error().isNotEmpty()) {
+    loadingOverlay_.setText(gpu_->error(), juce::dontSendNotification);
+    loadingOverlay_.setVisible(true);
+  }
   const auto showing = viewReady_ && isShowing() && viewVisible();
   const auto captureMeter = showing && gpu_->meterVisible();
   if (meterCaptureActive_ != captureMeter) {
@@ -253,7 +248,6 @@ void Editor::timerCallback() {
   publishState(false);
   publishMidiActivity();
   publishVisualization();
-  tickGpu();
 }
 
 void Editor::publishMidiActivity(const bool force) {
@@ -394,7 +388,7 @@ void Editor::publishVisualization(const bool force) {
   if (!isShowing() || !viewVisible() ||
       (!scopeCaptureActive_ && !meterCaptureActive_))
     return;
-  // Meters and waveform share one clock; GPU input remains at 60 Hz.
+  // Meters and waveform share one clock, independently of input redraws.
   constexpr auto intervalMs = 1000.0 / 30.0;
   const auto now = juce::Time::getMillisecondCounterHiRes();
   const auto elapsed = !force && publishedVisualizationTimeMs_ > 0.0

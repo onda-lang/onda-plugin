@@ -14,7 +14,8 @@ class NativeGpuSurface;
 class GpuView final : public juce::Component,
                       public juce::TextInputTarget,
                       private juce::ComponentMovementWatcher,
-                      private juce::AsyncUpdater {
+                      private juce::AsyncUpdater,
+                      private juce::Timer {
 public:
   using Command = std::function<void(const juce::var &)>;
   GpuView(Command command, std::function<void()> ready);
@@ -57,6 +58,8 @@ private:
   void componentPeerChanged() override;
   void componentVisibilityChanged() override;
   void handleAsyncUpdate() override { tick(); }
+  void timerCallback() override;
+  void armWake();
   bool input(juce::var event);
   void drain();
   void release();
@@ -74,6 +77,8 @@ private:
   decltype(&onda_ui_input) input_{};
   decltype(&onda_ui_cursor) cursor_{};
   decltype(&onda_ui_render) render_{};
+  decltype(&onda_ui_update) update_{};
+  decltype(&onda_ui_wake_delay_ms) wake_delay_{};
   decltype(&onda_ui_meter) meter_{};
   decltype(&onda_ui_meter_visible) meter_visible_{};
   decltype(&onda_ui_scope) scope_{};
@@ -90,5 +95,6 @@ private:
   bool exposed_{true};
   bool composing_{};
   bool drawing_{};
+  double redrawRetryMs_{};
 };
 } // namespace onda::plugin

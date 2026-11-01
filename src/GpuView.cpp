@@ -1,6 +1,8 @@
 #include "GpuView.h"
 #include "NativeGpuSurface.h"
 #include <array>
+#include <cmath>
+#include <limits>
 #include <utility>
 #if JUCE_WINDOWS
 #include <windows.h>
@@ -80,6 +82,7 @@ GpuView::GpuView(Command command, std::function<void()> ready)
 }
 GpuView::~GpuView() { release(); }
 void GpuView::release() {
+  stopTimer();
   cancelPendingUpdate();
   if (ui_)
     input(event("focusLost"));
@@ -88,6 +91,8 @@ void GpuView::release() {
   surface_.reset();
   peerId_ = 0;
   framebufferSize_ = {};
+  redrawRetryMs_ = 0;
+  cancelPendingUpdate();
 }
 bool GpuView::initialize() {
   if (!getPeer() || !isShowing() || getLocalBounds().isEmpty() ||
@@ -113,6 +118,8 @@ bool GpuView::initialize() {
     ONDA_LOAD(input_, "onda_ui_input")
     ONDA_LOAD(cursor_, "onda_ui_cursor")
     ONDA_LOAD(render_, "onda_ui_render")
+    ONDA_LOAD(update_, "onda_ui_update")
+    ONDA_LOAD(wake_delay_, "onda_ui_wake_delay_ms")
     ONDA_LOAD(meter_, "onda_ui_meter")
     ONDA_LOAD(meter_visible_, "onda_ui_meter_visible")
     ONDA_LOAD(scope_, "onda_ui_scope")
@@ -151,6 +158,8 @@ bool GpuView::initialize() {
   return true;
 }
 void GpuView::tick() {
+  cancelPendingUpdate();
+  stopTimer();
   if (ui_ && (!getPeer() || getPeer()->getUniqueID() != peerId_)) {
     release();
   }
@@ -162,7 +171,44 @@ void GpuView::tick() {
   if (!ui_ && !initialize())
     return;
   updateSurface();
-  draw();
+  if (exposed_) {
+    exposed_ = false;
+    redrawRetryMs_ = 0;
+    resize_(ui_, static_cast<uint32_t>(framebufferSize_.x),
+            static_cast<uint32_t>(framebufferSize_.y), scale_);
+  }
+  const auto redraw = update_(ui_);
+  drain();
+  if (redraw < 0) {
+    error_ = juce::String::fromUTF8(error_fn_(ui_));
+    if (error_.isEmpty())
+      error_ = "GPU UI update failed; reopen the editor";
+  }
+  if (!error_.isEmpty()) {
+    release();
+    return;
+  }
+  if (redraw > 0 && juce::Time::getMillisecondCounterHiRes() >= redrawRetryMs_)
+    draw();
+  armWake();
+}
+void GpuView::timerCallback() {
+  stopTimer();
+  triggerAsyncUpdate();
+}
+void GpuView::armWake() {
+  if (!ui_ || !isShowing())
+    return;
+  auto delay = wake_delay_(ui_);
+  if (redrawRetryMs_ > 0) {
+    const auto retry = std::max(
+        0.0, redrawRetryMs_ - juce::Time::getMillisecondCounterHiRes());
+    delay = delay < 0 ? retry : std::min(delay, retry);
+  }
+  if (delay >= 0)
+    startTimer(static_cast<int>(
+        std::clamp(std::ceil(delay), 1.0,
+                   static_cast<double>(std::numeric_limits<int>::max()))));
 }
 void GpuView::updateSurface() {
   if (!surface_ || !getPeer())
@@ -180,11 +226,6 @@ void GpuView::draw() {
   if (!ui_ || drawing_ || !isShowing())
     return;
   const juce::ScopedValueSetter<bool> drawing(drawing_, true);
-  if (exposed_) {
-    exposed_ = false;
-    resize_(ui_, static_cast<uint32_t>(framebufferSize_.x),
-            static_cast<uint32_t>(framebufferSize_.y), scale_);
-  }
   if (getLocalBounds().isEmpty()) {
     surface_->setVisible(false);
     drain();
@@ -202,14 +243,17 @@ void GpuView::draw() {
   }
   if (result > 0)
     surface_->setVisible(true);
+  // An unavailable swapchain must retry even if no input or audio arrives.
+  redrawRetryMs_ =
+      result == 0 ? juce::Time::getMillisecondCounterHiRes() + 1000.0 / 30.0
+                  : 0.0;
   drain();
 }
 void GpuView::componentMovedOrResized(bool, bool) {
   if (ui_) {
     if (getLocalBounds().isEmpty())
       suspend();
-    updateSurface();
-    draw();
+    tick();
   }
 }
 void GpuView::componentPeerChanged() {
@@ -232,16 +276,21 @@ void GpuView::message(const juce::var &value) {
   if (!message_(ui_, json.toRawUTF8()))
     error_ = juce::String::fromUTF8(error_fn_(ui_));
   drain();
+  triggerAsyncUpdate();
 }
 void GpuView::meter(int channels, const float *peaks, std::size_t count) {
-  if (ui_)
+  if (ui_) {
     meter_(ui_, static_cast<uint32_t>(channels), peaks, count);
+    triggerAsyncUpdate();
+  }
 }
 
 void GpuView::scope(int channels, const std::vector<float> &samples) {
-  if (ui_)
+  if (ui_) {
     scope_(ui_, static_cast<uint32_t>(channels), samples.data(),
            samples.size());
+    triggerAsyncUpdate();
+  }
 }
 bool GpuView::input(juce::var value) {
   if (!ui_)
@@ -251,6 +300,7 @@ bool GpuView::input(juce::var value) {
   if (result < 0)
     error_ = juce::String::fromUTF8(error_fn_(ui_));
   drain();
+  triggerAsyncUpdate();
   return result > 0;
 }
 void GpuView::drain() {

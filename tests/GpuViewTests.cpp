@@ -130,6 +130,7 @@ void exerciseSurfaceOwnership() {
   static int renders;
   // A temporarily unavailable swapchain must leave the last image visible.
   render = [](OndaUi *) { return 0; };
+  onda::plugin::GpuViewTestAccess::expose(view);
   view.tick();
 #if JUCE_LINUX
   checkNativePixels(first, view);
@@ -235,6 +236,109 @@ juce::MouseEvent mouse(juce::Component &view, juce::Point<float> position,
           1,
           false};
 }
+void exerciseScheduling() {
+  using onda::plugin::GpuViewTestAccess;
+  Window window;
+  int saves = 0;
+  onda::plugin::GpuView view(
+      [&](const auto &command) {
+        if (command["type"].toString() == "viewState")
+          ++saves;
+      },
+      [] {});
+  window.setSize(720, 840);
+  window.addAndMakeVisible(view);
+  view.setBounds(window.getLocalBounds());
+  window.addToDesktop(0);
+  window.setVisible(true);
+  pump(view);
+  view.message(juce::JSON::parse(
+      R"({"type":"state","state":{"path":"schedule.onda","supportsScope":false,"supportsTransport":false,"supportsViewState":true,"paramLayout":"knobs","params":[{"name":"gain","type":"f64","value":0.5,"rangeMin":0,"rangeMax":1}]}})"));
+  auto *messages = juce::MessageManager::getInstance();
+  messages->runDispatchLoopUntil(50);
+  static decltype(&onda_ui_render) nativeRender;
+  static int renders;
+  nativeRender = GpuViewTestAccess::render(view);
+  const juce::ScopedValueSetter<decltype(nativeRender)> countRenders(
+      GpuViewTestAccess::render(view), [](OndaUi *ui) {
+        ++renders;
+        return nativeRender(ui);
+      });
+  renders = 0;
+  view.mouseDown(mouse(view, {102.0f, 179.0f}));
+  for (int i = 1; i <= 20; ++i)
+    view.mouseDrag(mouse(view, {102.0f, 179.0f - static_cast<float>(i)}));
+  check(renders == 0, "Input rendered synchronously instead of coalescing");
+  messages->runDispatchLoopUntil(30);
+  check(renders == 1, "Input burst did not draw once without a polling tick");
+  view.mouseUp(mouse(view, {102.0f, 159.0f}));
+  view.mouseExit(mouse(view, {}));
+  messages->runDispatchLoopUntil(150);
+  renders = 0;
+  messages->runDispatchLoopUntil(100);
+  check(renders == 0 && !GpuViewTestAccess::wakePending(view),
+        "An idle view kept drawing or waking");
+
+  view.mouseMove(mouse(view, {100.0f, 35.0f}));
+  messages->runDispatchLoopUntil(30);
+  check(GpuViewTestAccess::wakePending(view),
+        "Hover did not schedule a wakeup");
+  renders = 0;
+  messages->runDispatchLoopUntil(600);
+  check(renders == 1 && !GpuViewTestAccess::wakePending(view),
+        "Idle tooltip failed to draw once and return to sleep");
+  view.mouseExit(mouse(view, {}));
+  messages->runDispatchLoopUntil(30);
+
+  // A temporary presentation failure must recover without a data polling timer.
+  static int attempts;
+  attempts = 0;
+  GpuViewTestAccess::render(view) = [](OndaUi *ui) {
+    if (++attempts == 1)
+      return 0;
+    return nativeRender(ui);
+  };
+  GpuViewTestAccess::expose(view);
+  view.tick();
+  check(attempts == 1 && GpuViewTestAccess::wakePending(view),
+        "Unavailable presentation did not schedule a bounded retry");
+  messages->runDispatchLoopUntil(100);
+  check(attempts == 2 && !GpuViewTestAccess::wakePending(view),
+        "Unavailable presentation did not recover and return to sleep");
+  GpuViewTestAccess::render(view) = nativeRender;
+
+  juce::Array<juce::var> params;
+  for (int i = 0; i < 60; ++i)
+    params.add(juce::JSON::parse("{\"name\":\"p" + juce::String(i) +
+                                 "\",\"type\":\"f64\",\"value\":0}"));
+  auto state =
+      juce::JSON::parse(R"({"type":"state","state":{"path":"scroll.onda"}})");
+  state["state"].getDynamicObject()->setProperty("params", params);
+  view.message(state);
+  messages->runDispatchLoopUntil(50);
+  juce::MouseWheelDetails wheel{};
+  wheel.deltaY = -0.1f;
+  saves = 0;
+  renders = 0;
+  GpuViewTestAccess::render(view) = [](OndaUi *ui) {
+    ++renders;
+    return nativeRender(ui);
+  };
+  view.mouseWheelMove(mouse(view, {700.0f, 400.0f}), wheel);
+  view.mouseExit(mouse(view, {}));
+  messages->runDispatchLoopUntil(250);
+  if (saves != 1 || renders != 1 || GpuViewTestAccess::wakePending(view))
+    std::cerr << "Scroll scheduling: saves=" << saves << ", frames=" << renders
+              << ", wake=" << GpuViewTestAccess::wakePending(view) << '\n';
+  check(saves == 1 && renders == 1 && !GpuViewTestAccess::wakePending(view),
+        "Scroll and its deferred save did not complete with one frame");
+  view.mouseMove(mouse(view, {100.0f, 35.0f}));
+  messages->runDispatchLoopUntil(30);
+  window.setVisible(false);
+  messages->runDispatchLoopUntil(30);
+  check(!GpuViewTestAccess::wakePending(view),
+        "Hidden view retained its wakeup timer");
+}
 void exerciseCompositionCancellation() {
   Window window;
   onda::plugin::GpuView view([](const auto &) {}, [] {});
@@ -275,6 +379,30 @@ void exerciseCompositionCancellation() {
               !view.isTextInputActive(),
           "Canceled composition blocked typing or Enter in the next field");
   }
+}
+void exercisePublicationFailure() {
+  Window window;
+  onda::plugin::GpuView view([](const auto &) {}, [] {});
+  window.setSize(720, 840);
+  window.addAndMakeVisible(view);
+  view.setBounds(window.getLocalBounds());
+  window.addToDesktop(0);
+  window.setVisible(true);
+  pump(view);
+  juce::MessageManager::getInstance()->runDispatchLoopUntil(30);
+  // A failed publication must release a clean view, even when no frame is due.
+  onda::plugin::GpuViewTestAccess::message(view) = [](OndaUi *, const char *) {
+    return 0;
+  };
+  onda::plugin::GpuViewTestAccess::error(view) = [](const OndaUi *) {
+    return "injected publication failure";
+  };
+  view.message(juce::JSON::parse(R"({"type":"state","state":{}})"));
+  juce::MessageManager::getInstance()->runDispatchLoopUntil(30);
+  check(view.error() == "injected publication failure" &&
+            !onda::plugin::GpuViewTestAccess::initialized(view) &&
+            !onda::plugin::GpuViewTestAccess::wakePending(view),
+        "Failed publication retained a clean UI or pending wakeup");
 }
 void exerciseZeroSizeSuspension() {
   std::vector<juce::var> commands;
@@ -575,9 +703,11 @@ int runTests(int argc, const char *const *argv) {
     checkWindowsRendererOwnership();
 #endif
     exerciseCompositionCancellation();
+    exercisePublicationFailure();
     exerciseZeroSizeSuspension();
     exerciseRenderFailure();
     exerciseSurfaceOwnership();
+    exerciseScheduling();
     exercise();
     exercise();
     std::cout << "Native GPU surface, parameter editing, scope, resize, "
