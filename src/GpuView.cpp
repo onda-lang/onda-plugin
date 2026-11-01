@@ -76,7 +76,10 @@ juce::var pointer(const char *type, const juce::MouseEvent &mouse) {
 
 GpuView::GpuView(Command command, std::function<void()> ready)
     : ComponentMovementWatcher(this), command_(std::move(command)),
-      ready_(std::move(ready)) {
+      ready_(std::move(ready)), scaleNotifier_(this, [this](float) {
+        exposed_ = true;
+        triggerAsyncUpdate();
+      }) {
   setWantsKeyboardFocus(true);
   setOpaque(false);
 }

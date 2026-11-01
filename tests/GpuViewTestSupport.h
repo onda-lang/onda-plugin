@@ -14,6 +14,7 @@ struct GpuViewTestAccess {
     static_cast<void>(view.input(juce::JSON::parse(json)));
   }
   static float scale(const GpuView &view) { return view.scale_; }
+  static auto framebufferSize(const GpuView &view) { return view.framebufferSize_; }
   static auto surfaceWindow(const GpuView &view) {
     return view.surface_ ? view.surface_->handles().window : 0;
   }

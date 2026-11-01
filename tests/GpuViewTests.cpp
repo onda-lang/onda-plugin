@@ -121,6 +121,27 @@ void exerciseSurfaceOwnership() {
   check(onda::plugin::GpuViewTestAccess::surfaceWindow(view) !=
             reinterpret_cast<uintptr_t>(first.getPeer()->getNativeHandle()),
         "GPU and JUCE still paint into the same native surface");
+#if JUCE_LINUX || JUCE_WINDOWS
+  // Host zoom/DPI changes may preserve every logical component bound.
+  juce::MessageManager::getInstance()->runDispatchLoopUntil(60);
+  auto *peer = first.getPeer();
+  const auto previousScale = peer->getCustomPlatformScaleFactor();
+  const auto nextScale = peer->getPlatformScaleFactor() == 1.5 ? 2.0 : 1.5;
+  const auto logicalBounds = view.getBounds();
+  peer->setCustomPlatformScaleFactor(nextScale);
+  juce::MessageManager::getInstance()->runDispatchLoopUntil(50);
+  check(
+      view.getBounds() == logicalBounds &&
+          juce::approximatelyEqual(onda::plugin::GpuViewTestAccess::scale(view),
+                                   static_cast<float>(nextScale)) &&
+          onda::plugin::GpuViewTestAccess::framebufferSize(view) ==
+              juce::Point<int>{
+                  juce::roundToInt(logicalBounds.getWidth() * nextScale),
+                  juce::roundToInt(logicalBounds.getHeight() * nextScale)},
+      "Idle DPI change waited for input, polling, or a logical resize");
+  peer->setCustomPlatformScaleFactor(previousScale);
+  juce::MessageManager::getInstance()->runDispatchLoopUntil(50);
+#endif
 #if JUCE_LINUX
   checkNativePixels(first, view);
 #endif
@@ -157,6 +178,23 @@ void exerciseSurfaceOwnership() {
   second.addAndMakeVisible(view);
   pump(view);
   check(ready == 2, "Reparenting did not recreate the dedicated surface");
+#if JUCE_LINUX || JUCE_WINDOWS
+  juce::MessageManager::getInstance()->runDispatchLoopUntil(50);
+  renders = 0;
+  render = [](OndaUi *ui) {
+    ++renders;
+    return nativeRender(ui);
+  };
+  first.getPeer()->setCustomPlatformScaleFactor(1.75);
+  juce::MessageManager::getInstance()->runDispatchLoopUntil(50);
+  check(renders == 0, "Reparented view still observed the old peer's scale");
+  second.getPeer()->setCustomPlatformScaleFactor(1.75);
+  juce::MessageManager::getInstance()->runDispatchLoopUntil(50);
+  check(renders > 0 && juce::approximatelyEqual(
+                           onda::plugin::GpuViewTestAccess::scale(view), 1.75f),
+        "Reparented view did not observe its new peer's scale");
+  render = nativeRender;
+#endif
   second.removeFromDesktop();
   pump(view);
   check(!onda::plugin::GpuViewTestAccess::initialized(view),

@@ -96,5 +96,6 @@ private:
   bool composing_{};
   bool drawing_{};
   double redrawRetryMs_{};
+  juce::NativeScaleFactorNotifier scaleNotifier_;
 };
 } // namespace onda::plugin

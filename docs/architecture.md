@@ -191,6 +191,9 @@ The surface is a dedicated X11 child, HWND, or NSView inside the JUCE peer.
 Only wgpu draws its pixels; input passes through to JUCE for pointer, keyboard,
 IME, cursor, and file-drop handling. Peer/movement/visibility changes keep the
 child attached. Destroy the renderer before the child or its borrowed display.
+JUCE's native scale notifier schedules presentation for idle host zoom/DPI changes
+even when logical bounds stay unchanged; AppKit backing changes also invalidate
+the native child directly.
 Resize draws immediately; native exposure schedules a draw through JUCE's event
 loop. The child stays hidden until the first frame and hides on rendering errors.
 The 60 Hz editor timer polls processor state; visualization has its own 30 Hz
