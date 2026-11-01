@@ -22,9 +22,9 @@ on:
         type: string
         default: ''
       onda_run_id:
-        description: Existing Onda SDK build run; zero uses the calling run
-        type: number
-        default: 0
+        description: Existing Onda SDK build run; empty uses the calling run
+        type: string
+        default: ''
 
 permissions:
   contents: read
@@ -74,7 +74,7 @@ jobs:
             echo "expected a full Onda SDK source commit" >&2
             exit 1
           fi
-          if [[ ! "$ONDA_RUN_ID" =~ ^[0-9]+$ || ( "$ONDA_RUN_ID" != 0 && -z "$ONDA_SOURCE_REF" ) ]]; then
+          if [[ -n "$ONDA_RUN_ID" && ( ! "$ONDA_RUN_ID" =~ ^[1-9][0-9]*$ || -z "$ONDA_SOURCE_REF" ) ]]; then
             echo "an existing SDK run requires its exact Onda source commit" >&2
             exit 1
           fi
