@@ -521,6 +521,7 @@ void exerciseRenderFailure() {
                           : !static_cast<bool>(c["commit"]));
           }),
           "Failure fixture did not acquire input ownership");
+    view.tick();
     commands.clear();
     static int renders;
     renders = 0;
@@ -535,7 +536,9 @@ void exerciseRenderFailure() {
       onda::plugin::GpuViewTestAccess::error(view) = [](const OndaUi *) {
         return "";
       };
+    onda::plugin::GpuViewTestAccess::expose(view);
     view.tick();
+    check(renders == 1, "Failure fixture did not request a render");
     check(std::any_of(commands.begin(), commands.end(), [&](const auto &c) {
             return c["type"].toString() == terminal &&
                    (piano ? !static_cast<bool>(c["pressed"])
