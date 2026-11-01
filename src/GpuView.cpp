@@ -1,10 +1,14 @@
 #include "GpuView.h"
 #include "NativeGpuSurface.h"
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <limits>
 #include <utility>
 #if JUCE_WINDOWS
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <windows.h>
 #else
 #include <dlfcn.h>
