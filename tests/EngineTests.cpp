@@ -1017,7 +1017,7 @@ bool exerciseTypedProjectDefaults() {
              waveform->minimums == std::vector<double>{testCase.expected} &&
              waveform->maximums == std::vector<double>{testCase.expected};
     };
-    if (buffers.size() != 1U || buffers[0].loadedFrames != 1 ||
+    if (buffers.size() != 1U || buffers[0].loadedSamples != 1 ||
         buffers[0].loadedChannels != 1 ||
         !close(buffers[0].loadedSampleRate, 48'000.0F) ||
         !buffers[0].loadedPath.empty() || !hasWaveform(*disk.engine))
@@ -1847,7 +1847,7 @@ sample { out1 = in1; out2 = in2 }
       unboundBuffer.engine->bufferMappings()[0].channelKind !=
           onda::plugin::BufferChannelKind::fixed ||
       unboundBuffer.engine->bufferMappings()[0].fixedChannels != 2 ||
-      unboundBuffer.engine->bufferMappings()[0].loadedFrames != 0) {
+      unboundBuffer.engine->bufferMappings()[0].loadedSamples != 0) {
     std::cerr << "unbound buffers did not retain neutral processing and metadata: "
               << unboundBuffer.diagnostic.message << '\n';
     return 1;
@@ -1866,7 +1866,7 @@ sample { out1 = in1; out2 = in2 }
   }
   const auto &bufferMetadata = buffered.engine->bufferMappings()[0];
   if (bufferMetadata.loadedPath != audioFile.path() ||
-      bufferMetadata.loadedFrames != 8 || bufferMetadata.loadedChannels != 2 ||
+      bufferMetadata.loadedSamples != 8 || bufferMetadata.loadedChannels != 2 ||
       !close(bufferMetadata.loadedSampleRate, 48'000.0F)) {
     std::cerr << "decoded buffer metadata is incorrect\n";
     return 1;

@@ -219,9 +219,9 @@ juce::var makeRunViewState(Processor &processor, const WorkerStatus &status,
     set(buffer, "loadedPath",
         mapping.loadedPath.empty() ? juce::var{}
                                    : juce::var{pathToJuce(mapping.loadedPath)});
-    const auto loaded = mapping.loadedFrames > 0 && mapping.loadedChannels > 0;
-    set(buffer, "loadedFrames",
-        loaded ? juce::var{mapping.loadedFrames} : juce::var{});
+    const auto loaded = mapping.loadedSamples > 0 && mapping.loadedChannels > 0;
+    set(buffer, "loadedSamples",
+        loaded ? juce::var{mapping.loadedSamples} : juce::var{});
     set(buffer, "loadedChannels",
         loaded ? juce::var{mapping.loadedChannels} : juce::var{});
     set(buffer, "loadedSampleRate",

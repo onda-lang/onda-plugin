@@ -150,7 +150,7 @@ struct BufferMapping {
   int fixedChannels{};
   bool hasProjectDefault{};
   std::filesystem::path loadedPath;
-  int loadedFrames{};
+  int loadedSamples{};
   int loadedChannels{};
   float loadedSampleRate{};
   BufferWaveformPtr waveform;

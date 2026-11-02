@@ -2150,7 +2150,7 @@ sample {
 
   const auto waitForBufferStatus = [](onda::plugin::Processor &processor,
                                       const bool active,
-                                      const int loadedFrames = -1) {
+                                      const int loadedSamples = -1) {
     onda::plugin::WorkerStatus status;
     const auto ready = test::waitUntil(
         [&] {
@@ -2158,8 +2158,8 @@ sample {
           status = processor.workerStatus();
           return !status.compiling && status.buffers.size() == 1U &&
                  status.active == active &&
-                 (loadedFrames < 0 ||
-                  status.buffers[0].loadedFrames == loadedFrames);
+                 (loadedSamples < 0 ||
+                  status.buffers[0].loadedSamples == loadedSamples);
         },
         test::yieldToWorker);
     return ready ? status : onda::plugin::WorkerStatus{};
@@ -2182,7 +2182,7 @@ sample {
                        false);
     const auto unbound = waitForBufferStatus(processor, true);
     if (unbound.buffers.size() != 1U ||
-        unbound.buffers[0].loadedFrames != 0 || unbound.hasError ||
+        unbound.buffers[0].loadedSamples != 0 || unbound.hasError ||
         processFirstFrame(processor) != std::pair{0.0F, 0.0F}) {
       std::cerr << "unbound buffer did not use neutral audio\n";
       return false;
@@ -2193,7 +2193,7 @@ sample {
     const auto bound = waitForBufferStatus(processor, true, 8);
     if (bound.buffers.size() != 1U ||
         bound.buffers[0].loadedPath != audioFile.path() ||
-        bound.buffers[0].loadedFrames != 8 ||
+        bound.buffers[0].loadedSamples != 8 ||
         bound.buffers[0].loadedChannels != 2) {
       std::cerr << "processor did not publish decoded buffer metadata\n";
       return false;
@@ -2339,7 +2339,7 @@ sample {
             5.0e-4) ||
         !static_cast<bool>(viewState->getProperty("canExportProject")) ||
         viewBuffer->getProperty("loadedPath").toString().isNotEmpty() ||
-        static_cast<int>(viewBuffer->getProperty("loadedFrames")) != 8 ||
+        static_cast<int>(viewBuffer->getProperty("loadedSamples")) != 8 ||
         static_cast<int>(viewBuffer->getProperty("loadedChannels")) != 2 ||
         !test::withinTolerance(
             static_cast<double>(viewBuffer->getProperty("loadedSampleRate")) -
@@ -2366,7 +2366,7 @@ sample {
                      exportDirectory / "project.ondaproject" &&
                  relinkedStatus.buffers.size() == 1U &&
                  relinkedStatus.buffers[0].loadedPath.empty() &&
-                 relinkedStatus.buffers[0].loadedFrames == 8 &&
+                 relinkedStatus.buffers[0].loadedSamples == 8 &&
                  relinkedStatus.buffers[0].loadedChannels == 2;
         },
         test::yieldToWorker);
@@ -4389,7 +4389,7 @@ sample { out1 = clip[0, 0] + extra[0, 0]; out2 = clip[0, 0] + extra[0, 0] }
       const auto loaded = std::ranges::find(partial.bufferChoices(), name,
                                             &BufferMapping::name);
       if (!partial.pendingBuffers || loaded == partial.bufferChoices().end() ||
-          loaded->loadedFrames == 0 ||
+          loaded->loadedSamples == 0 ||
           !rendersImmediately(processor, 64, 0.25F))
         return false;
       processor.clearBuffer(name);

@@ -1114,7 +1114,7 @@ PreparedEngine::build(std::shared_ptr<const CompileResult> compilation,
           bufferError = "Saved project buffer '" + mapping.name +
                         "' has unsupported dimensions";
       } else {
-        mapping.loadedFrames = static_cast<int>(asset->frames);
+        mapping.loadedSamples = static_cast<int>(asset->frames);
         mapping.loadedChannels = static_cast<int>(asset->channels);
         mapping.loadedSampleRate = asset->sampleRate;
         if (!defaultWaveforms)
@@ -1182,7 +1182,7 @@ PreparedEngine::build(std::shared_ptr<const CompileResult> compilation,
     storage = std::move(audio);
     result.bufferFiles.push_back({.binding = *binding, .audio = storage});
     mapping.loadedPath = binding->path;
-    mapping.loadedFrames = storage->frames;
+    mapping.loadedSamples = storage->frames;
     mapping.loadedChannels = storage->channels;
     mapping.loadedSampleRate = storage->sampleRate;
     mapping.waveform = makeBufferWaveform(storage->samples, storage->channels);

@@ -126,7 +126,7 @@ bool exerciseTypedBufferBindings() {
         PreparedEngine::build(built.compilation, Product::effect, cleared);
     if (!neutral.engine ||
         neutral.compilation->program != built.compilation->program ||
-        neutral.engine->bufferMappings()[0].loadedFrames != 0 ||
+        neutral.engine->bufferMappings()[0].loadedSamples != 0 ||
         neutral.engine->bufferMappings()[0].waveform)
       return false;
     // A cleared checkpoint exports no asset binding and restores unbound.
