@@ -20,13 +20,18 @@ set(onda_vst3_to_normalized_anchor
     "        Vst::ParamValue toNormalized (Vst::ParamValue v) const override  { return v; }")
 set(onda_vst3_steps_anchor
     "                return (Steinberg::int32) (0 < numSteps && numSteps < 0x7fffffff ? numSteps - 1 : 0);")
+set(onda_vst3_flags_anchor
+    "            anyUpdated |= updateParamIfScalarChanged (info.defaultNormalizedValue, (double) param.getDefaultValue());")
+set(onda_vst3_initial_flags_anchor
+    "            if (isBypassParameter)\n                info.flags |= Vst::ParameterInfo::kIsBypass;")
 string(LENGTH "${onda_vst3_source}" onda_vst3_source_length)
 foreach(anchor IN ITEMS onda_vst3_capture_anchor onda_vst3_publish_anchor
                         onda_vst3_bus_anchor onda_vst3_titles_anchor
                         onda_vst3_endpoint_anchor onda_vst3_controller_write_anchor
                         onda_vst3_controller_edit_anchor
                         onda_vst3_to_plain_anchor onda_vst3_to_normalized_anchor
-                        onda_vst3_steps_anchor)
+                        onda_vst3_steps_anchor onda_vst3_flags_anchor
+                        onda_vst3_initial_flags_anchor)
     string(REPLACE "${${anchor}}" "" unmatched "${onda_vst3_source}")
     string(LENGTH "${unmatched}" unmatched_length)
     string(LENGTH "${${anchor}}" anchor_length)
@@ -54,7 +59,7 @@ string(REPLACE "${onda_vst3_bus_anchor}"
 # Onda patch changes have no JUCE program parameter. Still invalidate the
 # host's value cache after plugin-owned defaults reach the controller.
 string(REPLACE "${onda_vst3_titles_anchor}"
-    "        if (details.programChanged)\n            flags |= Vst::kParamValuesChanged;\n\n${onda_vst3_titles_anchor}\n            flags |= Vst::kIoTitlesChanged;"
+    "        if (details.programChanged)\n            flags |= Vst::kParamValuesChanged;\n\n${onda_vst3_titles_anchor}\n            flags |= Vst::kIoTitlesChanged | Vst::kParamTitlesChanged;"
     onda_vst3_source "${onda_vst3_source}")
 # Use the same numeric mapping for controller conversions and DSP.
 string(REPLACE "${onda_vst3_to_plain_anchor}"
@@ -67,6 +72,13 @@ string(REPLACE "${onda_vst3_to_normalized_anchor}"
 # continuous parameters. Publish compiled discrete counts without that sentinel.
 string(REPLACE "${onda_vst3_steps_anchor}"
     "                return onda::plugin::vst3ParameterStepCount (param, (Steinberg::int32) (0 < numSteps && numSteps < 0x7fffffff ? numSteps - 1 : 0));"
+    onda_vst3_source "${onda_vst3_source}")
+# Choice lists and fixed choices can change when the loaded patch changes.
+string(REPLACE "${onda_vst3_flags_anchor}"
+    "${onda_vst3_flags_anchor}\n            anyUpdated |= updateParamIfScalarChanged (info.flags, onda::plugin::vst3ParameterFlags (param, info.flags));"
+    onda_vst3_source "${onda_vst3_source}")
+string(REPLACE "${onda_vst3_initial_flags_anchor}"
+    "${onda_vst3_initial_flags_anchor}\n            info.flags = onda::plugin::vst3ParameterFlags (param, info.flags);"
     onda_vst3_source "${onda_vst3_source}")
 # Host endpoints synchronize controller presentation without writing rounded
 # values back to DSP or reporting new plugin edits to the host.

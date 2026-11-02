@@ -19,6 +19,7 @@ struct GpuViewTestAccess {
     return view.surface_ ? view.surface_->handles().window : 0;
   }
   static auto &render(GpuView &view) { return view.render_; }
+  static auto &destroy(GpuView &view) { return view.destroy_; }
   static auto &error(GpuView &view) { return view.error_fn_; }
   static bool wakePending(const GpuView &view) { return view.isTimerRunning(); }
   static bool timedUpdatePending(const GpuView &view) {

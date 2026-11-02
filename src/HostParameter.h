@@ -81,30 +81,33 @@ public:
   }
 
   int getNumSteps() const override {
-    const auto count = discreteStepCount();
-    if (count == 0)
+    const auto steps = discreteSteps();
+    if (!steps)
       return juce::AudioProcessorParameter::getDefaultNumParameterSteps();
     // INT_MAX is JUCE's continuous sentinel. VST3 receives the exact count
     // separately, without passing through this narrower number of values.
     constexpr auto maximum = std::numeric_limits<int>::max() - 1;
-    return static_cast<int>(std::min<std::int64_t>(count, maximum - 1) + 1);
+    return static_cast<int>(std::min<std::int64_t>(*steps, maximum - 1) + 1);
   }
 
-  std::int64_t discreteStepCount() const {
-    const auto mapping = mappingSnapshot();
-    if (!mapping)
-      return 0;
-    return mapping->type == "bool" ? 1 : mapping->stepCount.value_or(0);
-  }
+  std::int64_t discreteStepCount() const { return discreteSteps().value_or(0); }
 
-  bool isDiscrete() const override {
-    const auto mapping = mappingSnapshot();
-    return mapping && (mapping->type == "bool" || mapping->stepCount);
-  }
+  bool isDiscrete() const override { return discreteSteps().has_value(); }
 
   bool isBoolean() const override {
     const auto mapping = mappingSnapshot();
     return mapping && mapping->type == "bool";
+  }
+
+  bool isEnum() const {
+    const auto mapping = mappingSnapshot();
+    return mapping && mapping->enumeration;
+  }
+
+  bool isAutomatable() const override {
+    const auto mapping = mappingSnapshot();
+    return !mapping || !mapping->enumeration ||
+           mapping->enumeration->members.size() > 1U;
   }
 
   double normalizedToPlain(const double value) const {
@@ -126,6 +129,13 @@ public:
       return truncate(normalizedValue >= 0.5F ? "On" : "Off", maximumLength);
 
     const auto plain = normalizedToPlain(*mapping, normalizedValue);
+    if (mapping->enumeration) {
+      const auto &members = mapping->enumeration->members;
+      const auto ordinal = static_cast<std::size_t>(
+          std::clamp(std::llround(plain), 0LL,
+                     static_cast<long long>(members.size() - 1U)));
+      return truncate(juce::String(members[ordinal].label), maximumLength);
+    }
     const auto text =
         mapping->type == "i32" || mapping->type == "i64"
             ? juce::String(static_cast<juce::int64>(std::llround(plain)))
@@ -137,6 +147,21 @@ public:
     const auto mapping = mappingSnapshot();
     if (!mapping)
       return normalizedText(text);
+    if (mapping->enumeration) {
+      const auto input = text.trim();
+      const auto &members = mapping->enumeration->members;
+      for (std::size_t ordinal = 0; ordinal < members.size(); ++ordinal) {
+        if (input == juce::String(members[ordinal].name))
+          return static_cast<float>(
+              plainToNormalized(*mapping, static_cast<double>(ordinal)));
+      }
+      for (std::size_t ordinal = 0; ordinal < members.size(); ++ordinal) {
+        if (input.equalsIgnoreCase(juce::String(members[ordinal].name)) ||
+            input.equalsIgnoreCase(juce::String(members[ordinal].label)))
+          return static_cast<float>(
+              plainToNormalized(*mapping, static_cast<double>(ordinal)));
+      }
+    }
     if (mapping->type == "bool") {
       const auto lowered = text.trim().toLowerCase();
       if (lowered == "on" || lowered == "true" || lowered == "yes")
@@ -151,6 +176,14 @@ public:
   }
 
 private:
+  std::optional<std::int64_t> discreteSteps() const {
+    const auto mapping = mappingSnapshot();
+    if (!mapping)
+      return std::nullopt;
+    return mapping->type == "bool" ? std::optional<std::int64_t>{1}
+                                   : mapping->stepCount;
+  }
+
   static double normalizedToPlain(const ParameterMapping &mapping,
                                   const double value) noexcept {
     if (mapping.type == "bool")

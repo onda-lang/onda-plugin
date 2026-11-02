@@ -4,6 +4,7 @@
 
 #include "ControlValue.h"
 #include "ScopeCapture.h"
+#include "UiPreferences.h"
 
 #include <juce_audio_processors/juce_audio_processors.h>
 #include <juce_gui_basics/juce_gui_basics.h>
@@ -48,8 +49,11 @@ private:
   void publishSmoothing();
   void publishMidiActivity(bool force = false);
   void publishVisualization(bool force = false);
+  void updateTheme();
 
   Processor &processor_;
+  UiPreferences preferences_;
+  bool lightTheme_{};
   std::unique_ptr<GpuView> gpu_;
   double publishedVisualizationTimeMs_{};
   juce::Label loadingOverlay_;

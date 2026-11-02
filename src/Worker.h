@@ -38,6 +38,7 @@ struct WorkerStatus {
   bool active{};
   bool usingProjectImage{};
   std::uint64_t engineGeneration{};
+  int blockSize{};
   std::vector<ParameterMapping> mappings;
   std::vector<ParameterMapping> controls;
   std::vector<BufferMapping> buffers;
@@ -233,6 +234,8 @@ private:
   // adoption races a newer publication; expired entries are pruned on publish.
   [[nodiscard]] std::shared_ptr<const EnginePublication>
   activePublication() const;
+  // Caller holds mutex_; restore the retained engine's interface/checkpoint.
+  [[nodiscard]] bool retainActivePublication();
   [[nodiscard]] bool updateStatus(const Request &request, std::string message,
                                   bool compiling,
                                   std::vector<BufferMapping> buffers = {},

@@ -354,7 +354,7 @@ endif()
 
 include(cmake/OndaVst3Automation.cmake)
 include(cmake/OndaJuceXEmbed.cmake)
-include(cmake/OndaJuceFileDrop.cmake)
+include(cmake/OndaJuceGuiBasics.cmake)
 
 function(onda_treat_juce_headers_as_system target)
     target_include_directories(${target} SYSTEM PRIVATE
@@ -472,6 +472,8 @@ add_library(onda_plugin_engine STATIC
     src/BufferWaveform.h
     src/Engine.cpp
     src/Engine.h
+    src/EnumMetadata.cpp
+    src/EnumMetadata.h
     src/EventPayload.cpp
     src/EventPayload.h
     src/FilesystemWatcher.cpp

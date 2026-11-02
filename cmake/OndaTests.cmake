@@ -139,6 +139,7 @@ target_sources(onda_processor_tests PRIVATE
     tests/UnrangedParameterTests.cpp
     tests/ParameterLifecycleTests.cpp
     tests/ParameterDefaultTests.cpp
+    tests/EnumParameterTests.cpp
     src/Editor.cpp
     src/Editor.h
     src/JucePath.h
@@ -228,6 +229,8 @@ else()
     onda_add_test(onda_control_default_precision_tests core onda_processor_tests ControlDefaultPrecision)
     onda_add_test(onda_seed_notification_thread_tests core onda_processor_tests SeedNotificationThreads)
     onda_add_test(onda_parameter_default_notification_tests core onda_processor_tests ParameterDefaultNotifications)
+    onda_add_test(onda_enum_parameter_tests core onda_processor_tests EnumParameters)
+    onda_add_test(onda_enum_event_tests core onda_processor_tests EnumEventMetadata)
     onda_add_test(onda_automation_after_unload_tests core onda_processor_tests AutomationAfterUnload)
     onda_add_test(onda_automation_flush_after_unload_tests core onda_processor_tests AutomationFlushAfterUnload)
     onda_add_test(onda_automation_flush_after_fault_tests core onda_processor_tests AutomationFlushAfterFault)
@@ -239,6 +242,7 @@ endif()
 add_executable(onda_vst3_smoke
     tests/Vst3Smoke.cpp
     tests/Vst3AutomationTests.cpp
+    tests/Vst3EnumTests.cpp
 )
 target_include_directories(onda_vst3_smoke PRIVATE src)
 target_compile_features(onda_vst3_smoke PRIVATE cxx_std_20)

@@ -144,6 +144,14 @@ PayloadTypePtr parseType(const juce::var &input, std::string &error) {
     }
     result->kind = Kind::scalar;
     result->scalar = *scalar;
+    const auto &rawEnum = property(*object, "enumeration");
+    if (!rawEnum.isVoid() && !rawEnum.isUndefined()) {
+      result->enumeration = parseEnumMetadata(rawEnum);
+      if (*scalar != PayloadScalar::i32 || !result->enumeration) {
+        error = "payload schema contains invalid enum metadata";
+        return {};
+      }
+    }
     const auto &rawRange = property(*object, "integer_range");
     if (!rawRange.isVoid() && !rawRange.isUndefined()) {
       auto range = parseIntegerRange(rawRange, *scalar);
@@ -586,6 +594,8 @@ juce::var payloadTypeValue(const PayloadType &type) {
   if (type.kind == Kind::scalar) {
     set(result, "kind", "scalar");
     set(result, "encoding", juce::String(scalarName(type.scalar).data()));
+    if (type.enumeration)
+      set(result, "enumeration", enumMetadataValue(*type.enumeration));
     if (type.integerRange) {
       auto range = object();
       auto minimum = object();

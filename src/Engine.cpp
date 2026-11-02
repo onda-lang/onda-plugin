@@ -3,6 +3,8 @@
 #include "AudioFile.h"
 #include "Primitive.h"
 
+#include <juce_core/juce_core.h>
+
 #include <algorithm>
 #include <array>
 #include <bit>
@@ -109,16 +111,17 @@ bool bindAudio(onda_instance_t *instance, const onda_program_t *program,
   return true;
 }
 
-std::optional<std::string> parameterUnit(const onda_program_t *program,
-                                         const int index) {
-  const auto bytes = onda_param_unit_copy(program, index, nullptr, 0);
+std::optional<std::string> parameterString(
+    const onda_program_t *program, const int index,
+    int (*copy)(const onda_program_t *, int, char *, int)) {
+  const auto bytes = copy(program, index, nullptr, 0);
   if (bytes < 0)
     return std::nullopt;
   if (bytes == 0)
     return std::string{};
 
   std::vector<char> buffer(static_cast<std::size_t>(bytes));
-  if (onda_param_unit_copy(program, index, buffer.data(), bytes) != bytes ||
+  if (copy(program, index, buffer.data(), bytes) != bytes ||
       buffer.back() != '\0') {
     return std::nullopt;
   }
@@ -128,7 +131,8 @@ std::optional<std::string> parameterUnit(const onda_program_t *program,
 std::optional<ParameterMapping>
 parameterMapping(const onda_program_t *program, const int index,
                  const int element,
-                 const std::span<const std::uint8_t> defaults) {
+                 const std::span<const std::uint8_t> defaults,
+                 const EnumMetadataPtr &enumeration) {
   const auto length = onda_param_array_len(program, index);
   if (element < 0 || element >= length)
     return std::nullopt;
@@ -137,7 +141,7 @@ parameterMapping(const onda_program_t *program, const int index,
     return std::nullopt;
   const auto primitive = onda_param_elem_type(program, index);
   const auto type = primitiveName(primitive);
-  const auto unit = parameterUnit(program, index);
+  const auto unit = parameterString(program, index, onda_param_unit_copy);
   if (type.empty() || !unit)
     return std::nullopt;
 
@@ -146,6 +150,7 @@ parameterMapping(const onda_program_t *program, const int index,
   mapping.elementIndex = element;
   mapping.type = type;
   mapping.unit = *unit;
+  mapping.enumeration = enumeration;
   if (const auto *name = onda_param_name(program, index))
     mapping.name = name;
   if (std::string_view{declaredType}.find('[') != std::string_view::npos) {
@@ -160,7 +165,7 @@ parameterMapping(const onda_program_t *program, const int index,
   mapping.rangeMin = ranged ? onda_param_range_min_f64(program, index) : 0.0;
   mapping.rangeMax = ranged ? onda_param_range_max_f64(program, index) : 1.0;
   if (!std::isfinite(mapping.rangeMin) || !std::isfinite(mapping.rangeMax) ||
-      mapping.rangeMin >= mapping.rangeMax) {
+      mapping.rangeMin > mapping.rangeMax) {
     return std::nullopt;
   }
 
@@ -189,7 +194,7 @@ parameterMapping(const onda_program_t *program, const int index,
   if (hasStep == 1) {
     const auto step = onda_param_step_f64(program, index);
     const auto stepCount = onda_param_step_count(program, index);
-    if (!std::isfinite(step) || step <= 0.0 || stepCount <= 0)
+    if (!std::isfinite(step) || step <= 0.0 || stepCount < 0)
       return std::nullopt;
     mapping.step = step;
     mapping.stepCount = stepCount;
@@ -1267,6 +1272,19 @@ PreparedEngine::build(std::shared_ptr<const CompileResult> compilation,
   for (int index = 0;
        index < parameterCount && engine->parameterMappingCount_ < slotCount;
        ++index) {
+    const auto enumJson =
+        parameterString(engine->program_.get(), index, onda_param_enum_json_copy);
+    if (!enumJson) {
+      result.diagnostic = error("Onda returned invalid enum metadata");
+      return result;
+    }
+    const auto enumeration = enumJson->empty()
+                                 ? EnumMetadataPtr{}
+                                 : parseEnumMetadata(juce::JSON::parse(*enumJson));
+    if (!enumJson->empty() && !enumeration) {
+      result.diagnostic = error("Onda returned invalid enum metadata");
+      return result;
+    }
     const auto defaultBytes =
         onda_param_default_bytes(engine->program_.get(), index, nullptr, 0);
     std::vector<std::uint8_t> defaults(
@@ -1283,7 +1301,8 @@ PreparedEngine::build(std::shared_ptr<const CompileResult> compilation,
          element < length && engine->parameterMappingCount_ < slotCount;
          ++element) {
       auto mapping =
-          parameterMapping(engine->program_.get(), index, element, defaults);
+          parameterMapping(engine->program_.get(), index, element, defaults,
+                           enumeration);
       if (!mapping)
         continue;
       const auto slot = engine->parameterMappingCount_++;

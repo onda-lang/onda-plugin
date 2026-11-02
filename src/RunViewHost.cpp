@@ -38,6 +38,8 @@ void appendParameters(juce::var &state, Processor &processor,
     set(parameter, "label", juce::String(mapping.name));
     set(parameter, "type", juce::String(mapping.type));
     set(parameter, "scalar", true);
+    if (mapping.enumeration)
+      set(parameter, "enumeration", enumMetadataValue(*mapping.enumeration));
     if (!mapping.arrayName.empty()) {
       auto array = object();
       set(array, "name", juce::String(mapping.arrayName));
@@ -161,7 +163,7 @@ juce::var makeRunViewState(Processor &processor, const WorkerStatus &status,
   set(state, "canExportProject", canExportProject);
   set(state, "supportsTransport", false);
   set(state, "supportsDeviceSelection", false);
-  set(state, "supportsRunSettings", status.path.empty());
+  set(state, "supportsRunSettings", true);
   set(state, "supportsFastMath", true);
   set(state, "fastMath", processor.fastMath());
   set(state, "canSetBlockSize", processor.canSetBlockSize());
@@ -190,7 +192,8 @@ juce::var makeRunViewState(Processor &processor, const WorkerStatus &status,
           ? juce::String{"knobs"}
           : juce::String{"sliders"});
   set(state, "sampleRateHz", processor.hostSampleRate());
-  set(state, "blockSamples", processor.ondaBlockSize());
+  set(state, "blockSamples",
+      status.blockSize > 0 ? status.blockSize : processor.ondaBlockSize());
 
   if (includeRuntimeLog)
     appendRuntimeLog(state, processor.runtimeLogSnapshot());

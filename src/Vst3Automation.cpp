@@ -3,6 +3,7 @@
 #include "Processor.h"
 
 #include <juce_audio_processors_headless/format_types/VST3_SDK/pluginterfaces/vst/ivstaudioprocessor.h>
+#include <juce_audio_processors_headless/format_types/VST3_SDK/pluginterfaces/vst/ivsteditcontroller.h>
 #include <juce_audio_processors_headless/format_types/VST3_SDK/pluginterfaces/vst/ivstparameterchanges.h>
 
 #include <algorithm>
@@ -51,6 +52,19 @@ std::int32_t vst3ParameterStepCount(
                    host->discreteStepCount(),
                    std::numeric_limits<std::int32_t>::max()))
              : fallback;
+}
+
+std::int32_t vst3ParameterFlags(
+    const juce::AudioProcessorParameter &parameter, const std::int32_t fallback) {
+  using Flags = Steinberg::Vst::ParameterInfo;
+  const auto *host = dynamic_cast<const HostParameter *>(&parameter);
+  if (host == nullptr)
+    return fallback;
+  auto flags = fallback & ~(Flags::kIsList | Flags::kIsReadOnly | Flags::kCanAutomate);
+  flags |= host->isAutomatable() ? Flags::kCanAutomate : Flags::kIsReadOnly;
+  if (host->isEnum())
+    flags |= Flags::kIsList;
+  return flags;
 }
 
 juce::String vst3BusName(juce::AudioProcessor &processor, const bool input,

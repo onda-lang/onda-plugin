@@ -657,11 +657,12 @@ void Processor::processAudio(juce::AudioBuffer<float> &audio,
   }
 
   acquireEngine();
+  // Editor compilation preferences take effect with a successful replacement.
+  // Host configuration changes invalidate the old engine explicitly.
   if (deactivateRequested_.load(std::memory_order_acquire) ||
       active_ == nullptr || activeFaulted_ ||
       !sameSampleRate(active_->sampleRate(),
-                      expectedSampleRate_.load(std::memory_order_acquire)) ||
-      active_->blockSize() != ondaBlockSize()) {
+                      expectedSampleRate_.load(std::memory_order_acquire))) {
     fallback(audio);
     return;
   }
@@ -1308,8 +1309,6 @@ void Processor::captureHostAutomation(const std::uint32_t id,
 
 bool Processor::setFastMath(const bool enabled) {
   std::unique_lock lock(preparationMutex_);
-  if (!canSetBlockSize())
-    return false;
   if (fastMath() == enabled)
     return true;
   fastMath_.store(enabled, std::memory_order_release);
@@ -1327,14 +1326,12 @@ int Processor::ondaBlockSize() const noexcept {
 }
 
 bool Processor::canSetBlockSize() const {
-  const auto status = worker_->status();
-  return status.path.empty() && !status.active && !status.compiling;
+  return hostBlockSize() > 0;
 }
 
 bool Processor::setPreferredBlockSize(const int samples) {
   std::unique_lock lock(preparationMutex_);
-  if (samples < 0 || (samples > 0 && samples > hostBlockSize()) ||
-      !canSetBlockSize())
+  if (samples < 0 || (samples > 0 && samples > hostBlockSize()))
     return false;
   if (preferredBlockSize() == samples)
     return true;

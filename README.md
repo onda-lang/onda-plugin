@@ -57,6 +57,11 @@ loaded program's parameter names and units. Array elements each consume one
 slot, in declaration order, up to the configured limit. Slots remain stable when the
 program is recompiled.
 
+Enum parameters expose their member labels in the editor and in DAW value text.
+Hosts supporting VST3 choice lists can also show named choices in automation
+editors. Each enum array element retains its own slot; a one-member enum is a
+fixed, read-only choice.
+
 Scalar numeric parameters without a declared range appear in **Params** and map to
 DAW slots using a plugin-owned 0–1 control range. Declare an explicit range when
 controls should cover other values, for example `frequency = 440.0 {20.0, 20000.0}`.
@@ -66,6 +71,10 @@ sampled at the start of each Onda block. Discrete parameters hold the latest
 point at that boundary.
 
 **Block Size** controls how often params automation updates.
+Change it or **Fast Math** in Settings to recompile the loaded program. Sample rate
+comes from the DAW. The ◐ button switches Dark / Light, including in the unloaded view.
+Without a saved choice, the editor detects the system appearance at startup. Only the theme
+is saved as a default for new instances. Block size and Fast Math belong to each instance.
 
 The **Smooth** value only affects changes made in the UI editor.
 DAW automation normally bypasses smoothing.

@@ -452,6 +452,8 @@ bool smokeSavedProject(juce::VST3PluginFormatHeadless &format,
                      description.name + " smokeControlAutomation failed");
   succeeded &= check(smokeParameterConversions(format, description, module),
                      description.name + " smokeParameterConversions failed");
+  succeeded &= check(smokeEnumParameters(format, description, module),
+                     description.name + " smokeEnumParameters failed");
   succeeded &= check(smokeAutomationNotifications(format, description, module),
                      description.name + " smokeAutomationNotifications failed");
   succeeded &=

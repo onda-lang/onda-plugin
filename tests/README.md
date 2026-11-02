@@ -141,7 +141,7 @@ compositor's bridge and are not established by this suite.
 | `onda_watcher_tests` | Native filesystem notifications, missing paths, inode replacement, and Linux subscription recovery without JUCE/compiler setup. |
 | `onda_scope_capture_{1,2,8,64}_tests` | Per-channel peak retention/reset, non-finite samples, and meter-only capture without waveform writes. |
 | `onda_channel_layout_script_tests` | Linux layout driver preserves the SDK resource checkout and revision for all configurations, including release-tag mode. |
-| `onda_gpu_ui_tests` | Dedicated native surface, input/IME, coalesced input redraws without polling, idle wakeups and presentation retries, immediate resize presentation, reparenting/parent destruction, and hide/show. Linux pixels survive JUCE repaints; macOS density and Windows parent-renderer ownership are checked. |
+| `onda_gpu_ui_tests` | Dedicated native surface, input/IME, coalesced input redraws without polling, idle wakeups and presentation retries, immediate resize presentation, reparenting, synchronous renderer release before desktop peer destruction and reattachment without manual ticks, and hide/show. Linux pixels survive JUCE repaints; macOS density and Windows parent-renderer ownership are checked. |
 | `onda_gpu_keyboard_tests` | Surface-free consumed/unused/error distinctions and forwarding unused keys to the DAW. |
 | `onda_gpu_editor_tests` | Smoothing acknowledgments carry accepted values and errors without resending schemas; teardown resolves drafts before handlers die; hidden input suspension and presentation/capture restoration after reparenting. |
 | `onda_example_tests` | Shipped examples compile and render finite, meaningful output. |
@@ -173,6 +173,12 @@ and exclusion of control buses from dry output. The VST3 smoke host repeats
 those transitions through the exported Bypass parameter. Controller conversion
 tests check exact native discrete counts around JUCE's continuous sentinel and
 saturation at VST3's signed 32-bit limit.
+`EnumParameters` checks labelled scalar and array parameters, singleton slot
+stability, ordinal rendering without realtime allocations, label-only reloads,
+and saved-image restoration. `EnumEventMetadata` checks recursive enum choices
+in struct, array, tuple, and slice event fields while preserving integer payloads.
+The VST3 smoke host also checks value-text conversion, list/read-only flags,
+label-only refresh notifications, and transitions back to numeric parameters.
 `ProjectBufferOverrideRestore` clears an override while the linked source is
 broken, verifies immediate and completed saves keep the cleared slot unbound,
 and checks that repairing the source does not resurrect the project default.
@@ -196,10 +202,13 @@ products must ramp from the last rendered value across callbacks and MIDI
 splits, without realtime allocations or locks.
 `UiAndHostParameterChanges` checks the 30 ms editor default, direct host changes,
 cancellation of editor ramps, state round-tripping, and allocation/lock auditing
-during mixed editor and host changes. `BlockProcessing` checks unloaded-only
+during mixed editor and host changes. `BlockProcessing` checks live and unloaded
 block-size selection, saved preferences and host limits, callback-delimited
 blocks, curve interpolation at chunk boundaries, MIDI and queued user
 events, oversized host callbacks, and allocation/lock auditing.
+`FailedBlockSizeChange` checks both products in realtime and offline modes:
+failed settings rebuilds retain audio and the published effective block size,
+and source repair applies the requested size without another host preparation.
 `CallbackProcessing` uses a shared reference for processor and exported VST3
 tests with block sizes 1, 3, and 8, changing callback lengths (including zero),
 parameter curves, sample-accurate control curves and buses, aliased input/output,

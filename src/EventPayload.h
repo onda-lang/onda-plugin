@@ -1,5 +1,7 @@
 #pragma once
 
+#include "EnumMetadata.h"
+
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -44,6 +46,7 @@ struct PayloadType {
   Kind kind{};
   PayloadScalar scalar{};
   std::optional<PayloadIntegerRange> integerRange;
+  EnumMetadataPtr enumeration;
   std::string name;
   std::vector<PayloadField> fields;
   std::vector<PayloadTypePtr> elements;

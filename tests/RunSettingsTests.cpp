@@ -7,12 +7,26 @@
 #include "RunViewHost.h"
 #include "TemporaryDirectory.h"
 #include "TestNumeric.h"
+#include "UiPreferences.h"
 
 #include <algorithm>
 #include <iostream>
 
 bool exerciseRunViewSchemaReadiness() {
   using namespace onda::plugin;
+  const juce::File preferencesFile{pathToJuce(testTemporaryRoot() / "ui-preferences.settings")};
+  if (UiPreferences(preferencesFile).theme().isNotEmpty())
+    return false;
+  for (const auto &mode : {"light", "dark"}) {
+    {
+      UiPreferences preferences(preferencesFile);
+      if (!preferences.setTheme(mode) || preferences.setTheme("auto") || preferences.setTheme("invalid"))
+        return false;
+    }
+    UiPreferences reopened(preferencesFile);
+    if (reopened.theme() != mode)
+      return false;
+  }
   const juce::File source{
       pathToJuce(testTemporaryRoot() / "schema-ready.onda")};
   if (!source.replaceWithText(
@@ -111,13 +125,19 @@ bool exerciseFastMath() {
                 << '\n';
       return false;
     }
-    if (static_cast<bool>(makeRunViewState(processor, processor.workerStatus(),
+    if (!static_cast<bool>(makeRunViewState(processor, processor.workerStatus(),
                                          false, {})["state"]["supportsRunSettings"])) {
-      std::cerr << "Loaded plugin exposed unavailable run settings\n";
+      std::cerr << "Loaded plugin hid editable run settings\n";
       return false;
     }
-    if (processor.setFastMath(!enabled) || processor.fastMath() != enabled)
-      return false;
+    for (const auto setting : {!enabled, enabled}) {
+      const auto previous = processor.workerStatus().engineGeneration;
+      if (!processor.setFastMath(setting) || !test::waitForMessage([&] {
+            return processor.workerStatus().engineGeneration > previous &&
+                   renders(processor, setting ? 1.0F : 0.0F);
+          }))
+        return false;
+    }
 
     // Automatic recompilation and host specialization retain the option.
     if (!writeSource(2))

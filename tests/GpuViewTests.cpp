@@ -75,6 +75,44 @@ bool dispatchUntil(const std::function<bool()> &complete) {
     juce::MessageManager::getInstance()->runDispatchLoopUntil(10);
   return complete();
 }
+void exercisePeerLifetime() {
+  using onda::plugin::GpuViewTestAccess;
+  Window parent;
+  parent.setSize(720, 840);
+  parent.addToDesktop(0);
+  parent.setVisible(true);
+  int ready = 0;
+  onda::plugin::GpuView view([](const auto &) {}, [&] { ++ready; });
+  parent.addAndMakeVisible(view);
+  view.setBounds(parent.getLocalBounds());
+  check(dispatchUntil([&] { return ready == 1; }),
+        "Idle view did not initialize through the event loop");
+
+  static decltype(&onda_ui_destroy) nativeDestroy;
+  static juce::ComponentPeer *peer;
+  static bool releasedBeforePeerDestruction;
+  nativeDestroy = GpuViewTestAccess::destroy(view);
+  GpuViewTestAccess::destroy(view) = [](OndaUi *ui) {
+    releasedBeforePeerDestruction = juce::ComponentPeer::isValidPeer(peer);
+    nativeDestroy(ui);
+  };
+  for (int attachment = 1; attachment <= 2; ++attachment) {
+    peer = parent.getPeer();
+    releasedBeforePeerDestruction = false;
+    parent.removeFromDesktop();
+    check(!GpuViewTestAccess::initialized(view),
+          "Peer removal waited for a tick to release the renderer");
+    check(releasedBeforePeerDestruction,
+          "Renderer outlived its borrowed native peer");
+    check(!GpuViewTestAccess::wakePending(view),
+          "Peer removal retained a UI wakeup");
+    if (attachment == 1) {
+      parent.addToDesktop(0);
+      check(dispatchUntil([&] { return ready == 2; }),
+            "Reattaching an idle view did not recreate the renderer");
+    }
+  }
+}
 #if JUCE_LINUX
 void checkNativePixels(juce::Component &parent, onda::plugin::GpuView &view) {
   auto *display = XOpenDisplay(nullptr);
@@ -202,7 +240,6 @@ void exerciseSurfaceOwnership() {
   render = nativeRender;
 #endif
   second.removeFromDesktop();
-  pump(view);
   check(!onda::plugin::GpuViewTestAccess::initialized(view),
         "GPU retained a destroyed parent window");
 }
@@ -770,6 +807,7 @@ int runTests(int argc, const char *const *argv) {
 #if JUCE_WINDOWS
     checkWindowsRendererOwnership();
 #endif
+    exercisePeerLifetime();
     exerciseCompositionCancellation();
     exercisePublicationFailure();
     exerciseZeroSizeSuspension();

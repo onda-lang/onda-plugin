@@ -25,6 +25,8 @@ double vst3PlainToNormalized(const juce::AudioProcessorParameter &parameter,
                              double value);
 std::int32_t vst3ParameterStepCount(
     const juce::AudioProcessorParameter &parameter, std::int32_t fallback);
+std::int32_t vst3ParameterFlags(
+    const juce::AudioProcessorParameter &parameter, std::int32_t fallback);
 
 // The generated wrapper borrows host queues only for this processing call.
 class ScopedVst3Automation final {

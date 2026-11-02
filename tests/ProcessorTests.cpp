@@ -26,6 +26,7 @@
 #include "UnrangedParameterTests.h"
 #include "ParameterLifecycleTests.h"
 #include "ParameterDefaultTests.h"
+#include "EnumParameterTests.h"
 #include "BypassTests.h"
 #include "BypassTestSupport.h"
 
@@ -4735,10 +4736,13 @@ int runProcessorCases(const int argc, const char *const *argv) {
       {"RunViewAdapter", exerciseRunViewAdapter},
       {"RunViewSchemaReadiness", exerciseRunViewSchemaReadiness},
       {"FastMath", exerciseFastMath},
+      {"FailedBlockSizeChange", exerciseFailedBlockSizeChange},
       {"ScopeCapture", exerciseScopeCapture},
       {"UserEvents", exerciseUserEvents},
       {"StructuredEvents", exerciseStructuredEvents},
       {"HostParameterPresentation", exerciseHostParameterPresentation},
+      {"EnumParameters", exerciseEnumParameters},
+      {"EnumEventMetadata", exerciseEnumEventMetadata},
       {"UnrangedParameters", exerciseUnrangedParameters},
       {"RuntimeLogging", exerciseRuntimeLogging},
       {"effect", +[] { return exercise(onda::plugin::Product::effect); }},

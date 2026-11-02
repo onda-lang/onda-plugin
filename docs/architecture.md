@@ -16,6 +16,11 @@ settles to its bypass state. Settled bypass returns main dry input for effects
 and silence for instruments. The scope captures the audible mixed output.
 An immutable presentation snapshot gives mapped slots their compiled Onda
 names, units, defaults, discrete step counts, and ABI-backed plain-value text.
+Enum descriptors are shared by array elements and snapshots. Host value text and
+the shared view use their member labels while DSP and automation retain ordinary
+i32 ordinal conversion. VST3 exposes enums as choice lists and singleton enums as
+read-only lists. Member or label changes invalidate host presentation even when
+the numeric domain stays unchanged.
 The worker schedules a message-thread parameter-info notification only when
 that mapping changes; the audio thread never reads presentation metadata. The
 wrapper also exposes the fixed, non-automatable
@@ -191,6 +196,8 @@ The surface is a dedicated X11 child, HWND, or NSView inside the JUCE peer.
 Only wgpu draws its pixels; input passes through to JUCE for pointer, keyboard,
 IME, cursor, and file-drop handling. Peer/movement/visibility changes keep the
 child attached. Destroy the renderer before the child or its borrowed display.
+The pinned JUCE build notifies child components before desktop peer removal,
+matching peer replacement, so an idle view releases its renderer synchronously.
 JUCE's native scale notifier schedules presentation for idle host zoom/DPI changes
 even when logical bounds stay unchanged; AppKit backing changes also invalidate
 the native child directly.
@@ -295,8 +302,12 @@ remains host-owned.
 
 The processor keeps host buffer capacity separate from the compiled Onda block
 size. An instance preference of zero follows the host; a positive preference is
-capped by the host capacity. The unloaded view can change it, and saved state
-restores it before specialization. Host capacity changes resize scratch storage
+capped by the host capacity. Settings can change it while loaded or unloaded,
+and saved state restores it before specialization. Editor preference changes
+retain the working engine until a replacement compiles successfully, including
+after a failed build. The run view reports that engine's compiled block size
+separately from the requested preference; repairing the source retries the
+requested size. Host capacity changes resize scratch storage
 without rebuilding an engine whose sample rate and Onda block size still match.
 The timer prepares replacement dry-input storage in a one-slot handoff. Only
 the audio thread adopts it, at callback entry, and returns the old storage for
@@ -305,7 +316,7 @@ preparation; a larger callback uses fallback until adequate storage is adopted.
 Suspended host preparation can replace and reclaim scratch storage directly.
 
 Fast Math is an instance compilation preference, off in a new instance and
-editable while unloaded. Saved state restores it before specialization. Every
+editable in Settings. Saved state restores it before specialization. Every
 worker request captures the option for both disk and saved-image compilation,
 including automatic reloads and host specialization changes.
 

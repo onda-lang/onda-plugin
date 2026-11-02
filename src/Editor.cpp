@@ -84,6 +84,9 @@ bool isSourcePath(const juce::String &path) {
 
 Editor::Editor(Processor &owner)
     : AudioProcessorEditor(owner), processor_(owner) {
+  const auto theme = preferences_.theme();
+  lightTheme_ = theme.isEmpty() ? !juce::Desktop::getInstance().isDarkModeActive()
+                                : theme == "light";
   gpu_ = std::make_unique<GpuView>(
       [this](const juce::var &command) { handleCommand(command); },
       [this] {
@@ -104,6 +107,7 @@ Editor::Editor(Processor &owner)
   setResizable(true, true);
   setSize(width, height);
   setResizeLimits(360, 480, 1600, 1400);
+  updateTheme();
   startTimerHz(60);
 }
 
@@ -130,7 +134,16 @@ void Editor::endParameterGesture(const std::size_t index) {
 }
 
 void Editor::paint(juce::Graphics &graphics) {
-  graphics.fillAll(editorBackground);
+  graphics.fillAll(juce::Colour(lightTheme_ ? 0xffe8f1fc : 0xff081522));
+}
+
+void Editor::updateTheme() {
+  loadingOverlay_.setColour(juce::Label::backgroundColourId,
+                           juce::Colour(lightTheme_ ? 0xffe8f1fc : 0xff081522));
+  loadingOverlay_.setColour(juce::Label::textColourId,
+                           juce::Colour(lightTheme_ ? 0xff4e6a86 : 0xff92a8bf));
+  repaint();
+  publishState(true);
 }
 
 bool Editor::isInterestedInFileDrag(const juce::StringArray &files) {
@@ -344,6 +357,8 @@ void Editor::publishState(const bool force) {
   auto message =
       makeRunViewState(processor_, status, processor_.canExportProject(),
                        actionError_, resetEventArguments, includeRuntimeLog);
+  auto *appearance = message["state"].getDynamicObject();
+  appearance->setProperty("themeMode", lightTheme_ ? "light" : "dark");
   if (initializeViewState) {
     auto state = message.getDynamicObject()->getProperty("state");
     juce::var viewState;
@@ -497,20 +512,28 @@ void Editor::handleCommand(const juce::var &command) {
       processor_.setInputControlLayout(layout == "knobs"
                                            ? ParamControlLayout::knobs
                                            : ParamControlLayout::sliders);
+  } else if (type == "setTheme") {
+    const auto mode = input->getProperty("mode").toString();
+    if (UiPreferences::validTheme(mode)) {
+      lightTheme_ = mode == "light";
+      actionError_ = preferences_.setTheme(mode) ? std::string{} : "Could not save UI theme";
+    } else {
+      actionError_ = "Invalid UI theme";
+    }
+    updateTheme();
   } else if (type == "setFastMath") {
     const auto enabled = input->getProperty("enabled");
     actionError_ =
         enabled.isBool() && processor_.setFastMath(static_cast<bool>(enabled))
             ? std::string{}
-            : "Unload the program before changing Fast Math";
+            : "Invalid Fast Math setting";
     publishState(true);
   } else if (type == "setRunSettings") {
     const auto samples = input->getProperty("blockSamples");
     actionError_ = samples.isInt() && processor_.setPreferredBlockSize(
                                           static_cast<int>(samples))
                        ? std::string{}
-                       : "Unload the program before choosing an Onda block "
-                         "size within the host limit";
+                       : "Choose an Onda block size within the host limit";
     publishState(true);
   } else if (type == "setParamSmoothing") {
     const auto milliseconds = number(input->getProperty("milliseconds"));
