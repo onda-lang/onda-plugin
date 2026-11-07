@@ -22,8 +22,11 @@ i32 ordinal conversion. VST3 exposes enums as choice lists and singleton enums a
 read-only lists. Member or label changes invalidate host presentation even when
 the numeric domain stays unchanged.
 The worker schedules a message-thread parameter-info notification only when
-that mapping changes; the audio thread never reads presentation metadata. The
-wrapper also exposes the fixed, non-automatable
+that mapping changes; the audio thread never reads presentation metadata.
+Bypass queues update the wrapper-owned boolean atomically. Its message-thread
+timer delivers coalesced listener notifications with host origin, keeping TLS
+initialization and listener locks out of processing and avoiding host edit echoes.
+The wrapper also exposes the fixed, non-automatable
 controller mappings that VST3 requires to deliver pitch bend, channel pressure,
 and CC through JUCE's MIDI buffer.
 
@@ -110,9 +113,10 @@ to the latest stored target. New engines, Reset, and pending seeds also settle
 immediately. UI commands, host gestures, and presentation snapshots remain off
 the audio thread; state serializes both sections' settings.
 
-The pinned SDK exposes scalar input defaults but cannot read array defaults.
-An array default overlapping control channels is rejected during preparation;
-arrays without defaults remain valid and disconnected channels receive zero.
+Borrowed SDK descriptors expose scalar and array defaults. Preparation decodes
+each control element from the same packed default bytes used for parameters;
+disconnected channels receive their declared default (zero when absent), clamped
+to the declared range.
 
 Audio files are read and decoded entirely on the worker. Their storage remains
 stable for the lifetime of the prepared engine and is never touched by the
@@ -175,7 +179,9 @@ complete checkpoint takes precedence until its replacement succeeds.
 
 Project export is derived only from that coherent image. Onda owns portable
 path mapping, syntax-aware directive rewriting, manifest construction, and
-typed asset encoding. The plugin writes the returned materialization plan to a
+typed asset encoding. The plugin borrows each materialized file for synchronous export and waveform
+inspection. Explicit buffer clears retain the plan while replacing only the
+manifest bytes. Export writes the returned materialization plan to a
 sibling staging directory, renames it into place, and links the exported
 `.ondaproject` manifest. It does not parse or reproduce the manifest's entry and
 buffer semantics, and it never partially overwrites a project. Every output stream is explicitly
@@ -242,6 +248,14 @@ little-endian payloads into a bounded SPSC queue. The audio callback consumes at
 most eight user events per callback, without allocation or locking. Invalid
 payloads are non-fatal; handler safety failures quarantine the engine.
 
+Onda's generic `onda_payload_layout` query supplies packed tensor regions and
+slice-prefix offsets. Delegate decoding uses the same SDK tensor metadata and
+`onda_payload_layout_from_bytes` traversal, with region storage prepared once. The UI encoder writes directly into these regions, while
+canonical MIDI/host-context bindings cache their offsets during preparation.
+Packed dispatch retains Onda's enum and integer-range normalization. Event
+metadata snapshots use an aliasing shared pointer to keep each borrowed plan's
+program alive across reloads; queued commands still own their payload bytes.
+
 Event commands carry the rendered engine generation as decimal text. The
 processor rejects stale generations before lookup/encoding, and the callback
 checks again before dispatch. Filesystem reloads advance this generation too.
@@ -299,6 +313,14 @@ release cannot stop a note in the replacement engine. MIDI device selection
 remains host-owned.
 
 ## Processing and automation
+
+Onda leaves floating-point mode setup to its host. Each audio callback calls
+`onda_configure_current_thread_audio_fp_mode` on its executing thread, including
+bypass and fallback. The helper checks the register and enables x86 FTZ/DAZ or
+ARM64 FZ only when needed, preserving other control bits. This handles thread
+migration and host policy changes without a TLS first-use allocation. The
+preparation worker configures its own thread before generated initializers;
+`prepareToPlay` leaves the calling host thread's mode unchanged.
 
 The processor keeps host buffer capacity separate from the compiled Onda block
 size. An instance preference of zero follows the host; a positive preference is
@@ -531,10 +553,18 @@ effect. Double-precision processing is not advertised. A loaded program advertis
 an infinite VST3 tail because arbitrary DSP may sustain indefinitely; an unloaded
 plugin reports no tail. MIDI filtering rejects unsupported system/SysEx and
 malformed channel packets before constructing an owning JUCE message.
+The exported wrapper filters SysEx before JUCE's VST3 conversion as well.
+One callback accepts at most 4,096 MIDI event-list entries and MIDI-controller
+queue points combined, using storage reserved during preparation. JUCE retains
+conversion and stable event ordering. On overflow, the entire MIDI batch is
+discarded and the processor releases its held host notes before rendering,
+without resetting DSP or changing ordinary parameter/control automation. A
+parameter-only overflow defers those releases until the next audio callback.
 
 Generated runtime safety checks return a positive status through the Onda C
-API. Prepared-instance resets use `onda_init_unchecked` so initializer failures
-also return a status without allocating diagnostics. On failure the callback
+API. Prepared-instance resets use `onda_init_checked`, whose success and failure
+paths return numeric status without allocating diagnostics, then refresh process
+readiness with `onda_prepare_process`. On failure the callback
 restores fallback audio, quarantines the active instance, clears its published
 active generation, and publishes an atomic fault flag. Quarantine belongs to
 the audio-owned engine and does not change the worker's lifecycle deactivation

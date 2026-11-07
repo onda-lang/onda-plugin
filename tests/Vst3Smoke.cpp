@@ -4,6 +4,8 @@
 #include "TemporaryDirectory.h"
 #include "TestNumeric.h"
 #include "Vst3TestSupport.h"
+#include "Vst3RealtimeTestSupport.h"
+#include "Vst3InputTests.h"
 #include "Vst3AutomationTests.h"
 #include "ControlInputTestSupport.h"
 
@@ -408,6 +410,45 @@ bool smokeSavedProject(juce::VST3PluginFormatHeadless &format,
     juce::AudioBuffer<float> audio(channels, 512);
     juce::MidiBuffer midi;
     midi.addEvent(juce::MidiMessage::noteOn(1, 60, 1.0F), 16);
+    // Exercise the exported entry on a thread that has never processed this
+    // module. Executable-linked tests cannot catch lazy shared-library TLS.
+    Steinberg::Vst::IAudioProcessor *raw{};
+    if (target.getVST3Client()->getIComponentPtr()->queryInterface(
+            Steinberg::Vst::IAudioProcessor::iid,
+            reinterpret_cast<void **>(&raw)) != Steinberg::kResultOk) {
+      concurrentProcessingSucceeded.store(false, std::memory_order_relaxed);
+      return;
+    }
+    std::array<float *,
+               static_cast<std::size_t>(ONDA_PLUGIN_INPUT_CHANNELS >
+                                                ONDA_PLUGIN_OUTPUT_CHANNELS
+                                            ? ONDA_PLUGIN_INPUT_CHANNELS
+                                            : ONDA_PLUGIN_OUTPUT_CHANNELS)>
+        pointers{};
+    for (int channel = 0; channel < channels; ++channel)
+      pointers[static_cast<std::size_t>(channel)] =
+          audio.getWritePointer(channel);
+    std::array<Steinberg::Vst::AudioBusBuffers, onda::plugin::pluginInputBuses>
+        inputs{};
+    if constexpr (ONDA_PLUGIN_INPUT_CHANNELS > 0) {
+      inputs[0].numChannels = ONDA_PLUGIN_INPUT_CHANNELS;
+      inputs[0].channelBuffers32 = pointers.data();
+    }
+    Steinberg::Vst::AudioBusBuffers output{};
+    output.numChannels = ONDA_PLUGIN_OUTPUT_CHANNELS;
+    output.channelBuffers32 = pointers.data();
+    Steinberg::Vst::ProcessData data{};
+    data.processMode = Steinberg::Vst::kRealtime;
+    data.symbolicSampleSize = Steinberg::Vst::kSample32;
+    data.numSamples = 512;
+    data.numInputs = onda::plugin::pluginInputBuses;
+    data.numOutputs = 1;
+    data.inputs = inputs.data();
+    data.outputs = &output;
+    audio.clear();
+    if (!smokeFreshBypassCallbacks(target, *raw, data))
+      concurrentProcessingSucceeded.store(false, std::memory_order_relaxed);
+    raw->release();
     for (int iteration = 0; iteration < 100; ++iteration) {
       for (int channel = 0; channel < channels; ++channel)
         std::fill_n(audio.getWritePointer(channel), audio.getNumSamples(),
@@ -435,7 +476,7 @@ bool smokeSavedProject(juce::VST3PluginFormatHeadless &format,
   succeeded &=
       check(concurrentProcessingSucceeded.load(std::memory_order_relaxed),
             description.name +
-                " produced an unsafe fallback with two concurrent instances");
+                " failed concurrent callback audio, FP mode, or realtime checks");
   instance->releaseResources();
   secondInstance->releaseResources();
   succeeded &= check(smokeLoadedProgram(*instance),
@@ -463,6 +504,8 @@ bool smokeSavedProject(juce::VST3PluginFormatHeadless &format,
                      instance->getName() + " control input smoke failed");
   succeeded &= check(smokeBypassTransitions(*instance),
                      description.name + " smokeBypassTransitions failed");
+  succeeded &= check(smokeVst3MidiInput(format, description, module),
+                     description.name + " smokeVst3MidiInput failed");
 
   return succeeded;
 }

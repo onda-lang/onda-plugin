@@ -92,6 +92,9 @@ sample { out1 = level + clip[0] + spare[0] }
   for (const auto product : {Product::effect, Product::instrument}) {
     Processor processor(product);
     processor.setNonRealtime(true);
+    // Test native edit delivery independently of sample-driven smoothing.
+    if (!processor.setParamSmoothingSeconds(0.0))
+      return false;
     {
       EditorWindow host(processor);
       if (!readyGpu(host.editor()))

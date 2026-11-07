@@ -12,7 +12,6 @@
 #include <cmath>
 #include <cstring>
 #include <limits>
-#include <numeric>
 #include <span>
 #include <string_view>
 #include <type_traits>
@@ -37,6 +36,12 @@ Unsigned readLittleEndian(const std::uint8_t *bytes) noexcept {
   return value;
 }
 
+template <typename Value> Value readNative(const std::uint8_t *bytes) noexcept {
+  Value value;
+  std::memcpy(&value, bytes, sizeof(value));
+  return value;
+}
+
 Diagnostic error(std::string message) {
   Diagnostic result;
   result.message = std::move(message);
@@ -54,18 +59,16 @@ int flattenedChannels(const onda_program_t *program, const bool input,
 
   int channels = 0;
   for (int index = 0; index < count; ++index) {
-    const auto primitive = input ? onda_input_elem_type(program, index)
-                                 : onda_output_elem_type(program, index);
-    const auto arrayLength = input ? onda_input_array_len(program, index)
-                                   : onda_output_array_len(program, index);
-    if (primitive != ONDA_PRIMITIVE_F32 || arrayLength <= 0 ||
-        channels > maximumChannels - arrayLength) {
+    const auto *info = input ? onda_input_info(program, index)
+                             : onda_output_info(program, index);
+    if (info == nullptr || info->element_type != ONDA_PRIMITIVE_F32 ||
+        info->array_len <= 0 || channels > maximumChannels - info->array_len) {
       diagnostic = error("Audio " + std::string(input ? "inputs" : "outputs") +
                          " must flatten to at most " +
                          std::to_string(maximumChannels) + " f32 channels");
       return -1;
     }
-    channels += arrayLength;
+    channels += info->array_len;
   }
   return channels;
 }
@@ -76,27 +79,25 @@ bool bindAudio(onda_instance_t *instance, const onda_program_t *program,
   const auto count =
       input ? onda_input_count(program) : onda_output_count(program);
   for (int index = 0; index < count; ++index) {
-    const auto slotOffset = input ? onda_input_slot_offset(program, index)
-                                  : onda_output_slot_offset(program, index);
-    const auto arrayLength = input ? onda_input_array_len(program, index)
-                                   : onda_output_array_len(program, index);
+    const auto *info = input ? onda_input_info(program, index)
+                             : onda_output_info(program, index);
     const auto availableChannels =
         slab.size() / static_cast<std::size_t>(blockSize);
-    if (slotOffset < 0 || arrayLength <= 0 ||
-        static_cast<std::size_t>(slotOffset) +
-                static_cast<std::size_t>(arrayLength) >
+    if (info == nullptr || info->slot_offset < 0 || info->array_len <= 0 ||
+        static_cast<std::size_t>(info->slot_offset) +
+                static_cast<std::size_t>(info->array_len) >
             availableChannels) {
       diagnostic = error("Onda returned invalid flattened audio metadata");
       return false;
     }
-    const auto samples = static_cast<std::size_t>(arrayLength) *
+    const auto samples = static_cast<std::size_t>(info->array_len) *
                          static_cast<std::size_t>(blockSize);
     if (samples > static_cast<std::size_t>(std::numeric_limits<int>::max()) /
                       sizeof(float)) {
       diagnostic = error("The prepared audio slab is too large");
       return false;
     }
-    auto *pointer = slab.data() + static_cast<std::size_t>(slotOffset) *
+    auto *pointer = slab.data() + static_cast<std::size_t>(info->slot_offset) *
                                       static_cast<std::size_t>(blockSize);
     const auto bytes = static_cast<int>(samples * sizeof(float));
     const auto status = input
@@ -111,66 +112,72 @@ bool bindAudio(onda_instance_t *instance, const onda_program_t *program,
   return true;
 }
 
-std::optional<std::string> parameterString(
-    const onda_program_t *program, const int index,
-    int (*copy)(const onda_program_t *, int, char *, int)) {
-  const auto bytes = copy(program, index, nullptr, 0);
-  if (bytes < 0)
+std::optional<ScalarPlain> defaultElement(const onda_value_info_t &info,
+                                          const int element) {
+  const auto width = primitiveBytes(info.element_type);
+  if (element < 0 || element >= info.array_len || width == 0U ||
+      info.default_bytes == nullptr || info.default_byte_count < 0)
     return std::nullopt;
-  if (bytes == 0)
-    return std::string{};
-
-  std::vector<char> buffer(static_cast<std::size_t>(bytes));
-  if (copy(program, index, buffer.data(), bytes) != bytes ||
-      buffer.back() != '\0') {
+  const auto offset = static_cast<std::size_t>(element) * width;
+  const auto size = static_cast<std::size_t>(info.default_byte_count);
+  if (offset > size || width > size - offset)
+    return std::nullopt;
+  const auto *bytes = info.default_bytes + offset;
+  // Descriptor defaults use native byte order; event wire payloads use LE.
+  switch (info.element_type) {
+  case ONDA_PRIMITIVE_BOOL:
+    return bytes[0] != 0U ? 1.0 : 0.0;
+  case ONDA_PRIMITIVE_I32:
+    return static_cast<double>(readNative<std::int32_t>(bytes));
+  case ONDA_PRIMITIVE_I64:
+    return readNative<std::int64_t>(bytes);
+  case ONDA_PRIMITIVE_F32:
+    return static_cast<double>(readNative<float>(bytes));
+  case ONDA_PRIMITIVE_F64:
+    return readNative<double>(bytes);
+  default:
     return std::nullopt;
   }
-  return std::string(buffer.data(), buffer.size() - 1U);
 }
 
 std::optional<ParameterMapping>
-parameterMapping(const onda_program_t *program, const int index,
-                 const int element,
-                 const std::span<const std::uint8_t> defaults,
-                 const EnumMetadataPtr &enumeration) {
-  const auto length = onda_param_array_len(program, index);
+parameterMapping(const onda_value_info_t &info, const int index,
+                 const int element, const EnumMetadataPtr &enumeration) {
+  const auto length = info.array_len;
   if (element < 0 || element >= length)
     return std::nullopt;
-  const auto *declaredType = onda_param_type(program, index);
-  if (declaredType == nullptr)
+  if (info.name == nullptr || info.type_text == nullptr)
     return std::nullopt;
-  const auto primitive = onda_param_elem_type(program, index);
+  const auto primitive = info.element_type;
   const auto type = primitiveName(primitive);
-  const auto unit = parameterString(program, index, onda_param_unit_copy);
-  if (type.empty() || !unit)
+  if (type.empty())
     return std::nullopt;
 
   ParameterMapping mapping;
   mapping.parameterIndex = index;
   mapping.elementIndex = element;
   mapping.type = type;
-  mapping.unit = *unit;
+  if (info.unit != nullptr)
+    mapping.unit = info.unit;
   mapping.enumeration = enumeration;
-  if (const auto *name = onda_param_name(program, index))
-    mapping.name = name;
-  if (std::string_view{declaredType}.find('[') != std::string_view::npos) {
+  mapping.name = info.name;
+  if (info.is_array) {
     mapping.arrayName = mapping.name;
     mapping.arrayLength = length;
     mapping.name += "[" + std::to_string(element) + "]";
   }
 
-  const auto ranged = onda_param_has_range(program, index) == 1;
+  const auto ranged = info.has_range == 1;
   mapping.defaultMayExceedRange = !ranged && primitive != ONDA_PRIMITIVE_BOOL;
   // This is the plugin's control domain; it adds no range to Onda's storage.
-  mapping.rangeMin = ranged ? onda_param_range_min_f64(program, index) : 0.0;
-  mapping.rangeMax = ranged ? onda_param_range_max_f64(program, index) : 1.0;
+  mapping.rangeMin = ranged ? info.range_min : 0.0;
+  mapping.rangeMax = ranged ? info.range_max : 1.0;
   if (!std::isfinite(mapping.rangeMin) || !std::isfinite(mapping.rangeMax) ||
       mapping.rangeMin > mapping.rangeMax) {
     return std::nullopt;
   }
 
-  const auto scale =
-      ranged ? onda_param_scale(program, index) : ONDA_PARAM_SCALE_LINEAR;
+  const auto scale = ranged ? info.scale : ONDA_PARAM_SCALE_LINEAR;
   if (scale == ONDA_PARAM_SCALE_LINEAR)
     mapping.scale = "linear";
   else if (scale == ONDA_PARAM_SCALE_LOG)
@@ -178,22 +185,22 @@ parameterMapping(const onda_program_t *program, const int index,
   else
     return std::nullopt;
 
-  const auto hasCurve = onda_param_has_curve(program, index);
+  const auto hasCurve = info.has_curve;
   if (hasCurve < 0)
     return std::nullopt;
   if (hasCurve == 1) {
-    const auto curve = onda_param_curve(program, index);
+    const auto curve = info.curve;
     if (!std::isfinite(curve))
       return std::nullopt;
     mapping.curve = curve;
   }
 
-  const auto hasStep = onda_param_has_step(program, index);
+  const auto hasStep = info.has_step;
   if (hasStep < 0)
     return std::nullopt;
   if (hasStep == 1) {
-    const auto step = onda_param_step_f64(program, index);
-    const auto stepCount = onda_param_step_count(program, index);
+    const auto step = info.step;
+    const auto stepCount = info.step_count;
     if (!std::isfinite(step) || step <= 0.0 || stepCount < 0)
       return std::nullopt;
     mapping.step = step;
@@ -204,33 +211,12 @@ parameterMapping(const onda_program_t *program, const int index,
     mapping.stepCount = 1;
   }
 
-  const auto hasDefault = onda_param_has_default(program, index) == 1;
+  const auto hasDefault = info.has_default == 1;
   if (hasDefault) {
-    const auto width = primitiveBytes(primitive);
-    const auto offset = static_cast<std::size_t>(element) * width;
-    if (width == 0U || offset > defaults.size() || width > defaults.size() - offset)
+    const auto value = defaultElement(info, element);
+    if (!value)
       return std::nullopt;
-    const auto *bytes = defaults.data() + offset;
-    switch (primitive) {
-    case ONDA_PRIMITIVE_BOOL:
-      mapping.defaultPlain = bytes[0] != 0U ? 1.0 : 0.0;
-      break;
-    case ONDA_PRIMITIVE_I32:
-      mapping.defaultPlain = static_cast<double>(std::bit_cast<std::int32_t>(
-          readLittleEndian<std::uint32_t>(bytes)));
-      break;
-    case ONDA_PRIMITIVE_I64:
-      mapping.defaultPlain = std::bit_cast<std::int64_t>(readLittleEndian<std::uint64_t>(bytes));
-      break;
-    case ONDA_PRIMITIVE_F32:
-      mapping.defaultPlain = static_cast<double>(std::bit_cast<float>(readLittleEndian<std::uint32_t>(bytes)));
-      break;
-    case ONDA_PRIMITIVE_F64:
-      mapping.defaultPlain = std::bit_cast<double>(readLittleEndian<std::uint64_t>(bytes));
-      break;
-    default:
-      return std::nullopt;
-    }
+    mapping.defaultPlain = *value;
   } else {
     mapping.defaultPlain = std::clamp(0.0, mapping.rangeMin, mapping.rangeMax);
   }
@@ -354,87 +340,36 @@ int payloadPrimitive(const PayloadScalar scalar) noexcept {
   return -1;
 }
 
-bool eventTensorMetadataMatches(const onda_program_t *program,
-                                const int eventIndex,
-                                const PayloadSchema &schema) {
-  const auto tensorCount = onda_event_tensor_count(program, eventIndex);
-  if (tensorCount < 0)
-    return false;
-
-  const auto plan = makePayloadPlan(schema);
-  const auto expectedCount = std::accumulate(
-      plan.parameters.begin(), plan.parameters.end(), std::size_t{},
-      [](const auto count, const auto &parameter) {
-        return count + parameter.leaves.size();
-      });
-  if (expectedCount != static_cast<std::size_t>(tensorCount))
-    return false;
-
-  int tensorIndex{};
-  for (std::size_t parameterIndex = 0; parameterIndex < plan.parameters.size();
-       ++parameterIndex) {
-    const auto &parameter = plan.parameters[parameterIndex];
-    for (const auto &leaf : parameter.leaves) {
-      onda_event_tensor_info_t info{};
-      if (onda_event_tensor_info(program, eventIndex, tensorIndex++, &info) !=
-              0 ||
-          info.path == nullptr || info.shape_rank < 0 ||
-          info.parameter_index != static_cast<int>(parameterIndex) ||
-          info.element_type != payloadPrimitive(leaf.scalar) ||
-          info.is_slice != static_cast<int>(parameter.dynamic) ||
-          info.fixed_element_count <= 0 ||
-          static_cast<std::size_t>(info.fixed_element_count) !=
-              leaf.fixedElements ||
-          leaf.path != info.path ||
-          static_cast<std::size_t>(info.shape_rank) != leaf.shape.size() ||
-          (info.shape_rank != 0 && info.shape == nullptr)) {
-        return false;
-      }
-      for (int axis = 0; axis < info.shape_rank; ++axis) {
-        if (info.shape[axis] <= 0 ||
-            static_cast<std::size_t>(info.shape[axis]) !=
-                leaf.shape[static_cast<std::size_t>(axis)]) {
-          return false;
-        }
-      }
-    }
-  }
-  return true;
-}
-
-bool collectVisibleEvents(const onda_program_t *program,
+bool collectVisibleEvents(const ProgramHandle &program,
                           std::vector<EventMapping> &events,
                           Diagnostic &diagnostic) {
-  const auto count = onda_event_count(program);
+  const auto count = onda_event_count(program.get());
   if (count < 0) {
     diagnostic = error("Onda returned invalid event metadata");
     return false;
   }
   events.reserve(static_cast<std::size_t>(count));
   for (int eventIndex = 0; eventIndex < count; ++eventIndex) {
-    const auto *rawName = onda_event_name(program, eventIndex);
-    const auto *schemaJson = onda_event_schema_json(program, eventIndex);
-    if (rawName == nullptr || schemaJson == nullptr) {
+    const auto *info = onda_event_info(program.get(), eventIndex);
+    if (info == nullptr || info->name == nullptr ||
+        info->schema_json == nullptr || info->payload_plan == nullptr) {
       diagnostic = error("Onda returned invalid event metadata");
       return false;
     }
-    if (isPluginEvent(rawName))
+    if (isPluginEvent(info->name))
       continue;
 
     EventMapping event{
         .index = eventIndex,
-        .name = rawName,
+        .name = info->name,
+        .payloadPlan = {program, info->payload_plan},
         .schema = {},
         .parameters = {},
     };
     std::string schemaError;
-    if (!parsePayloadSchema(schemaJson, event.schema, schemaError)) {
+    if (!parsePayloadSchema(info->schema_json, event.schema, schemaError)) {
       diagnostic =
           error("Onda returned invalid event metadata: " + schemaError);
-      return false;
-    }
-    if (!eventTensorMetadataMatches(program, eventIndex, event.schema)) {
-      diagnostic = error("Onda returned inconsistent event tensor metadata");
       return false;
     }
     event.parameters.reserve(event.schema.parameters.size());
@@ -469,21 +404,21 @@ bool appendNumber(RuntimeLogEntry &entry, const Value value) noexcept {
          appendText(entry, {text.data(), converted.ptr});
 }
 
-bool appendPayloadScalar(RuntimeLogEntry &entry, const PayloadScalar scalar,
+bool appendPayloadScalar(RuntimeLogEntry &entry, const int scalar,
                          const std::uint8_t *bytes) noexcept {
   switch (scalar) {
-  case PayloadScalar::boolean:
+  case ONDA_PRIMITIVE_BOOL:
     return appendText(entry, bytes[0] == 0U ? "false" : "true");
-  case PayloadScalar::f32:
+  case ONDA_PRIMITIVE_F32:
     return appendNumber(
         entry, std::bit_cast<float>(readLittleEndian<std::uint32_t>(bytes)));
-  case PayloadScalar::f64:
+  case ONDA_PRIMITIVE_F64:
     return appendNumber(
         entry, std::bit_cast<double>(readLittleEndian<std::uint64_t>(bytes)));
-  case PayloadScalar::i32:
+  case ONDA_PRIMITIVE_I32:
     return appendNumber(entry, std::bit_cast<std::int32_t>(
                                    readLittleEndian<std::uint32_t>(bytes)));
-  case PayloadScalar::i64:
+  case ONDA_PRIMITIVE_I64:
     return appendNumber(entry, std::bit_cast<std::int64_t>(
                                    readLittleEndian<std::uint64_t>(bytes)));
   }
@@ -518,54 +453,46 @@ bool validateEvent(const onda_program_t *program, const ExpectedEvent &expected,
     return true;
   }
 
-  const auto parameterCount = onda_event_param_count(program, index);
-  if (parameterCount != static_cast<int>(expected.parameterNames.size()) ||
+  const auto *info = onda_event_info(program, index);
+  PayloadSchema schema;
+  std::string schemaError;
+  if (info == nullptr || info->schema_json == nullptr ||
+      !parsePayloadSchema(info->schema_json, schema, schemaError) ||
+      schema.parameters.size() != expected.parameterNames.size() ||
       expected.parameterNames.size() > binding.offsets.size()) {
     diagnostic = error("Canonical " + std::string(expected.category) +
                        " event '" + name + "' has an incompatible payload");
     return false;
   }
 
-  for (int parameter = 0; parameter < parameterCount; ++parameter) {
-    const auto *parameterName =
-        onda_event_param_name(program, index, parameter);
-    const auto arrayLength =
-        onda_event_param_array_len(program, index, parameter);
-    if (parameterName == nullptr ||
-        expected.parameterNames[static_cast<std::size_t>(parameter)] !=
-            parameterName ||
-        onda_event_param_elem_type(program, index, parameter) !=
-            expected.parameterTypes[static_cast<std::size_t>(parameter)] ||
-        onda_event_param_is_slice(program, index, parameter) != 0 ||
-        onda_event_param_is_array(program, index, parameter) != 0 ||
-        arrayLength != 1) {
+  for (std::size_t parameter = 0; parameter < schema.parameters.size();
+       ++parameter) {
+    const auto &field = schema.parameters[parameter];
+    if (field.name != expected.parameterNames[parameter] || !field.type ||
+        field.type->kind != PayloadType::Kind::scalar ||
+        payloadPrimitive(field.type->scalar) !=
+            expected.parameterTypes[parameter]) {
       diagnostic = error("Canonical " + std::string(expected.category) +
                          " event '" + name + "' has an incompatible payload");
       return false;
     }
-    binding.offsets[static_cast<std::size_t>(parameter)] =
-        onda_event_param_offset_bytes(program, index, parameter);
   }
 
-  binding.index = index;
-  binding.payloadBytes = onda_event_payload_bytes(program, index);
-  if (binding.payloadBytes <= 0 || binding.payloadBytes > 32) {
+  std::array<onda_payload_region_t, 4U> regions{};
+  onda_payload_layout_t layout{};
+  if (onda_payload_layout(info->payload_plan, nullptr, 0, regions.data(),
+                          static_cast<int>(regions.size()), &layout) != 0 ||
+      layout.region_count != static_cast<int>(schema.parameters.size()) ||
+      layout.payload_bytes <= 0 || layout.payload_bytes > 32) {
     diagnostic = error("Canonical " + std::string(expected.category) +
                        " event '" + name + "' has an invalid packed payload");
     return false;
   }
-  for (int parameter = 0; parameter < parameterCount; ++parameter) {
-    const auto offset = binding.offsets[static_cast<std::size_t>(parameter)];
-    const auto bytes = primitiveBytes(
-        expected.parameterTypes[static_cast<std::size_t>(parameter)]);
-    if (bytes == 0U || offset < 0 ||
-        static_cast<std::size_t>(offset) + bytes >
-            static_cast<std::size_t>(binding.payloadBytes)) {
-      diagnostic = error("Canonical " + std::string(expected.category) +
-                         " event '" + name + "' has an invalid packed payload");
-      return false;
-    }
-  }
+  binding.index = index;
+  binding.payloadBytes = layout.payload_bytes;
+  for (std::size_t parameter = 0; parameter < schema.parameters.size();
+       ++parameter)
+    binding.offsets[parameter] = regions[parameter].payload_offset;
   return true;
 }
 
@@ -634,53 +561,49 @@ bool PreparedEngine::prepareInputDefaults(Diagnostic &diagnostic) {
       std::max(inputChannels_ - pluginInputChannels, 0));
   controlMappings_.reserve(controls);
   for (int index = 0; index < onda_input_count(program_.get()); ++index) {
-    const auto offset = onda_input_slot_offset(program_.get(), index);
-    const auto length = onda_input_array_len(program_.get(), index);
-    if (offset < 0 || length <= 0 || offset > inputChannels_ - length) {
+    const auto *info = onda_input_info(program_.get(), index);
+    if (info == nullptr || info->slot_offset < 0 || info->array_len <= 0 ||
+        info->slot_offset > inputChannels_ - info->array_len) {
       diagnostic = error("Onda returned invalid flattened input metadata");
       return false;
     }
+    const auto offset = info->slot_offset;
+    const auto length = info->array_len;
     if (offset + length <= pluginInputChannels)
       continue;
-    const auto *name = onda_input_name(program_.get(), index);
-    const auto *type = onda_input_type(program_.get(), index);
-    if (name == nullptr || type == nullptr) {
+    if (info->name == nullptr || info->type_text == nullptr) {
       diagnostic = error("Onda returned invalid input names/types");
       return false;
     }
-    const auto array =
-        std::string_view{type}.find('[') != std::string_view::npos;
-    const auto hasDefault = onda_input_has_default(program_.get(), index) == 1;
-    const auto value =
-        hasDefault ? onda_input_default_f64(program_.get(), index) : 0.0;
-    // The SDK exposes scalar defaults only. Array defaults return NaN.
-    if (!std::isfinite(value) || !std::isfinite(static_cast<float>(value))) {
-      diagnostic = error("External control input '" + std::string{name} +
-                         "' defaults must be finite scalars; declare separate "
-                         "scalar inputs for array defaults");
-      return false;
-    }
-    const auto ranged = onda_input_has_range(program_.get(), index) == 1;
-    // Unranged controls use a unit interval extended to include their default.
-    const auto minimum = ranged
-                             ? onda_input_range_min_f64(program_.get(), index)
-                             : std::min(0.0, value);
-    const auto maximum = ranged
-                             ? onda_input_range_max_f64(program_.get(), index)
-                             : std::max(1.0, value);
-    if (!std::isfinite(minimum) || !std::isfinite(maximum) ||
-        minimum > maximum || !std::isfinite(static_cast<float>(minimum)) ||
-        !std::isfinite(static_cast<float>(maximum))) {
-      diagnostic =
-          error("External control input ranges must be finite f32 ranges");
-      return false;
-    }
-    const auto defaultPlain = std::clamp(value, minimum, maximum);
-    const auto normalized = maximum > minimum
-                                ? (defaultPlain - minimum) / (maximum - minimum)
-                                : 0.0;
     for (int element = std::max(pluginInputChannels - offset, 0);
          element < length; ++element) {
+      const auto value = info->has_default == 1
+                             ? defaultElement(*info, element)
+                             : std::optional<ScalarPlain>{0.0};
+      if (!value || !std::isfinite(scalarPlainNumber(*value)) ||
+          !std::isfinite(static_cast<float>(scalarPlainNumber(*value)))) {
+        diagnostic =
+            error("External control input '" + std::string{info->name} +
+                  "' defaults must be finite f32 values");
+        return false;
+      }
+      const auto number = scalarPlainNumber(*value);
+      const auto ranged = info->has_range == 1;
+      // Unranged controls use a unit interval extended to include their
+      // default.
+      const auto minimum = ranged ? info->range_min : std::min(0.0, number);
+      const auto maximum = ranged ? info->range_max : std::max(1.0, number);
+      if (!std::isfinite(minimum) || !std::isfinite(maximum) ||
+          minimum > maximum || !std::isfinite(static_cast<float>(minimum)) ||
+          !std::isfinite(static_cast<float>(maximum))) {
+        diagnostic =
+            error("External control input ranges must be finite f32 ranges");
+        return false;
+      }
+      const auto defaultPlain = std::clamp(number, minimum, maximum);
+      const auto normalized =
+          maximum > minimum ? (defaultPlain - minimum) / (maximum - minimum)
+                            : 0.0;
       const auto channel = offset + element;
       const auto control =
           static_cast<std::size_t>(channel - pluginInputChannels);
@@ -694,8 +617,9 @@ bool PreparedEngine::prepareInputDefaults(Diagnostic &diagnostic) {
       controlMinimum_[control] = minimum;
       controlMaximum_[control] = maximum;
       ParameterMapping mapping;
-      mapping.name = std::string{name} +
-                     (array ? "[" + std::to_string(element) + "]" : "");
+      mapping.name =
+          std::string{info->name} +
+          (info->is_array ? "[" + std::to_string(element) + "]" : "");
       mapping.type = "f32";
       mapping.defaultNormalized = normalized;
       mapping.defaultPlain = defaultPlain;
@@ -718,21 +642,27 @@ bool PreparedEngine::prepareRuntimeOutput(Diagnostic &diagnostic) {
 
   delegates_.reserve(static_cast<std::size_t>(delegateCount));
   for (int delegateIndex = 0; delegateIndex < delegateCount; ++delegateIndex) {
-    const auto *name = onda_delegate_name(program_.get(), delegateIndex);
-    const auto *schemaJson =
-        onda_delegate_schema_json(program_.get(), delegateIndex);
-    if (name == nullptr || schemaJson == nullptr) {
+    const auto *info = onda_delegate_info(program_.get(), delegateIndex);
+    if (info == nullptr || info->name == nullptr ||
+        info->payload_plan == nullptr || info->tensor_count < 0 ||
+        info->region_count < 0) {
       diagnostic = error("Onda returned invalid delegate metadata");
       return false;
     }
-    PayloadSchema schema;
-    std::string schemaError;
-    if (!parsePayloadSchema(schemaJson, schema, schemaError)) {
-      diagnostic =
-          error("Onda returned invalid delegate metadata: " + schemaError);
-      return false;
+    DelegateMetadata metadata;
+    metadata.info = info;
+    metadata.regions.resize(static_cast<std::size_t>(info->region_count));
+    metadata.tensors.reserve(static_cast<std::size_t>(info->tensor_count));
+    for (int tensor = 0; tensor < info->tensor_count; ++tensor) {
+      const auto *leaf = onda_payload_tensor_info(info->payload_plan, tensor);
+      if (leaf == nullptr || leaf->path == nullptr ||
+          primitiveBytes(leaf->element_type) == 0U) {
+        diagnostic = error("Onda returned invalid delegate tensor metadata");
+        return false;
+      }
+      metadata.tensors.push_back(leaf);
     }
-    delegates_.push_back({.name = name, .plan = makePayloadPlan(schema)});
+    delegates_.push_back(std::move(metadata));
   }
 
   logSites_.reserve(static_cast<std::size_t>(logSiteCount));
@@ -908,60 +838,47 @@ bool PreparedEngine::publishDelegate(
   return publish(
       RuntimeLogKind::delegate,
       [this, &occurrence](RuntimeLogEntry &entry) noexcept {
-        const auto &delegate = delegates_[occurrence.delegate_index];
-        auto valid =
-            appendText(entry, "delegate ") && appendText(entry, delegate.name);
-        if (!delegate.plan.parameters.empty())
+        auto &delegate = delegates_[occurrence.delegate_index];
+        onda_payload_layout_t layout{};
+        if (occurrence.payload_size_bytes >
+                static_cast<std::uint32_t>(std::numeric_limits<int>::max()) ||
+            onda_payload_layout_from_bytes(
+                delegate.info->payload_plan, occurrence.payload,
+                static_cast<int>(occurrence.payload_size_bytes),
+                delegate.regions.data(),
+                static_cast<int>(delegate.regions.size()), &layout) != 0)
+          return false;
+        auto valid = appendText(entry, "delegate ") &&
+                     appendText(entry, delegate.info->name);
+        if (!delegate.tensors.empty())
           valid = valid && appendText(entry, ": ");
-
-        std::size_t cursor{};
         std::size_t displayed{};
-        for (const auto &parameter : delegate.plan.parameters) {
-          std::size_t dynamicCount{1U};
-          if (parameter.dynamic) {
-            if (cursor > occurrence.payload_size_bytes ||
-                sizeof(std::uint32_t) >
-                    occurrence.payload_size_bytes - cursor) {
-              valid = false;
-              break;
-            }
-            dynamicCount =
-                readLittleEndian<std::uint32_t>(occurrence.payload + cursor);
-            cursor += sizeof(std::uint32_t);
+        for (const auto &region : delegate.regions) {
+          if (region.tensor_index < 0)
+            continue;
+          const auto &leaf =
+              *delegate.tensors[static_cast<std::size_t>(region.tensor_index)];
+          if (displayed++ != 0U)
+            valid = valid && appendText(entry, " ");
+          valid =
+              valid && appendText(entry, leaf.path) && appendText(entry, "=");
+          const auto collection =
+              leaf.is_slice != 0 || leaf.fixed_element_count != 1;
+          if (collection)
+            valid = valid && appendText(entry, "[");
+          const auto width = primitiveBytes(leaf.element_type);
+          for (int index = 0; valid && index < region.element_count; ++index) {
+            if (index != 0)
+              valid = appendText(entry, ", ");
+            valid = valid && appendPayloadScalar(
+                                 entry, leaf.element_type,
+                                 occurrence.payload + region.payload_offset +
+                                     static_cast<std::size_t>(index) * width);
           }
-          for (const auto &leaf : parameter.leaves) {
-            if (displayed++ != 0U)
-              valid = valid && appendText(entry, " ");
-            valid =
-                valid && appendText(entry, leaf.path) && appendText(entry, "=");
-            const auto scalarBytes = payloadScalarBytes(leaf.scalar);
-            if (dynamicCount >
-                std::numeric_limits<std::size_t>::max() / leaf.fixedElements) {
-              valid = false;
-              break;
-            }
-            const auto count = dynamicCount * leaf.fixedElements;
-            if (scalarBytes == 0U || cursor > occurrence.payload_size_bytes ||
-                count >
-                    (occurrence.payload_size_bytes - cursor) / scalarBytes) {
-              valid = false;
-              break;
-            }
-            const auto collection = parameter.dynamic || count != 1U;
-            if (collection)
-              valid = valid && appendText(entry, "[");
-            for (std::size_t index = 0; valid && index < count; ++index) {
-              if (index != 0U)
-                valid = appendText(entry, ", ");
-              valid = valid && appendPayloadScalar(entry, leaf.scalar,
-                                                   occurrence.payload + cursor);
-              cursor += scalarBytes;
-            }
-            if (collection)
-              valid = valid && appendText(entry, "]");
-          }
+          if (collection)
+            valid = valid && appendText(entry, "]");
         }
-        return valid && cursor == occurrence.payload_size_bytes;
+        return valid;
       });
 }
 
@@ -1060,31 +977,28 @@ PreparedEngine::build(std::shared_ptr<const CompileResult> compilation,
   std::vector<std::string> clearedBuffers;
   std::string bufferError;
   for (int index = 0; index < bufferCount; ++index) {
-    const auto *rawName = onda_buffer_name(compiled.program.get(), index);
-    const auto *rawType = onda_buffer_type(compiled.program.get(), index);
-    const auto rawKind =
-        onda_buffer_channels_kind(compiled.program.get(), index);
-    if (rawName == nullptr || rawType == nullptr ||
-        onda_buffer_elem_type(compiled.program.get(), index) < 0 ||
-        (rawKind != ONDA_BUFFER_CHANNELS_MONO &&
-         rawKind != ONDA_BUFFER_CHANNELS_STATIC &&
-         rawKind != ONDA_BUFFER_CHANNELS_DYNAMIC)) {
+    const auto *info = onda_buffer_info(compiled.program.get(), index);
+    if (info == nullptr || info->name == nullptr ||
+        info->type_text == nullptr || info->element_type < 0 ||
+        (info->channels_kind != ONDA_BUFFER_CHANNELS_MONO &&
+         info->channels_kind != ONDA_BUFFER_CHANNELS_STATIC &&
+         info->channels_kind != ONDA_BUFFER_CHANNELS_DYNAMIC)) {
       result.diagnostic = error("Onda returned invalid buffer metadata");
       return result;
     }
 
     BufferMapping mapping;
     mapping.index = index;
-    mapping.name = rawName;
-    mapping.type = rawType;
-    mapping.channelKind = rawKind == ONDA_BUFFER_CHANNELS_MONO
-                              ? BufferChannelKind::mono
-                              : (rawKind == ONDA_BUFFER_CHANNELS_STATIC
-                                     ? BufferChannelKind::fixed
-                                     : BufferChannelKind::dynamic);
+    mapping.name = info->name;
+    mapping.type = info->type_text;
+    mapping.channelKind =
+        info->channels_kind == ONDA_BUFFER_CHANNELS_MONO
+            ? BufferChannelKind::mono
+            : (info->channels_kind == ONDA_BUFFER_CHANNELS_STATIC
+                   ? BufferChannelKind::fixed
+                   : BufferChannelKind::dynamic);
     if (mapping.channelKind == BufferChannelKind::fixed) {
-      mapping.fixedChannels =
-          onda_buffer_channels_static(compiled.program.get(), index);
+      mapping.fixedChannels = info->channels_static;
       if (mapping.fixedChannels <= 0) {
         result.diagnostic = error("Onda returned invalid buffer metadata");
         return result;
@@ -1128,7 +1042,7 @@ PreparedEngine::build(std::shared_ptr<const CompileResult> compilation,
     }
 
     result.watchPaths.push_back(binding->path);
-    if (onda_buffer_may_write(compiled.program.get(), index) != 0) {
+    if (info->may_write != 0) {
       if (bufferError.empty()) {
         bufferError = "Buffer '" + mapping.name +
                       "' is writable; audio-file bindings must be read-only "
@@ -1154,8 +1068,7 @@ PreparedEngine::build(std::shared_ptr<const CompileResult> compilation,
       }
       audio = std::make_shared<DecodedAudioFile>(std::move(*decoded.audio));
     }
-    if (audio->samples.elementType() !=
-        onda_buffer_elem_type(compiled.program.get(), index)) {
+    if (audio->samples.elementType() != info->element_type) {
       if (bufferError.empty())
         bufferError = "Buffer asset element type does not match Onda buffer '" +
                       mapping.name + "' (" + mapping.type + ")";
@@ -1207,8 +1120,8 @@ PreparedEngine::build(std::shared_ptr<const CompileResult> compilation,
   }
 
   OndaDiagnostic rawDiagnostic;
-  InstanceHandle instance{onda_instance_create(
-      compiled.program.get(), inputs, outputs, rawDiagnostic.outParameter())};
+  InstanceHandle instance{onda_instance_create(compiled.program.get(), nullptr,
+                                               rawDiagnostic.outParameter())};
   result.diagnostic = rawDiagnostic.copy();
   if (!instance) {
     if (result.diagnostic.empty())
@@ -1255,7 +1168,8 @@ PreparedEngine::build(std::shared_ptr<const CompileResult> compilation,
               storage ? storage->samples.data() : nullptr,
               storage ? storage->frames : 0, storage ? storage->channels : 0,
               storage ? storage->sampleRate : 0.0F,
-              onda_buffer_elem_type(engine->program_.get(), index)) != 0) {
+              onda_buffer_info(engine->program_.get(), index)->element_type) !=
+          0) {
         result.diagnostic = error(
             "Failed to bind audio file for Onda buffer '" +
             engine->bufferMappings_[static_cast<std::size_t>(index)].name +
@@ -1272,42 +1186,35 @@ PreparedEngine::build(std::shared_ptr<const CompileResult> compilation,
   for (int index = 0;
        index < parameterCount && engine->parameterMappingCount_ < slotCount;
        ++index) {
-    const auto enumJson =
-        parameterString(engine->program_.get(), index, onda_param_enum_json_copy);
-    if (!enumJson) {
-      result.diagnostic = error("Onda returned invalid enum metadata");
+    const auto *info = onda_param_info(engine->program_.get(), index);
+    if (info == nullptr || info->array_len <= 0) {
+      result.diagnostic = error("Onda returned invalid parameter metadata");
       return result;
     }
-    const auto enumeration = enumJson->empty()
+    const auto enumeration = info->enumeration_json == nullptr
                                  ? EnumMetadataPtr{}
-                                 : parseEnumMetadata(juce::JSON::parse(*enumJson));
-    if (!enumJson->empty() && !enumeration) {
+                                 : parseEnumMetadata(juce::JSON::parse(
+                                       juce::String{info->enumeration_json}));
+    if (info->enumeration_json != nullptr && !enumeration) {
       result.diagnostic = error("Onda returned invalid enum metadata");
       return result;
     }
-    const auto defaultBytes =
-        onda_param_default_bytes(engine->program_.get(), index, nullptr, 0);
-    std::vector<std::uint8_t> defaults(
-        static_cast<std::size_t>(std::max(defaultBytes, 0)));
-    if (defaultBytes < 0 ||
-        (defaultBytes > 0 && onda_param_default_bytes(
-                                 engine->program_.get(), index, defaults.data(),
-                                 defaultBytes) != defaultBytes)) {
-      result.diagnostic = error("Onda returned invalid parameter defaults");
-      return result;
-    }
-    const auto length = onda_param_array_len(engine->program_.get(), index);
+    const auto length = info->array_len;
     for (int element = 0;
          element < length && engine->parameterMappingCount_ < slotCount;
          ++element) {
-      auto mapping =
-          parameterMapping(engine->program_.get(), index, element, defaults,
-                           enumeration);
-      if (!mapping)
-        continue;
+      auto mapping = parameterMapping(*info, index, element, enumeration);
+      if (!mapping) {
+        auto name = info->name != nullptr ? std::string{info->name} : "<unnamed>";
+        if (info->is_array)
+          name += "[" + std::to_string(element) + "]";
+        result.diagnostic = error("Onda parameter '" + name +
+                                  "' requires a finite default and valid "
+                                  "control metadata");
+        return result;
+      }
       const auto slot = engine->parameterMappingCount_++;
-      const auto primitive =
-          onda_param_elem_type(engine->program_.get(), index);
+      const auto primitive = info->element_type;
       if (!mapping->stepCount &&
           (primitive == ONDA_PRIMITIVE_F32 || primitive == ONDA_PRIMITIVE_F64))
         engine->smoothedParameterTypes_[slot] = primitive;
@@ -1326,7 +1233,7 @@ PreparedEngine::build(std::shared_ptr<const CompileResult> compilation,
     result.diagnostic = error("Failed to initialize the Onda runtime instance");
     return result;
   }
-  if (onda_prepare_unchecked_process(engine->instance_.get()) != 0) {
+  if (onda_prepare_process(engine->instance_.get()) != 0) {
     if (result.diagnostic.empty())
       result.diagnostic = error("Failed to prepare unchecked Onda processing");
     return result;
@@ -1351,7 +1258,7 @@ PreparedEngine::build(std::shared_ptr<const CompileResult> compilation,
       engine->needsPositionInfo_ = true;
     }
   }
-  if (!collectVisibleEvents(engine->program_.get(), engine->eventMappings_,
+  if (!collectVisibleEvents(engine->program_, engine->eventMappings_,
                             result.diagnostic)) {
     return result;
   }
@@ -2053,10 +1960,10 @@ bool PreparedEngine::reset(const ParameterState &slots) noexcept {
   parametersSettleRequested_ = false;
   logicalFrame_ = 0;
   blockStarted_ = false;
-  const auto status = onda_init_unchecked(
+  const auto status = onda_init_checked(
       instance_.get(), ONDA_INIT_PRESERVE_PINNED, &executionOutput_);
   collectExecutionOutput();
-  return status == 0 && onda_prepare_unchecked_process(instance_.get()) == 0;
+  return status == 0 && onda_prepare_process(instance_.get()) == 0;
 }
 
 } // namespace onda::plugin

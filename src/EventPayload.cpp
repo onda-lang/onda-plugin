@@ -325,14 +325,13 @@ juce::var makeDefault(const PayloadType &type, const PayloadDefault *value) {
 }
 
 template <typename Unsigned>
-bool appendLittleEndian(std::vector<std::byte> &output, const Unsigned value,
-                        const std::size_t capacity) {
-  if (output.size() > capacity || sizeof(value) > capacity - output.size())
+bool appendLittleEndian(std::span<std::byte> &output, const Unsigned value) {
+  if (output.size() < sizeof(value))
     return false;
-  for (std::size_t index = 0; index < sizeof(value); ++index) {
-    output.push_back(
-        static_cast<std::byte>((value >> (index * 8U)) & Unsigned{0xff}));
-  }
+  for (std::size_t index = 0; index < sizeof(value); ++index)
+    output[index] =
+        static_cast<std::byte>((value >> (index * 8U)) & Unsigned{0xff});
+  output = output.subspan(sizeof(value));
   return true;
 }
 
@@ -355,6 +354,8 @@ std::optional<double> floatNumber(const juce::var &value) {
     return std::numeric_limits<double>::infinity();
   if (text == "-Infinity")
     return -std::numeric_limits<double>::infinity();
+  if (text == "-0")
+    return -0.0;
   return std::nullopt;
 }
 
@@ -362,13 +363,12 @@ bool integer(const double value) noexcept {
   return std::isfinite(value) && std::trunc(value) == value;
 }
 
-bool appendScalar(std::vector<std::byte> &output, const PayloadScalar scalar,
-                  const juce::var &value, const std::size_t capacity) {
+bool appendScalar(std::span<std::byte> &output, const PayloadScalar scalar,
+                  const juce::var &value) {
   if (scalar == PayloadScalar::boolean)
     return value.isBool() &&
            appendLittleEndian(
-               output, static_cast<std::uint8_t>(static_cast<bool>(value)),
-               capacity);
+               output, static_cast<std::uint8_t>(static_cast<bool>(value)));
   if (scalar == PayloadScalar::i64) {
     std::int64_t parsed{};
     if (value.isString()) {
@@ -388,8 +388,7 @@ bool appendScalar(std::vector<std::byte> &output, const PayloadScalar scalar,
         return false;
       parsed = static_cast<std::int64_t>(*number);
     }
-    return appendLittleEndian(output, std::bit_cast<std::uint64_t>(parsed),
-                              capacity);
+    return appendLittleEndian(output, std::bit_cast<std::uint64_t>(parsed));
   }
   if (scalar == PayloadScalar::i32) {
     const auto number = finiteNumber(value);
@@ -398,10 +397,8 @@ bool appendScalar(std::vector<std::byte> &output, const PayloadScalar scalar,
             static_cast<double>(std::numeric_limits<std::int32_t>::min()) ||
         *number > static_cast<double>(std::numeric_limits<std::int32_t>::max()))
       return false;
-    return appendLittleEndian(
-        output,
-        std::bit_cast<std::uint32_t>(static_cast<std::int32_t>(*number)),
-        capacity);
+    return appendLittleEndian(output, std::bit_cast<std::uint32_t>(
+                                          static_cast<std::int32_t>(*number)));
   }
   const auto number = floatNumber(value);
   if (!number)
@@ -412,11 +409,9 @@ bool appendScalar(std::vector<std::byte> &output, const PayloadScalar scalar,
          *number > static_cast<double>(std::numeric_limits<float>::max())))
       return false;
     return appendLittleEndian(
-        output, std::bit_cast<std::uint32_t>(static_cast<float>(*number)),
-        capacity);
+        output, std::bit_cast<std::uint32_t>(static_cast<float>(*number)));
   }
-  return appendLittleEndian(output, std::bit_cast<std::uint64_t>(*number),
-                            capacity);
+  return appendLittleEndian(output, std::bit_cast<std::uint64_t>(*number));
 }
 
 std::size_t leafCount(const PayloadType &type) {
@@ -439,11 +434,11 @@ std::size_t leafCount(const PayloadType &type) {
 }
 
 bool encodeValue(const PayloadType &type, const juce::var &value,
-                 std::vector<std::vector<std::byte>> &leaves, std::size_t &leaf,
-                 const std::size_t capacity) {
+                 const std::span<std::span<std::byte>> leaves,
+                 std::size_t &leaf) {
   if (type.kind == Kind::scalar)
     return leaf < leaves.size() &&
-           appendScalar(leaves[leaf++], type.scalar, value, capacity);
+           appendScalar(leaves[leaf++], type.scalar, value);
 
   if (type.kind == Kind::structure) {
     const auto *object = value.getDynamicObject();
@@ -453,7 +448,7 @@ bool encodeValue(const PayloadType &type, const juce::var &value,
     for (const auto &field : type.fields) {
       if (!object->hasProperty(field.name.c_str()) ||
           !encodeValue(*field.type, object->getProperty(field.name.c_str()),
-                       leaves, leaf, capacity))
+                       leaves, leaf))
         return false;
     }
     return true;
@@ -472,7 +467,7 @@ bool encodeValue(const PayloadType &type, const juce::var &value,
     for (std::size_t index = 0; index < expected; ++index) {
       if (!encodeValue(*type.elements[index],
                        values->getReference(static_cast<int>(index)), leaves,
-                       leaf, capacity))
+                       leaf))
         return false;
     }
     return true;
@@ -482,7 +477,7 @@ bool encodeValue(const PayloadType &type, const juce::var &value,
   const auto count = leafCount(*type.element);
   for (const auto &item : *values) {
     auto current = start;
-    if (!encodeValue(*type.element, item, leaves, current, capacity) ||
+    if (!encodeValue(*type.element, item, leaves, current) ||
         current != start + count)
       return false;
   }
@@ -490,54 +485,7 @@ bool encodeValue(const PayloadType &type, const juce::var &value,
   return true;
 }
 
-void collectLeaves(const PayloadType &type, const std::string &path,
-                   const std::size_t fixedElements,
-                   const std::vector<std::size_t> &shape,
-                   std::vector<PayloadLeaf> &leaves) {
-  if (type.kind == Kind::scalar) {
-    leaves.push_back({path, type.scalar, fixedElements, shape});
-    return;
-  }
-  if (type.kind == Kind::array) {
-    auto nestedShape = shape;
-    nestedShape.push_back(type.arrayLength);
-    collectLeaves(*type.element, path, fixedElements * type.arrayLength,
-                  nestedShape, leaves);
-    return;
-  }
-  if (type.kind == Kind::slice) {
-    collectLeaves(*type.element, path, fixedElements, shape, leaves);
-    return;
-  }
-  if (type.kind == Kind::structure) {
-    for (const auto &field : type.fields) {
-      collectLeaves(*field.type,
-                    path.empty() ? field.name : path + "." + field.name,
-                    fixedElements, shape, leaves);
-    }
-    return;
-  }
-  for (std::size_t index = 0; index < type.elements.size(); ++index) {
-    collectLeaves(*type.elements[index], path + ".__" + std::to_string(index),
-                  fixedElements, shape, leaves);
-  }
-}
-
 } // namespace
-
-std::size_t payloadScalarBytes(const PayloadScalar scalar) noexcept {
-  switch (scalar) {
-  case PayloadScalar::boolean:
-    return 1U;
-  case PayloadScalar::f32:
-  case PayloadScalar::i32:
-    return 4U;
-  case PayloadScalar::f64:
-  case PayloadScalar::i64:
-    return 8U;
-  }
-  return 0U;
-}
 
 bool parsePayloadSchema(const std::string_view json, PayloadSchema &schema,
                         std::string &error) {
@@ -647,7 +595,8 @@ payloadDefaultValue(const PayloadType &type,
   return makeDefault(type, defaultValue ? &*defaultValue : nullptr);
 }
 
-bool encodePayload(const PayloadSchema &schema, const juce::var &values,
+bool encodePayload(const PayloadSchema &schema, const onda_payload_plan_t *plan,
+                   const juce::var &values,
                    const std::span<std::byte> destination, std::size_t &written,
                    std::string &error) {
   written = 0U;
@@ -659,71 +608,73 @@ bool encodePayload(const PayloadSchema &schema, const juce::var &values,
     return false;
   }
 
-  for (std::size_t parameterIndex = 0;
-       parameterIndex < schema.parameters.size(); ++parameterIndex) {
-    const auto &parameter = schema.parameters[parameterIndex];
-    const auto &value =
-        arguments->getReference(static_cast<int>(parameterIndex));
-    const auto *type = parameter.type.get();
-    const auto dynamic = type->kind == Kind::slice;
-    const auto *dynamicValues = dynamic ? value.getArray() : nullptr;
-    if (dynamic && dynamicValues == nullptr) {
-      error = "parameter '" + parameter.name + "' has an invalid value";
+  std::vector<std::int32_t> lengths;
+  for (std::size_t index = 0; index < schema.parameters.size(); ++index) {
+    if (schema.parameters[index].type->kind != Kind::slice)
+      continue;
+    const auto *items =
+        arguments->getReference(static_cast<int>(index)).getArray();
+    if (items == nullptr) {
+      error = "parameter '" + schema.parameters[index].name +
+              "' has an invalid value";
       return false;
     }
-    if (dynamic) {
-      const auto count = static_cast<std::uint32_t>(dynamicValues->size());
-      if (written > destination.size() ||
-          sizeof(count) > destination.size() - written) {
-        error = "event payload exceeds the host capacity";
+    lengths.push_back(items->size());
+  }
+  onda_payload_layout_t layout{};
+  if (onda_payload_layout(plan, lengths.data(),
+                          static_cast<int>(lengths.size()), nullptr, 0,
+                          &layout) != 0) {
+    error = "invalid event payload layout";
+    return false;
+  }
+  if (static_cast<std::size_t>(layout.payload_bytes) > destination.size()) {
+    error = "event payload exceeds the host capacity";
+    return false;
+  }
+  std::vector<onda_payload_region_t> regions(
+      static_cast<std::size_t>(layout.region_count));
+  if (onda_payload_layout(plan, lengths.data(),
+                          static_cast<int>(lengths.size()), regions.data(),
+                          layout.region_count, &layout) != 0) {
+    error = "invalid event payload layout";
+    return false;
+  }
+  std::vector<std::span<std::byte>> leaves;
+  leaves.reserve(regions.size() - lengths.size());
+  std::size_t lengthIndex{};
+  for (const auto &region : regions) {
+    auto bytes =
+        destination.subspan(static_cast<std::size_t>(region.payload_offset),
+                            static_cast<std::size_t>(region.payload_bytes));
+    if (region.tensor_index < 0) {
+      if (!appendLittleEndian(
+              bytes, static_cast<std::uint32_t>(lengths[lengthIndex++]))) {
+        error = "invalid event slice prefix";
         return false;
       }
-      for (std::size_t byte = 0; byte < sizeof(count); ++byte)
-        destination[written++] =
-            static_cast<std::byte>((count >> (byte * 8U)) & 0xffU);
-      type = type->element.get();
-    }
-
-    std::vector<std::vector<std::byte>> leaves(leafCount(*type));
-    std::size_t leaf{};
-    if (dynamic) {
-      PayloadType sequence;
-      sequence.kind = Kind::slice;
-      sequence.element = parameter.type->element;
-      if (!encodeValue(sequence, value, leaves, leaf, destination.size()))
-        leaf = leaves.size() + 1U;
-    } else if (!encodeValue(*type, value, leaves, leaf, destination.size())) {
-      leaf = leaves.size() + 1U;
-    }
-    if (leaf != leaves.size()) {
-      error = "parameter '" + parameter.name + "' has an invalid value";
-      return false;
-    }
-    for (const auto &bytes : leaves) {
-      if (bytes.size() > destination.size() - written) {
-        error = "event payload exceeds the host capacity";
-        return false;
-      }
-      std::copy(bytes.begin(), bytes.end(),
-                destination.begin() + static_cast<std::ptrdiff_t>(written));
-      written += bytes.size();
+    } else {
+      leaves.push_back(bytes);
     }
   }
+  std::size_t leaf{};
+  for (std::size_t index = 0; index < schema.parameters.size(); ++index) {
+    const auto &parameter = schema.parameters[index];
+    if (!encodeValue(*parameter.type,
+                     arguments->getReference(static_cast<int>(index)), leaves,
+                     leaf)) {
+      error = "parameter '" + parameter.name + "' has an invalid value";
+      return false;
+    }
+  }
+  if (leaf != leaves.size() ||
+      std::ranges::any_of(leaves,
+                          [](const auto bytes) { return !bytes.empty(); })) {
+    error = "event values do not match the payload layout";
+    return false;
+  }
+  written = static_cast<std::size_t>(layout.payload_bytes);
   return true;
-}
-
-PayloadPlan makePayloadPlan(const PayloadSchema &schema) {
-  PayloadPlan result;
-  result.parameters.reserve(schema.parameters.size());
-  for (const auto &parameter : schema.parameters) {
-    PayloadParameterPlan plan;
-    plan.dynamic = parameter.type->kind == Kind::slice;
-    const auto &type =
-        plan.dynamic ? *parameter.type->element : *parameter.type;
-    collectLeaves(type, parameter.name, 1U, {}, plan.leaves);
-    result.parameters.push_back(std::move(plan));
-  }
-  return result;
 }
 
 } // namespace onda::plugin

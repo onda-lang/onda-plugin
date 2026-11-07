@@ -25,19 +25,47 @@ bool exerciseControlInputs() {
     if (!source.replaceWithText(test::controlInputSource()))
       return false;
     const auto inputPrefix = "ins {\n" + test::mainAudioInputDeclaration();
-    juce::String arraySource{inputPrefix};
-    arraySource +=
-        "  cv: f32[1] = [0.5]\n}\nouts { out1 }\nsample { out1 = cv[0] }\n";
     const juce::File arrayFile{
         pathToJuce(testTemporaryRoot() / "control-array-default.onda")};
-    if (!arrayFile.replaceWithText(arraySource))
-      return false;
-    const auto rejected =
-        PreparedEngine::build(pathFromJuce(arrayFile.getFullPathName()),
-                              Product::effect, 48'000.0, 3);
-    if (rejected.engine ||
-        rejected.diagnostic.message.find("finite scalars") == std::string::npos)
-      return false;
+    for (int count = 1; count <= std::min(2, pluginControlInputs); ++count) {
+      // One array spans the main audio and control slots. Each control must
+      // retain its own default, even when that default lies outside [0, 1].
+      const auto length = pluginInputChannels + count;
+      auto arraySource = "ins { cv: f32[" + juce::String(length) + "] = [";
+      for (int element = 0; element < length; ++element)
+        arraySource += (element == 0 ? "" : ", ") +
+                       juce::String(static_cast<double>(element) + 0.25);
+      arraySource += "] }\nouts { out1 }\nsample { out1 = cv[" +
+                     juce::String(length - 1) + "] }\n";
+      if (!arrayFile.replaceWithText(arraySource))
+        return false;
+      const auto built =
+          PreparedEngine::build(pathFromJuce(arrayFile.getFullPathName()),
+                                Product::effect, 48'000.0, 3);
+      if (!built.engine || built.engine->controlMappings().size() !=
+                               static_cast<std::size_t>(count))
+        return false;
+      for (int control = 0; control < count; ++control) {
+        const auto element = pluginInputChannels + control;
+        const auto &mapping = built.engine->controlMappings()[
+            static_cast<std::size_t>(control)];
+        if (mapping.name != "cv[" + std::to_string(element) + "]" ||
+            mapping.defaultPlain !=
+                ScalarPlain{static_cast<double>(element) + 0.25})
+          return false;
+      }
+      std::array<std::array<float, 3>, pluginOutputChannels> samples{};
+      std::array<float *, pluginOutputChannels> outputs{};
+      for (std::size_t channel = 0; channel < outputs.size(); ++channel)
+        outputs[channel] = samples[channel].data();
+      ParameterState slots;
+      if (!built.engine->process(nullptr, outputs.data(), 3, {}, slots) ||
+          !std::ranges::all_of(samples[0], [length](const float value) {
+            return test::withinTolerance(
+                value - (static_cast<float>(length - 1) + 0.25F), 1.0e-6F);
+          }))
+        return false;
+    }
     const juce::File invalidTypeFile{
         pathToJuce(testTemporaryRoot() / "control-invalid-type.onda")};
     for (const auto *type : {"f64", "f64[1]", "i32", "bool"}) {

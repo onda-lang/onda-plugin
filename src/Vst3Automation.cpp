@@ -11,6 +11,32 @@
 
 namespace onda::plugin {
 namespace {
+// Retain JUCE's boolean presentation and wrapper-owned state. Host queues only
+// commit its atomic value; controller/listener delivery belongs to the timer.
+class DeferredBypassParameter final : public juce::AudioParameterBool,
+                                      private juce::Timer {
+public:
+  DeferredBypassParameter() : AudioParameterBool("byps", "Bypass", false) {
+    startTimerHz(20);
+  }
+  ~DeferredBypassParameter() override { stopTimer(); }
+
+  void setFromHost(const float newValue) noexcept {
+    auto &parameter = static_cast<juce::AudioProcessorParameter &>(*this);
+    if (!juce::approximatelyEqual(parameter.getValue(), newValue)) {
+      parameter.setValue(newValue);
+      pending_.store(true, std::memory_order_release);
+    }
+  }
+
+private:
+  void timerCallback() override {
+    if (pending_.exchange(false, std::memory_order_acq_rel))
+      HostParameter::notifyHostValue(*this);
+  }
+  std::atomic<bool> pending_{};
+};
+
 bool readPoint(const void *context, const int index,
                AutomationPoint &point) noexcept {
   auto *queue = static_cast<Steinberg::Vst::IParamValueQueue *>(
@@ -21,6 +47,23 @@ bool readPoint(const void *context, const int index,
   return result == Steinberg::kResultOk;
 }
 } // namespace
+
+std::unique_ptr<juce::AudioProcessorParameter> makeVst3BypassParameter() {
+  return std::make_unique<DeferredBypassParameter>();
+}
+
+bool vst3SetBypassFromHost(juce::AudioProcessorParameter &parameter,
+                           const float value) noexcept {
+  if (auto *bypass = dynamic_cast<DeferredBypassParameter *>(&parameter)) {
+    bypass->setFromHost(value);
+    return true;
+  }
+  return false;
+}
+
+void vst3MidiOverflow(juce::AudioProcessor &processor) noexcept {
+  static_cast<Processor &>(processor).requestHostNotesOff();
+}
 
 bool vst3OwnsParameter(juce::AudioProcessor &processor,
                        const std::uint32_t id) noexcept {

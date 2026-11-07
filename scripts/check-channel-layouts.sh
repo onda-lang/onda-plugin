@@ -20,6 +20,7 @@ cache_value() {
 }
 sdk_archive="$(cache_value ONDA_SDK_ARCHIVE)"
 sdk_checksums="$(cache_value ONDA_SDK_CHECKSUMS)"
+development_source="$(cache_value ONDA_DEVELOPMENT_SOURCE_DIR)"
 release_source="$(cache_value ONDA_RELEASE_SOURCE_DIR)"
 release_revision="$(cache_value ONDA_RELEASE_SOURCE_REVISION)"
 juce_root="${ONDA_JUCE_ROOT:-$(cache_value ONDA_JUCE_ROOT)}"
@@ -36,6 +37,7 @@ for layout in '2 16 2 1' '0 16 2 32' '1 0 1 32' '4 4 4 64'; do
     -DONDA_PLUGIN_PARAMETER_SLOTS="$slots" \
     -DONDA_PLUGIN_BUILD_VST3_AUDIT=OFF \
     -DONDA_VST3_VALIDATOR="$validator" \
+    -DONDA_DEVELOPMENT_SOURCE_DIR="$development_source" \
     -DONDA_SDK_ARCHIVE="${sdk_archive:-$default_build/_deps/onda-$onda_version-linux-x64.tar.xz}" \
     -DONDA_SDK_CHECKSUMS="${sdk_checksums:-$default_build/_deps/$onda_version-SHA256SUMS.txt}" \
     -DONDA_RELEASE_SOURCE_DIR="${release_source:-$default_build/_deps/ondareleasesource-src}" \

@@ -158,6 +158,9 @@ public:
   [[nodiscard]] bool ownsHostParameter(std::uint32_t id) const noexcept;
   void publishHostAutomationTargets() noexcept;
   void clearHostAutomation() noexcept;
+  void requestHostNotesOff() noexcept {
+    hostNotesOffRequested_.store(true, std::memory_order_release);
+  }
   [[nodiscard]] juce::String controlInputName(std::size_t index) const;
 
   [[nodiscard]] int preferredBlockSize() const noexcept {
@@ -258,6 +261,7 @@ private:
   SpscSlot<PreparedEngine *> retirements_;
   std::atomic<bool> deactivateRequested_{};
   std::atomic<bool> resetRequested_{};
+  std::atomic<bool> hostNotesOffRequested_{};
   std::atomic<bool> parameterSettleRequested_{};
   std::atomic<bool> runtimeFaulted_{};
   std::atomic<bool> runtimeRecoveryRequested_{};

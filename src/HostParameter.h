@@ -32,9 +32,13 @@ public:
   // Synchronous listeners retain the host origin, including controller
   // presentation updates. Nested editor changes establish their own origin.
   void notifyHostValue() {
+    notifyHostValue(*this);
+  }
+
+  static void notifyHostValue(juce::AudioProcessorParameter &parameter) {
     const juce::ScopedValueSetter<const juce::AudioProcessorParameter *>
-        notification(hostValueNotification_, this);
-    sendValueChangedMessageToListeners(getValue());
+        notification(hostValueNotification_, &parameter);
+    parameter.sendValueChangedMessageToListeners(parameter.getValue());
   }
 
   [[nodiscard]] static bool isHostValueNotification(

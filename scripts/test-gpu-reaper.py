@@ -10,7 +10,7 @@ import signal
 import subprocess
 import tempfile
 import time
-from x11_file_drop import drop_files
+from x11_file_drop import Event, drop_files
 
 
 class XError(c.Structure):
@@ -53,6 +53,12 @@ class X11:
             "XFetchName": ([c.c_void_p, c.c_ulong, c.POINTER(c.c_char_p)], c.c_int),
             "XInternAtom": ([c.c_void_p, c.c_char_p, c.c_int], c.c_ulong),
             "XGetWindowProperty": ([c.c_void_p, c.c_ulong, c.c_ulong, c.c_long, c.c_long, c.c_int, c.c_ulong, c.POINTER(c.c_ulong), c.POINTER(c.c_int), c.POINTER(c.c_ulong), c.POINTER(c.c_ulong), c.POINTER(c.POINTER(c.c_ubyte))], c.c_int),
+            "XCreateSimpleWindow": ([c.c_void_p, c.c_ulong, c.c_int, c.c_int, c.c_uint, c.c_uint, c.c_uint, c.c_ulong, c.c_ulong], c.c_ulong),
+            "XDestroyWindow": ([c.c_void_p, c.c_ulong], c.c_int),
+            "XSetSelectionOwner": ([c.c_void_p, c.c_ulong, c.c_ulong, c.c_ulong], c.c_int),
+            "XConvertSelection": ([c.c_void_p, c.c_ulong, c.c_ulong, c.c_ulong, c.c_ulong, c.c_ulong], c.c_int),
+            "XPending": ([c.c_void_p], c.c_int),
+            "XNextEvent": ([c.c_void_p, c.POINTER(Event)], c.c_int),
             "XGetGeometry": ([c.c_void_p, c.c_ulong, c.POINTER(c.c_ulong), c.POINTER(c.c_int), c.POINTER(c.c_int), c.POINTER(c.c_uint), c.POINTER(c.c_uint), c.POINTER(c.c_uint), c.POINTER(c.c_uint)], c.c_int),
             "XGetWindowAttributes": ([c.c_void_p, c.c_ulong, c.POINTER(WindowAttributes)], c.c_int),
             "XKeysymToKeycode": ([c.c_void_p, c.c_ulong], c.c_uint),
@@ -122,15 +128,67 @@ class X11:
                  if min(self.size(child)) > 100 and self.visible(child)]
         return peers[-1] if peers else None
 
-    def key(self, symbol):
+    def key(self, symbol, control=False):
         code = self.x.XKeysymToKeycode(self.display, symbol)
+        modifier = self.x.XKeysymToKeycode(self.display, 0xffe3)  # Control_L
         # XTest updates the server's key state as well as delivering events;
         # JUCE and the VST3 host both consult that state during key handling.
+        if control:
+            self.xtest.XTestFakeKeyEvent(self.display, modifier, 1, 0)
         self.xtest.XTestFakeKeyEvent(self.display, code, 1, 0)
         self.x.XFlush(self.display)
         time.sleep(0.025)
         self.xtest.XTestFakeKeyEvent(self.display, code, 0, 0)
+        if control:
+            self.xtest.XTestFakeKeyEvent(self.display, modifier, 0, 0)
         self.x.XFlush(self.display)
+
+    def copy_text(self):
+        clipboard, utf8, prop = [self.x.XInternAtom(self.display, name, 0)
+                                 for name in (b"CLIPBOARD", b"UTF8_STRING", b"ONDA_TEST_TEXT")]
+        # Require a fresh copy; an earlier field's clipboard must not count as focus.
+        self.x.XSetSelectionOwner(self.display, clipboard, 0, 0)
+        self.key(ord('c'), control=True)
+        requestor = self.x.XCreateSimpleWindow(self.display, self.root, 0, 0, 1, 1, 0, 0, 0)
+        try:
+            self.x.XConvertSelection(self.display, clipboard, utf8, prop, requestor, 0)
+            self.x.XFlush(self.display)
+            deadline = time.monotonic() + 0.5
+            while time.monotonic() < deadline:
+                if not self.x.XPending(self.display):
+                    time.sleep(0.005)
+                    continue
+                event = Event()
+                self.x.XNextEvent(self.display, c.byref(event))
+                if event.type != 31 or event.selection.requestor != requestor:
+                    continue
+                if not event.selection.property:
+                    return None
+                actual, bits, count, remaining = c.c_ulong(), c.c_int(), c.c_ulong(), c.c_ulong()
+                data = c.POINTER(c.c_ubyte)()
+                self.x.XGetWindowProperty(self.display, requestor, prop, 0, 1024, 1, utf8,
+                                         c.byref(actual), c.byref(bits), c.byref(count), c.byref(remaining), c.byref(data))
+                try:
+                    if actual.value == utf8 and bits.value == 8 and not remaining.value:
+                        return c.string_at(data, count.value).decode()
+                    return None
+                finally:
+                    if data:
+                        self.x.XFree(data)
+            raise RuntimeError("Timed out reading the focused field's clipboard")
+        finally:
+            self.x.XDestroyWindow(self.display, requestor)
+            self.x.XFlush(self.display)
+
+    def focus_text(self, window, expected):
+        self.x.XSetInputFocus(self.display, window, 1, 0)
+        self.x.XFlush(self.display)
+        self.key(0xff1b)  # Escape
+        for _ in range(32):
+            self.key(0xff09)  # Tab: traverse the UI's logical widget order.
+            if self.copy_text() == expected:
+                return
+        raise RuntimeError(f"Native editor did not focus the parameter value {expected!r}")
 
     def click(self, window, x, y):
         root_x, root_y, child = c.c_int(), c.c_int(), c.c_ulong()
@@ -196,7 +254,7 @@ def main():
         shutil.copytree(bundle, relocated)
         if not (relocated / "Contents/Resources/onda_ui/libonda_ui.so").is_file():
             raise RuntimeError("Build the GPU editor before running the DAW test")
-        subprocess.run([str(build / "onda_vst3_smoke"), "--preset", str(relocated), str(source), str(root / f"{product}.vstpreset")], check=True)
+        subprocess.run([str(build / "onda_vst3_smoke"), "--preset", str(relocated), str(source), str(root / f"{product}.vstpreset")], check=True, timeout=30)
     configuration = root / "reaper.ini"
     # REAPER appends ~/.vst3 if absent and selects the last duplicate plugin.
     # Keep the relocated test bundles last, ahead of installed Onda versions.
@@ -341,13 +399,10 @@ def main():
             x11.x.XResizeWindow(x11.display, handle, 720, 840)
             x11.x.XFlush(x11.display)
             time.sleep(0.2)
-            width, _ = x11.size(peer)
-            time.sleep(0.1)
-            # The scope starts closed; Params sits directly below the header.
-            # Select Sliders, then focus the numeric field in its first card.
-            x11.click(peer, width - 64, 100)
-            x11.click(peer, 178, 140)
-            time.sleep(0.1)
+            # Follow keyboard focus and verify the copied value before typing.
+            # Scope visibility, layout and host sizing do not determine this path.
+            x11.focus_text(peer, command('query')[parameter_index + 1])
+            x11.key(ord('a'), control=True)
             for symbol in [ord('8'), ord('8'), ord('0'), 0xff0d]:
                 x11.key(symbol)
                 time.sleep(0.05)

@@ -13,6 +13,25 @@ also works. Use the `core` label for tests that do not require a native surface.
 Native scheduling checks wait for bounded completion and verify a return to
 idle; OS exposure events and transient swapchains can add presentation attempts.
 
+`AudioThreadFpMode` verifies SDK FP setup for worker initialization and callbacks,
+including bypass, thread migration, multiple instances, and host mode changes.
+The exported VST3 audit also checks untouched processing threads before warmup,
+catching dynamic-library TLS allocation that executable-linked tests cannot. It
+audits first and subsequent callbacks for allocations and locks, and checks that
+preparation leaves the calling host thread's mode unchanged.
+Those first callbacks include actual bypass queues. Exported input regressions
+also check audible bypass transitions and deferred controller delivery without
+host edit echoes; dense notes and CC curves through the 4,096-entry shared MIDI
+budget; overflow in either source and their combination; release of held notes
+and subsequent recovery; and rejection of SysEx before owning-message allocation.
+
+`EventPayloadLayout` verifies exact packed bytes for dynamic and empty slices,
+full-width integers, signed float zeros (including `"-0"` strings in scalar and
+structured values), and rejection before writing when capacity is insufficient.
+It also encodes through a retained event snapshot after its engine is destroyed.
+`StructuredEvents` exercises the encoder through real callbacks with nested
+structs, tuples, arrays, slices, and integer-domain normalization.
+
 | CTest label | Placement and purpose |
 | --- | --- |
 | `core` | All three toolchains: deterministic C++ DSP, state, automation and worker behavior; examples; exported VST3 behavior and protocol validation. |
@@ -129,7 +148,9 @@ xvfb-run -a python3 scripts/test-gpu-reaper.py build --file-drops
 
 The script uses a temporary REAPER profile and relocated bundles. It checks
 library loading, native edits, DAW automation, resize, reopening, and optional
-source drops. Requirements are REAPER, X11/XTest, and ImageMagick. `--nautilus`
+source drops. Native edits use keyboard traversal and a fresh clipboard copy to
+verify parameter focus before typing, independently of panel positions.
+Requirements are REAPER, X11/XTest, and ImageMagick. `--nautilus`
 also needs Nautilus and `dbus-run-session` and exercises its actual file drag.
 These are X11 checks; native Wayland-to-X11 drops additionally depend on the
 compositor's bridge and are not established by this suite.
@@ -138,9 +159,11 @@ compositor's bridge and are not established by this suite.
 
 | Test | Contract |
 | --- | --- |
+| `onda_sdk_archive_tests` | SDK extraction follows archive contents when reconfiguring, rebuilds consumers despite older archived timestamps, reuses an unchanged archive, and repairs incomplete or unidentified extraction caches. |
+| `onda_gpu_ui_library_tests` | Renderer selection follows development and release SDK changes in one build directory, preserves explicit overrides, and resumes automatic selection when an override is cleared. |
 | `onda_watcher_tests` | Native filesystem notifications, missing paths, inode replacement, and Linux subscription recovery without JUCE/compiler setup. |
 | `onda_scope_capture_{1,2,8,64}_tests` | Per-channel peak retention/reset, non-finite samples, and meter-only capture without waveform writes. |
-| `onda_channel_layout_script_tests` | Linux layout driver preserves the SDK resource checkout and revision for all configurations, including release-tag mode. |
+| `onda_channel_layout_script_tests` | Linux layout driver preserves the development SDK selection, resource checkout and revision for all configurations, including release-tag mode. |
 | `onda_gpu_ui_tests` | Dedicated native surface, input/IME, coalesced input redraws without polling, idle wakeups and presentation retries, immediate resize presentation, reparenting, synchronous renderer release before desktop peer destruction and reattachment without manual ticks, and hide/show. Linux pixels survive JUCE repaints; macOS density and Windows parent-renderer ownership are checked. |
 | `onda_gpu_keyboard_tests` | Surface-free consumed/unused/error distinctions and forwarding unused keys to the DAW. |
 | `onda_gpu_editor_tests` | Smoothing acknowledgments carry accepted values and errors without resending schemas; teardown resolves drafts before handlers die; hidden input suspension and presentation/capture restoration after reparenting. |
@@ -157,7 +180,9 @@ compositor's bridge and are not established by this suite.
 
 Parameter publication tests check exact defaults and focused drafts through
 the native adapter. `NativeEditor` requires real GPU edits to reach the DSP and
-retains values across closing and reopening the editor.
+retains values across closing and reopening the editor. It disables parameter
+smoothing so edit-delivery checks do not depend on how many audio samples fit
+between GUI message-loop iterations; dedicated processing tests cover smoothing.
 The `EditorGestureCancellation` processor case checks the native command against
 JUCE's actual value and gesture notifications, including cancellation after a
 newer host automation value.
@@ -192,7 +217,9 @@ discrete edits, automation, Reset, saved state, and native file reload after
 adding a parameter while input controls are present. It verifies that Onda's
 metadata remains unranged and authored defaults outside 0–1 survive loading,
 Reset, and state restoration. It also checks adding an explicit range after an
-unranged default and rejects saved defaults outside their scalar type.
+unranged default and rejects saved defaults outside their scalar type. Non-finite
+scalar and array defaults must fail preparation with a named error, retaining the
+previous engine, automation mapping, and audio until a valid reload succeeds.
 `EventOnlyParameterSmoothing` checks that zero-frame MIDI and user-event
 callbacks preserve subsequent `f32` and `f64` smoothing after startup and reset,
 including partial first blocks, with allocation and lock auditing.
@@ -338,10 +365,11 @@ VST3s. They cover default-disabled mono bus metadata, individual and combined
 activation, fixed channel positions with an earlier bus disabled, disconnected
 scalar defaults, per-sample clamping including NaN, MIDI timing, short final
 blocks, and bypass using only main audio inputs. Processor
-renders audit allocations and locks. Preparation rejects control array defaults
-that the pinned SDK cannot expose, and rejects scalar/array `f64`, `i32`, and
-`bool` control ports. An additional fixture enables every control bus while the
-program declares none, supplying NaNs on those buses and checking that output
+renders audit allocations and locks. Control arrays preserve per-element defaults,
+including arrays spanning main audio and control slots. Preparation rejects
+scalar/array `f64`, `i32`, and `bool` control ports. An additional fixture enables
+every control bus while the program declares none, supplying NaNs on those buses
+and checking that output
 stays valid. Both processor and exported VST3 tests route the last control bus
 with all earlier control buses disabled, then check its current parameter value
 after disconnecting it. Processor tests automate every lane concurrently across

@@ -17,6 +17,8 @@
 #include "StateFormat.h"
 #include "TestAudioFile.h"
 #include "BlockProcessingTests.h"
+#include "AudioFpTests.h"
+#include "PayloadLayoutTests.h"
 #include "AutomationSeedingTests.h"
 #include "ScratchHandoffTests.h"
 #include "ControlInputTests.h"
@@ -4718,6 +4720,7 @@ int runProcessorCases(const int argc, const char *const *argv) {
       {"RealtimeAuditInstrumentation",
        test::exerciseRealtimeAuditInstrumentation},
       {"AlignedAllocation", exerciseAlignedAllocation},
+      {"AudioThreadFpMode", exerciseAudioThreadFpMode},
       {"NewControlDefaults", exerciseNewControlDefaults},
       {"HostPreparation", exerciseHostPreparation},
       {"MeterLifecycle", exerciseMeterLifecycle},
@@ -4740,6 +4743,7 @@ int runProcessorCases(const int argc, const char *const *argv) {
       {"ScopeCapture", exerciseScopeCapture},
       {"UserEvents", exerciseUserEvents},
       {"StructuredEvents", exerciseStructuredEvents},
+      {"EventPayloadLayout", exerciseEventPayloadLayout},
       {"HostParameterPresentation", exerciseHostParameterPresentation},
       {"EnumParameters", exerciseEnumParameters},
       {"EnumEventMetadata", exerciseEnumEventMetadata},

@@ -84,8 +84,10 @@ public:
   }
 
   double value(const char *id) const {
-    return controller_->getParamNormalized(
-        juce::VST3ClientExtensions::convertJuceParameterId(id));
+    return value(juce::VST3ClientExtensions::convertJuceParameterId(id));
+  }
+  double value(const Vst::ParamID id) const {
+    return controller_->getParamNormalized(id);
   }
   double plain(const char *id, const double value) const {
     return controller_->normalizedParamToPlain(

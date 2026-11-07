@@ -37,7 +37,8 @@ env:
 jobs:
   build:
     name: ${{ matrix.platform }}
-    runs-on: ${{ matrix.platform == 'linux-x64' && 'ubuntu-24.04' || matrix.platform == 'windows-x64' && 'windows-latest' || 'macos-latest' }}
+    runs-on: ${{ matrix.platform == 'linux-x64' && 'ubuntu-24.04' || matrix.platform == 'windows-x64' && 'windows-2022' || 'macos-latest' }}
+    container: ${{ matrix.platform == 'linux-x64' && 'debian:bookworm@sha256:268fb24c39bca92d326dd83ea3abebe4a3f7751c804ffef23bb6d857dd343ff8' || '' }}
     strategy:
       fail-fast: false
       matrix:
@@ -47,6 +48,17 @@ jobs:
       BUILD_PATH: ${{ github.workspace }}/build
 
     steps:
+      - name: Prepare Debian 12 build environment
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          source /etc/os-release
+          test "$ID:$VERSION_ID" = debian:12
+          test "$(getconf GNU_LIBC_VERSION)" = 'glibc 2.36'
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            build-essential ca-certificates cmake curl git ninja-build pkg-config python3 unzip xz-utils
+
       - name: Select tests
         id: tests
         shell: bash
@@ -157,13 +169,13 @@ jobs:
         if: runner.os == 'Linux'
         shell: bash
         run: |
-          sudo apt-get update
-          sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y \
+          apt-get install -y --no-install-recommends \
             pkg-config xvfb xauth \
             libasound2-dev \
             libfontconfig1-dev \
             libfreetype6-dev \
             libvulkan1 mesa-vulkan-drivers \
+            libxkbcommon0 libxkbcommon-x11-0 \
             libx11-dev \
             libxcomposite-dev \
             libxcursor-dev \
@@ -171,6 +183,7 @@ jobs:
             libxinerama-dev \
             libxrandr-dev \
             libxrender-dev
+          echo "WGPU_BACKEND=vulkan" >> "$GITHUB_ENV"
 
       - name: Checkout VST3 validator SDK
         if: steps.tests.outputs.validator == 'true'
@@ -232,10 +245,12 @@ jobs:
           if [[ "$RUNNER_OS" == Windows ]]; then extension=zip; fi
           archive="$GITHUB_WORKSPACE/.onda-sdk/onda-$version-$SDK_PLATFORM.$extension"
           test -f "$archive"
-          echo "ONDA_SDK_ARCHIVE=$archive" >> "$GITHUB_ENV"
-          echo "ONDA_SDK_CHECKSUMS=$GITHUB_WORKSPACE/.onda-sdk/SHA256SUMS.txt" >> "$GITHUB_ENV"
-          echo "ONDA_RELEASE_SOURCE_DIR=$GITHUB_WORKSPACE/.onda-source" >> "$GITHUB_ENV"
-          echo "ONDA_RELEASE_SOURCE_REVISION=$ONDA_SOURCE_REF" >> "$GITHUB_ENV"
+          {
+            echo "ONDA_SDK_ARCHIVE=$archive"
+            echo "ONDA_SDK_CHECKSUMS=$GITHUB_WORKSPACE/.onda-sdk/SHA256SUMS.txt"
+            echo "ONDA_RELEASE_SOURCE_DIR=$GITHUB_WORKSPACE/.onda-source"
+            echo "ONDA_RELEASE_SOURCE_REVISION=$ONDA_SOURCE_REF"
+          } >> "$GITHUB_ENV"
 
       - name: Configure CMake on Windows
         if: runner.os == 'Windows'
@@ -324,7 +339,9 @@ jobs:
           bash scripts/check-macos-deployment-target.sh \
             "$MACOSX_DEPLOYMENT_TARGET" \
             "$BUILD_PATH/OndaSynth_artefacts/Release/VST3/OndaSynth.vst3/Contents/MacOS/OndaSynth" \
-            "$BUILD_PATH/OndaFX_artefacts/Release/VST3/OndaFX.vst3/Contents/MacOS/OndaFX"
+            "$BUILD_PATH/OndaFX_artefacts/Release/VST3/OndaFX.vst3/Contents/MacOS/OndaFX" \
+            "$BUILD_PATH/OndaSynth_artefacts/Release/VST3/OndaSynth.vst3/Contents/Resources/onda_ui/libonda_ui.dylib" \
+            "$BUILD_PATH/OndaFX_artefacts/Release/VST3/OndaFX.vst3/Contents/Resources/onda_ui/libonda_ui.dylib"
 
       - name: Package Unix bundles
         if: inputs.tests == 'package' && runner.os != 'Windows'

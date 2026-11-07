@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.22)
+cmake_minimum_required(VERSION 3.24)
 
 if(NOT DEFINED ONDA_PLUGIN_VERSION OR ONDA_PLUGIN_VERSION STREQUAL "")
     if(DEFINED ENV{ONDA_PLUGIN_VERSION}
@@ -49,7 +49,7 @@ if(NOT JUCE_REVISION MATCHES "^[0-9a-f]+$" OR
     message(FATAL_ERROR "Invalid JUCE revision '${JUCE_REVISION}'")
 endif()
 
-# Keep the native host and the packaged Rust renderer on the same macOS baseline.
+# Floating-point std::to_chars cannot back-deploy to the SDK's macOS 11 baseline.
 if(CMAKE_HOST_APPLE AND NOT DEFINED CMAKE_OSX_DEPLOYMENT_TARGET)
     set(CMAKE_OSX_DEPLOYMENT_TARGET "14.0" CACHE STRING "Minimum macOS version")
 endif()
@@ -69,7 +69,7 @@ set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/plugin-version")
 
 if(APPLE AND CMAKE_OSX_DEPLOYMENT_TARGET VERSION_LESS "14.0")
-    message(FATAL_ERROR "The Onda plugin editor requires macOS 14.0 or later")
+    message(FATAL_ERROR "The Onda plugin requires macOS 14.0 or later")
 endif()
 
 if(MSVC)
@@ -248,13 +248,9 @@ else()
         "${CMAKE_BINARY_DIR}/_deps/onda-${ONDA_VERSION}-${ONDA_SDK_PLATFORM}")
     set(ONDA_SDK_ROOT
         "${ONDA_SDK_EXTRACT_DIR}/onda-${ONDA_VERSION}-${ONDA_SDK_PLATFORM}")
-    if(NOT EXISTS "${ONDA_SDK_ROOT}/lib/cmake/Onda/OndaConfig.cmake")
-        file(REMOVE_RECURSE "${ONDA_SDK_EXTRACT_DIR}")
-        file(MAKE_DIRECTORY "${ONDA_SDK_EXTRACT_DIR}")
-        file(ARCHIVE_EXTRACT
-            INPUT "${ONDA_SDK_ARCHIVE}"
-            DESTINATION "${ONDA_SDK_EXTRACT_DIR}")
-    endif()
+    include(cmake/OndaSdkArchive.cmake)
+    onda_extract_sdk_archive("${ONDA_SDK_ARCHIVE}"
+        "${ONDA_SDK_ARCHIVE_SHA256}" "${ONDA_SDK_ROOT}")
 
     if(NOT ONDA_RELEASE_SOURCE_DIR)
         FetchContent_Declare(
@@ -444,18 +440,7 @@ copy_onda_release_license(
     "${ONDA_JUCE_SOURCE_DIR}/modules/juce_graphics/unicode/sheenbidi/LICENSE"
     "SheenBidi-LICENSE.txt")
 
-if(ONDA_DEVELOPMENT_SOURCE_DIR)
-    set(onda_ui_library_dir "${ONDA_DEVELOPMENT_SOURCE_DIR}/target/release")
-else()
-    set(onda_ui_library_dir "${ONDA_SDK_ROOT}/lib")
-endif()
-set(ONDA_GPU_UI_LIBRARY
-    "${onda_ui_library_dir}/${CMAKE_SHARED_LIBRARY_PREFIX}onda_ui${CMAKE_SHARED_LIBRARY_SUFFIX}"
-    CACHE FILEPATH "Path to the shared onda_ui renderer built with --features ffi")
-if(NOT EXISTS "${ONDA_SDK_ROOT}/include/onda_ui.h" OR NOT EXISTS "${ONDA_GPU_UI_LIBRARY}")
-    message(FATAL_ERROR "The Onda SDK must include onda_ui.h and the onda_ui shared library; development checkouts need cargo build --release -p onda_ui --features ffi")
-endif()
-get_filename_component(ONDA_GPU_UI_LIBRARY_NAME "${ONDA_GPU_UI_LIBRARY}" NAME)
+include(cmake/OndaGpuUiLibrary.cmake)
 
 add_library(onda_plugin_engine STATIC
     src/ParameterAutomation.cpp

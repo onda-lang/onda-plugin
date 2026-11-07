@@ -88,7 +88,7 @@ exportProject(const ProjectImage &projectImage,
   std::string exportError;
   Diagnostic diagnostic;
   const auto materialized = visitMaterializedProjectFiles(
-      projectImage, diagnostic, [&](MaterializedProjectFile &&file) {
+      projectImage, diagnostic, [&](const MaterializedProjectFile &file) {
         if (!isSafeRelativeProjectPath(file.relativePath)) {
           exportError = "Onda returned an unsafe project path";
           return false;

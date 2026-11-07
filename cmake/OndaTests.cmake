@@ -5,6 +5,15 @@ function(onda_add_test name group)
     set_tests_properties(${name} PROPERTIES LABELS "${group}" TIMEOUT 180)
 endfunction()
 
+onda_add_test(onda_sdk_archive_tests core
+    "${CMAKE_COMMAND}" "-DTEST_DIRECTORY=${CMAKE_CURRENT_BINARY_DIR}/sdk-archive-tests"
+    "-DTEST_GENERATOR=${CMAKE_GENERATOR}"
+    -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/SdkArchiveTests.cmake")
+onda_add_test(onda_gpu_ui_library_tests core
+    "${CMAKE_COMMAND}" "-DTEST_DIRECTORY=${CMAKE_CURRENT_BINARY_DIR}/gpu-ui-library-tests"
+    "-DTEST_GENERATOR=${CMAKE_GENERATOR}"
+    -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/GpuUiLibraryTests.cmake")
+
 find_package(Threads REQUIRED)
 if(WIN32)
     get_filename_component(ONDA_LINKER_DIRECTORY "${CMAKE_LINKER}" DIRECTORY)
@@ -126,6 +135,8 @@ target_sources(onda_processor_tests PRIVATE
     tests/RealtimeAuditTests.cpp
     tests/BypassTests.cpp
     tests/BlockProcessingTests.cpp
+    tests/AudioFpTests.cpp
+    tests/PayloadLayoutTests.cpp
     tests/RunSettingsTests.cpp
     tests/UnboundBufferTests.cpp
     tests/BufferBindingProcessorTests.cpp
@@ -212,6 +223,8 @@ if(ONDA_PLUGIN_INPUT_CHANNELS EQUAL 2 AND
     onda_add_test(onda_processor_stress_tests extended onda_processor_tests --group extended)
 else()
     onda_add_test(onda_realtime_audit_instrumentation_tests core onda_processor_tests RealtimeAuditInstrumentation)
+    onda_add_test(onda_audio_thread_fp_tests core onda_processor_tests AudioThreadFpMode)
+    onda_add_test(onda_event_payload_layout_tests core onda_processor_tests EventPayloadLayout)
     onda_add_test(onda_bypass_transition_tests core onda_processor_tests BypassTransitions)
     onda_add_test(onda_callback_processing_tests core onda_processor_tests CallbackProcessing)
     onda_add_test(onda_callback_smoothing_tests core onda_processor_tests CallbackSmoothing)
@@ -243,6 +256,7 @@ add_executable(onda_vst3_smoke
     tests/Vst3Smoke.cpp
     tests/Vst3AutomationTests.cpp
     tests/Vst3EnumTests.cpp
+    tests/Vst3InputTests.cpp
 )
 target_include_directories(onda_vst3_smoke PRIVATE src)
 target_compile_features(onda_vst3_smoke PRIVATE cxx_std_20)

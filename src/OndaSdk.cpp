@@ -124,13 +124,17 @@ copyProjectBuffers(const onda_project_image_t *image, Diagnostic &diagnostic) {
   std::vector<ProjectBufferInfo> buffers;
   buffers.reserve(static_cast<std::size_t>(count));
   for (int index = 0; index < count; ++index) {
-    const auto *name = onda_project_image_buffer_name(image, index);
+    onda_project_buffer_info_t raw{};
+    if (onda_project_image_buffer_info(image, index, &raw) != 0) {
+      diagnostic.message = "Onda returned invalid project buffer metadata";
+      return {};
+    }
     ProjectBufferInfo info{
-        .name = copyString(name),
-        .elementType = onda_project_image_buffer_element_type(image, index),
-        .frames = onda_project_image_buffer_frames(image, index),
-        .channels = onda_project_image_buffer_channels(image, index),
-        .sampleRate = onda_project_image_buffer_sample_rate(image, index),
+        .name = copyString(raw.name),
+        .elementType = raw.element_type,
+        .frames = raw.frames,
+        .channels = raw.channels,
+        .sampleRate = raw.sample_rate,
     };
     if (info.name.empty() || info.elementType < 0 || info.frames <= 0 ||
         info.channels <= 0 || !std::isfinite(info.sampleRate) ||
@@ -291,6 +295,56 @@ ProjectImage loadFilesystemProjectImage(
   if (!diagnostic.empty())
     return {};
   return serialize(image.get(), diagnostic);
+}
+
+MaterializationHandle materialize(const ProjectImage &image,
+                                  Diagnostic &diagnostic) {
+  auto handle = deserialize(image, diagnostic);
+  if (!handle)
+    return {};
+
+  OndaDiagnostic rawDiagnostic;
+  MaterializationHandle plan{onda_project_image_materialize(
+      handle.get(), rawDiagnostic.outParameter())};
+  diagnostic = rawDiagnostic.copy();
+  if (!plan) {
+    if (diagnostic.empty())
+      diagnostic.message = "Onda could not materialize the project image";
+    return {};
+  }
+
+  return plan;
+}
+
+bool visitMaterializedFiles(const onda_project_materialization_plan_t *plan,
+                            Diagnostic &diagnostic,
+                            const MaterializedProjectVisitor &visitor) {
+  const auto count = onda_project_materialization_file_count(plan);
+  if (count <= 0) {
+    diagnostic.message = "Onda returned an empty project materialization";
+    return false;
+  }
+  for (int index = 0; index < count; ++index) {
+    onda_project_file_t info{};
+    if (onda_project_materialization_file_info(plan, index, &info) != 0 ||
+        info.path_utf8 == nullptr ||
+        (info.byte_count != 0U && info.bytes == nullptr)) {
+      diagnostic.message = "Onda returned an invalid materialized project file";
+      return false;
+    }
+    MaterializedProjectFile file{
+        .relativePath = pathFromString(info.path_utf8),
+        .bytes = {static_cast<const std::uint8_t *>(info.bytes),
+                  info.byte_count},
+    };
+    if (!visitor(file)) {
+      if (diagnostic.empty())
+        diagnostic.message = "The materialized Onda project was rejected";
+      return false;
+    }
+  }
+  diagnostic = {};
+  return true;
 }
 
 } // namespace
@@ -465,54 +519,8 @@ withProjectBufferOverrides(const ProjectImage &image,
 bool visitMaterializedProjectFiles(const ProjectImage &image,
                                    Diagnostic &diagnostic,
                                    const MaterializedProjectVisitor &visitor) {
-  auto handle = deserialize(image, diagnostic);
-  if (!handle)
-    return false;
-
-  OndaDiagnostic rawDiagnostic;
-  MaterializationHandle plan{onda_project_image_materialize(
-      handle.get(), rawDiagnostic.outParameter())};
-  diagnostic = rawDiagnostic.copy();
-  if (!plan) {
-    if (diagnostic.empty())
-      diagnostic.message = "Onda could not materialize the project image";
-    return false;
-  }
-
-  const auto count = onda_project_materialization_file_count(plan.get());
-  if (count <= 0) {
-    diagnostic.message = "Onda returned an empty project materialization";
-    return false;
-  }
-  for (int index = 0; index < count; ++index) {
-    const auto *path =
-        onda_project_materialization_file_path(plan.get(), index);
-    const auto required =
-        onda_project_materialization_file_bytes(plan.get(), index, nullptr, 0);
-    if (path == nullptr || required < 0 ||
-        static_cast<std::uint64_t>(required) >
-            std::vector<std::uint8_t>{}.max_size()) {
-      diagnostic.message = "Onda returned an invalid materialized project file";
-      return false;
-    }
-    MaterializedProjectFile file{
-        .relativePath = pathFromString(path),
-        .bytes = std::vector<std::uint8_t>(static_cast<std::size_t>(required)),
-    };
-    const auto written = onda_project_materialization_file_bytes(
-        plan.get(), index, file.bytes.data(), file.bytes.size());
-    if (written != required) {
-      diagnostic.message = "Onda could not copy a materialized project file";
-      return false;
-    }
-    if (!visitor(std::move(file))) {
-      if (diagnostic.empty())
-        diagnostic.message = "The materialized Onda project was rejected";
-      return false;
-    }
-  }
-  diagnostic = {};
-  return true;
+  const auto plan = materialize(image, diagnostic);
+  return plan && visitMaterializedFiles(plan.get(), diagnostic, visitor);
 }
 
 ProjectImage withoutProjectBuffers(const ProjectImage &image,
@@ -522,16 +530,18 @@ ProjectImage withoutProjectBuffers(const ProjectImage &image,
     return image;
   // Edit the SDK's public materialization manifest, then let the SDK rebuild
   // and validate the image. The original image and its defaults stay immutable.
-  std::vector<StoredProjectFile> files;
-  if (!visitMaterializedProjectFiles(
-          image, diagnostic, [&](MaterializedProjectFile &&file) {
-            files.push_back(
-                {pathString(file.relativePath), std::move(file.bytes)});
-            return true;
-          }))
+  const auto plan = materialize(image, diagnostic);
+  if (!plan)
     return {};
-  const auto manifest =
-      std::ranges::find(files, "project.ondaproject", &StoredProjectFile::path);
+  std::vector<MaterializedProjectFile> files;
+  if (!visitMaterializedFiles(plan.get(), diagnostic,
+                              [&](const MaterializedProjectFile &file) {
+                                files.push_back(file);
+                                return true;
+                              }))
+    return {};
+  const auto manifest = std::ranges::find(
+      files, "project.ondaproject", &MaterializedProjectFile::relativePath);
   if (manifest == files.end()) {
     diagnostic.message = "Onda export omitted the project manifest";
     return {};
@@ -565,11 +575,17 @@ ProjectImage withoutProjectBuffers(const ProjectImage &image,
   auto updatedManifest = original;
   updatedManifest.replace(range->first, range->second - range->first,
                           juce::JSON::toString(bindings).toStdString());
-  manifest->bytes.assign(updatedManifest.begin(), updatedManifest.end());
+  manifest->bytes = {
+      reinterpret_cast<const std::uint8_t *>(updatedManifest.data()),
+      updatedManifest.size()};
+  std::vector<std::string> paths;
   std::vector<onda_project_file_t> raw;
+  paths.reserve(files.size());
   raw.reserve(files.size());
-  for (const auto &file : files)
-    raw.push_back({file.path.c_str(), file.bytes.data(), file.bytes.size()});
+  for (const auto &file : files) {
+    paths.push_back(pathString(file.relativePath));
+    raw.push_back({paths.back().c_str(), file.bytes.data(), file.bytes.size()});
+  }
   OndaDiagnostic rawDiagnostic;
   ProjectImageHandle updated{onda_project_image_load_files(
       raw.data(), raw.size(), "project.ondaproject",

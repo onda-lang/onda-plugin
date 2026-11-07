@@ -1293,6 +1293,8 @@ void Worker::build(const Request &request) {
 }
 
 void Worker::run() noexcept {
+  // Generated initializers run here before the engine reaches the audio thread.
+  onda_configure_current_thread_audio_fp_mode();
   try {
     std::uint64_t observedGeneration{};
     for (;;) {

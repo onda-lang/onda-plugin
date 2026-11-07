@@ -6,7 +6,9 @@
 [Onda](https://onda-lang.org) audio programming language in your DAW.
 
 [Pre-built binaries](https://github.com/onda-lang/onda-plugin/releases) are available for Windows, macOS and Linux.
-The macOS VST3 binaries require macOS 14 (Sonoma) or later and are not signed.
+Release builds target Linux x64 with a Debian 12 baseline (glibc 2.36), Windows
+x64 with the Visual Studio 2022 toolchain and static MSVC runtime, and macOS
+arm64 with a minimum deployment target of macOS 14.0. The macOS binaries are not signed.
 
 ## Examples
 
@@ -31,6 +33,10 @@ event program_change(channel: i32, program: i32)
 events are optional. `OndaFX` may omit them all. Channels are zero-based, MIDI
 notes use `id = -1`, and velocity, pressure, bend, and CC values use `[0, 1]`.
 Pitch bend is centered at `0.5`.
+
+Each callback accepts up to 4,096 MIDI events and MIDI-controller automation
+points combined. If that limit is exceeded, the plugin discards that MIDI batch
+and releases held host notes. Ordinary parameter and control automation continues.
 
 These optional events provide DAW transport and timing information:
 
@@ -65,6 +71,8 @@ fixed, read-only choice.
 Scalar numeric parameters without a declared range appear in **Params** and map to
 DAW slots using a plugin-owned 0–1 control range. Declare an explicit range when
 controls should cover other values, for example `frequency = 440.0 {20.0, 20000.0}`.
+Mapped parameter defaults must be finite. An unsupported default rejects the
+replacement and keeps the previous working program and automation mapping.
 
 Continuous `params` automation follows the DAW's normalized linear curve,
 sampled at the start of each Onda block. Discrete parameters hold the latest
@@ -119,7 +127,7 @@ files are unavailable when reopening it, the plugin restores the saved version.
 
 ## Build
 
-Requires CMake 3.22+, Ninja, and a C++20 compiler. Linux also needs X11,
+Requires CMake 3.24+, Ninja, and a C++20 compiler. Linux also needs X11,
 Fontconfig, FreeType, and ALSA development packages and a Vulkan driver.
 
 ```sh
@@ -146,7 +154,8 @@ cmake --build build
 ```
 
 `ONDA_GPU_UI_LIBRARY` optionally overrides the UI library path at build or run time.
-Use a library/header from the same Onda build.
+An empty build option follows the selected SDK on every configure. Use a
+library/header from the same Onda build when overriding it.
 
 Custom layouts use `ONDA_PLUGIN_INPUT_CHANNELS`, `ONDA_PLUGIN_CONTROL_INPUTS`,
 `ONDA_PLUGIN_OUTPUT_CHANNELS`, and `ONDA_PLUGIN_PARAMETER_SLOTS`. Main and control

@@ -113,6 +113,8 @@ struct EventParameterMapping {
 struct EventMapping {
   int index{-1};
   std::string name;
+  // Aliases the program owner so status snapshots retain the borrowed plan.
+  std::shared_ptr<const onda_payload_plan_t> payloadPlan;
   PayloadSchema schema;
   std::vector<EventParameterMapping> parameters;
 };
@@ -276,8 +278,9 @@ private:
   using BufferStorage = std::shared_ptr<DecodedAudioFile>;
 
   struct DelegateMetadata {
-    std::string name;
-    PayloadPlan plan;
+    const onda_message_info_t *info{}; // Borrowed from program_.
+    std::vector<const onda_payload_tensor_info_t *> tensors;
+    std::vector<onda_payload_region_t> regions; // Reused by audio decoding.
   };
 
   struct LogSiteMetadata {

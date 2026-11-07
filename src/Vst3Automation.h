@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
 
 namespace juce {
 class AudioProcessor;
@@ -13,6 +14,10 @@ struct ProcessData;
 
 namespace onda::plugin {
 class Processor;
+std::unique_ptr<juce::AudioProcessorParameter> makeVst3BypassParameter();
+bool vst3SetBypassFromHost(juce::AudioProcessorParameter &parameter,
+                           float value) noexcept;
+void vst3MidiOverflow(juce::AudioProcessor &processor) noexcept;
 juce::String vst3BusName(juce::AudioProcessor &processor, bool input,
                          int index);
 bool vst3OwnsParameter(juce::AudioProcessor &processor,
