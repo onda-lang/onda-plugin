@@ -68,6 +68,10 @@ if(NOT EXISTS "${sdk_root}/sentinel")
 endif()
 
 # A different archive with the same root must replace all previous contents.
+# macOS Make compares whole-second mtimes. Cross a tick before replacing the SDK
+# so this checks restored archive timestamps rather than subsecond tracking.
+execute_process(COMMAND "${CMAKE_COMMAND}" -E sleep 1
+    COMMAND_ERROR_IS_FATAL ANY)
 onda_extract_sdk_archive("${scratch}/B.zip" "${sha256_B}" "${sdk_root}")
 expect_revision("${sdk_root}" B)
 expect_consumer(B)

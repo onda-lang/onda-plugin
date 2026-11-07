@@ -57,7 +57,7 @@ jobs:
           test "$(getconf GNU_LIBC_VERSION)" = 'glibc 2.36'
           apt-get update
           apt-get install -y --no-install-recommends \
-            build-essential ca-certificates cmake curl git ninja-build pkg-config python3 unzip xz-utils
+            build-essential ca-certificates cmake curl git ninja-build pkg-config python3 unzip util-linux xz-utils
 
       - name: Select tests
         id: tests
@@ -296,7 +296,11 @@ jobs:
           TEST_LABELS: ${{ steps.tests.outputs.labels }}
         run: |
           if [[ "$RUNNER_OS" == "Linux" ]]; then
-            xvfb-run -a ctest --test-dir "$BUILD_PATH" -C Release \
+            # Permission tests must observe denied access even in a root container.
+            setpriv --bounding-set=-dac_override,-dac_read_search \
+              --inh-caps=-dac_override,-dac_read_search \
+              --ambient-caps=-dac_override,-dac_read_search \
+              xvfb-run -a ctest --test-dir "$BUILD_PATH" -C Release \
               --output-on-failure --no-tests=error -L "$TEST_LABELS"
           else
             ctest --test-dir "$BUILD_PATH" -C Release \
