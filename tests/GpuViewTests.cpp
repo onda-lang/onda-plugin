@@ -1,5 +1,7 @@
 #include "GpuView.h"
 #include "GpuViewTestSupport.h"
+#include <algorithm>
+#include <cmath>
 #include <iostream>
 #include <juce_gui_basics/juce_gui_basics.h>
 #include <stdexcept>
@@ -206,7 +208,8 @@ void exerciseSurfaceOwnership() {
     return nativeRender(ui);
   };
   view.setSize(900, 700);
-  check(renders > 0, "Resize waited for the publication timer to draw");
+  check(dispatchUntil([&] { return renders > 0; }),
+        "Resize did not draw through its frame deadline");
   render = nativeRender;
 #if JUCE_LINUX
   checkNativePixels(first, view);
@@ -320,11 +323,13 @@ juce::MouseEvent mouse(juce::Component &view, juce::Point<float> position,
 void exerciseScheduling() {
   using onda::plugin::GpuViewTestAccess;
   Window window;
-  int saves = 0;
+  int saves = 0, edits = 0;
   onda::plugin::GpuView view(
       [&](const auto &command) {
         if (command["type"].toString() == "viewState")
           ++saves;
+        if (command["type"].toString() == "setParam")
+          ++edits;
       },
       [] {});
   window.setSize(720, 840);
@@ -339,13 +344,23 @@ void exerciseScheduling() {
   messages->runDispatchLoopUntil(50);
   static decltype(&onda_ui_render) nativeRender;
   static int renders;
+  static double firstFrame;
+  static bool paced;
   nativeRender = GpuViewTestAccess::render(view);
   const juce::ScopedValueSetter<decltype(nativeRender)> countRenders(
       GpuViewTestAccess::render(view), [](OndaUi *ui) {
+        const auto now = juce::Time::getMillisecondCounterHiRes();
+        if (firstFrame == 0)
+          firstFrame = now;
         ++renders;
+        // Vsync may quantize a 60 Hz cadence into alternating refresh gaps.
+        paced = paced && renders <= 2 + std::floor((now - firstFrame + 0.5) /
+                                                   (1000.0 / 60.0));
         return nativeRender(ui);
       });
   renders = 0;
+  firstFrame = 0;
+  paced = true;
   view.mouseDown(mouse(view, {102.0f, 179.0f}));
   for (int i = 1; i <= 20; ++i)
     view.mouseDrag(mouse(view, {102.0f, 179.0f - static_cast<float>(i)}));
@@ -353,7 +368,21 @@ void exerciseScheduling() {
   // Native focus and exposure may independently request more frames.
   check(dispatchUntil([&] { return renders > 0; }),
         "Input burst did not draw without a polling tick");
-  view.mouseUp(mouse(view, {102.0f, 159.0f}));
+  const auto previousEdits = edits;
+  // Host publication and mouse input arrive in separate dispatches during a
+  // real drag. Coalescing only the initial burst does not bound that work.
+  for (int i = 1; i <= 20; ++i) {
+    view.mouseDrag(mouse(view, {102.0f, 159.0f - static_cast<float>(i)}));
+    view.tick();
+  }
+  check(edits == previousEdits + 20, "Frame pacing delayed parameter updates");
+  check(paced, "Sustained input rendered faster than the frame budget");
+  check(dispatchUntil([&] {
+          return !GpuViewTestAccess::needsRedraw(view) &&
+                 !GpuViewTestAccess::timedUpdatePending(view);
+        }),
+        "Final drag value did not draw without more input or polling");
+  view.mouseUp(mouse(view, {102.0f, 139.0f}));
   view.mouseExit(mouse(view, {}));
   messages->runDispatchLoopUntil(150);
   renders = 0;
@@ -377,11 +406,19 @@ void exerciseScheduling() {
 
   // A temporary presentation failure must recover without a data polling timer.
   static int attempts, presented;
+  static onda::plugin::GpuView *retryView;
+  retryView = &view;
   attempts = 0;
   presented = 0;
   GpuViewTestAccess::render(view) = [](OndaUi *ui) {
-    if (++attempts == 1)
-      return 0;
+    if (++attempts == 1) {
+      // Exercise the real adapter's unavailable-surface and retry deadline.
+      GpuViewTestAccess::resize(*retryView, {});
+      const auto result = nativeRender(ui);
+      GpuViewTestAccess::resize(*retryView,
+                                GpuViewTestAccess::framebufferSize(*retryView));
+      return result;
+    }
     const auto result = nativeRender(ui);
     if (result > 0)
       ++presented;
@@ -389,7 +426,8 @@ void exerciseScheduling() {
   };
   GpuViewTestAccess::expose(view);
   view.tick();
-  check(attempts == 1 && GpuViewTestAccess::wakePending(view),
+  check(dispatchUntil([&] { return attempts > 0; }) &&
+            GpuViewTestAccess::wakePending(view),
         "Unavailable presentation did not schedule a bounded retry");
   const auto recovered = dispatchUntil([&] {
     return attempts >= 2 && presented > 0 &&
@@ -440,6 +478,107 @@ void exerciseScheduling() {
   messages->runDispatchLoopUntil(30);
   check(!GpuViewTestAccess::wakePending(view),
         "Hidden view retained its wakeup timer");
+}
+
+// Run manually on the affected desktop to measure host-thread stalls with the
+// real renderer. Interleaving events matters: a single input burst only tests
+// AsyncUpdater coalescing, unlike a sustained drag from a high-rate mouse.
+void profileDragging(bool present, bool knobs) {
+  using onda::plugin::GpuViewTestAccess;
+  Window window;
+  int edits = 0;
+  onda::plugin::GpuView view(
+      [&](const auto &command) {
+        if (command["type"].toString() == "setParam")
+          ++edits;
+      },
+      [] {});
+  window.setSize(720, 840);
+  window.addAndMakeVisible(view);
+  view.setBounds(window.getLocalBounds());
+  window.addToDesktop(0);
+  window.setVisible(true);
+  check(dispatchUntil([&] {
+          return GpuViewTestAccess::initialized(view) ||
+                 !view.error().isEmpty();
+        }),
+        "Drag profile did not initialize");
+  check(view.error().isEmpty(), view.error().toRawUTF8());
+  auto state = juce::JSON::parse(
+      R"({"type":"state","state":{"path":"drag-profile.onda","supportsScope":false,"supportsTransport":false,"params":[{"name":"gain","type":"f64","value":0.5,"rangeMin":0,"rangeMax":1}]}})");
+  state["state"].getDynamicObject()->setProperty("paramLayout",
+                                                 knobs ? "knobs" : "sliders");
+  view.message(state);
+  auto *messages = juce::MessageManager::getInstance();
+  messages->runDispatchLoopUntil(250);
+
+  struct Statistics {
+    int frames{};
+    double renderMs{}, worstRenderMs{};
+  };
+  Statistics statistics;
+  static Statistics *active;
+  static decltype(&onda_ui_render) nativeRender;
+  active = &statistics;
+  nativeRender =
+      present ? GpuViewTestAccess::render(view) : +[](OndaUi *) { return 1; };
+  const juce::ScopedValueSetter<decltype(nativeRender)> measure(
+      GpuViewTestAccess::render(view), [](OndaUi *ui) {
+        const auto start = juce::Time::getMillisecondCounterHiRes();
+        const auto result = nativeRender(ui);
+        const auto elapsed = juce::Time::getMillisecondCounterHiRes() - start;
+        ++active->frames;
+        active->renderMs += elapsed;
+        active->worstRenderMs = std::max(active->worstRenderMs, elapsed);
+        return result;
+      });
+  struct Drag final : juce::Timer {
+    onda::plugin::GpuView &view;
+    const bool knobs;
+    int moves{};
+    double deadline{};
+    Drag(onda::plugin::GpuView &v, bool k) : view(v), knobs(k) {}
+    juce::Point<float> position() const {
+      const auto offset = 30.0f * static_cast<float>(std::sin(moves * 0.05));
+      return knobs ? juce::Point<float>{102.0f, 179.0f - offset}
+                   : juce::Point<float>{126.0f + offset, 169.0f};
+    }
+    void timerCallback() override {
+      if (juce::Time::getMillisecondCounterHiRes() >= deadline) {
+        stopTimer();
+        view.mouseUp(mouse(view, position()));
+        return;
+      }
+      ++moves;
+      view.mouseDrag(mouse(view, position()));
+    }
+  } drag(view, knobs);
+  view.mouseDown(mouse(view, drag.position()));
+  const auto start = juce::Time::getMillisecondCounterHiRes();
+  drag.deadline = start + 2000.0;
+  drag.startTimer(4);
+  double worstDispatchMs = 0;
+  while (juce::Time::getMillisecondCounterHiRes() - start < 2000.0) {
+    const auto before = juce::Time::getMillisecondCounterHiRes();
+    messages->runDispatchLoopUntil(1);
+    worstDispatchMs = std::max(
+        worstDispatchMs, juce::Time::getMillisecondCounterHiRes() - before);
+  }
+  drag.stopTimer();
+  const auto elapsed = juce::Time::getMillisecondCounterHiRes() - start;
+  view.mouseUp(mouse(view, drag.position()));
+  std::cout << (knobs ? "Knob" : "Slider")
+            << " drag profile: moves=" << drag.moves << ", edits=" << edits
+            << ", frames=" << statistics.frames
+            << ", fps=" << statistics.frames * 1000.0 / elapsed
+            << ", render_ms=" << statistics.renderMs
+            << ", worst_render_ms=" << statistics.worstRenderMs
+            << ", worst_dispatch_ms=" << worstDispatchMs << '\n';
+  check(view.error().isEmpty(), view.error().toRawUTF8());
+  check(edits > 10, "Drag profile did not edit the parameter");
+  check(edits >= drag.moves * 9 / 10,
+        "Native focus or input interrupted the sustained drag");
+  check(worstDispatchMs < 100.0, "Dragging stalled the UI thread for 100 ms");
 }
 void exerciseCompositionCancellation() {
   Window window;
@@ -602,7 +741,8 @@ void exerciseRenderFailure() {
       };
     onda::plugin::GpuViewTestAccess::expose(view);
     view.tick();
-    check(renders == 1, "Failure fixture did not request a render");
+    check(dispatchUntil([&] { return renders == 1; }),
+          "Failure fixture did not request a render");
     check(std::any_of(commands.begin(), commands.end(), [&](const auto &c) {
             return c["type"].toString() == terminal &&
                    (piano ? !static_cast<bool>(c["pressed"])
@@ -802,6 +942,12 @@ int runTests(int argc, const char *const *argv) {
     exerciseKeyboardRouting();
     if (argc == 2 && juce::String(argv[1]) == "--keyboard") {
       std::cout << "GPU keyboard routing passed\n";
+      return 0;
+    }
+    if (argc == 2 && (juce::String(argv[1]) == "--drag-profile" ||
+                      juce::String(argv[1]) == "--drag-profile-no-present")) {
+      for (bool knobs : {false, true})
+        profileDragging(juce::String(argv[1]) == "--drag-profile", knobs);
       return 0;
     }
 #if JUCE_WINDOWS

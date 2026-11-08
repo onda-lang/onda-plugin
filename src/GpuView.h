@@ -70,6 +70,11 @@ private:
   juce::uint32 peerId_{};
   juce::Point<int> framebufferSize_;
   OndaUi *ui_{};
+  OndaUiFramePacer *framePacer_{};
+  decltype(&onda_ui_frame_pacer_create) createPacer_{};
+  decltype(&onda_ui_frame_pacer_destroy) destroyPacer_{};
+  decltype(&onda_ui_frame_pacer_timer_delay_ms) timerDelay_{};
+  decltype(&onda_ui_frame_pacer_timer_submitted) timerSubmitted_{};
   decltype(&onda_ui_create) create_{};
   decltype(&onda_ui_destroy) destroy_{};
   decltype(&onda_ui_resize) resize_{};
@@ -95,6 +100,7 @@ private:
   bool exposed_{true};
   bool composing_{};
   bool drawing_{};
+  bool redrawPending_{};
   double redrawRetryMs_{};
   juce::NativeScaleFactorNotifier scaleNotifier_;
 };

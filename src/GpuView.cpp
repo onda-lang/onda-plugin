@@ -95,9 +95,12 @@ void GpuView::release() {
     input(event("focusLost"));
   if (ui_)
     destroy_(std::exchange(ui_, nullptr));
+  if (framePacer_)
+    destroyPacer_(std::exchange(framePacer_, nullptr));
   surface_.reset();
   peerId_ = 0;
   framebufferSize_ = {};
+  redrawPending_ = false;
   redrawRetryMs_ = 0;
   cancelPendingUpdate();
 }
@@ -119,6 +122,10 @@ bool GpuView::initialize() {
     return false;                                                              \
   }
     ONDA_LOAD(create_, "onda_ui_create")
+    ONDA_LOAD(createPacer_, "onda_ui_frame_pacer_create")
+    ONDA_LOAD(destroyPacer_, "onda_ui_frame_pacer_destroy")
+    ONDA_LOAD(timerDelay_, "onda_ui_frame_pacer_timer_delay_ms")
+    ONDA_LOAD(timerSubmitted_, "onda_ui_frame_pacer_timer_submitted")
     ONDA_LOAD(destroy_, "onda_ui_destroy")
     ONDA_LOAD(resize_, "onda_ui_resize")
     ONDA_LOAD(message_, "onda_ui_message")
@@ -151,13 +158,26 @@ bool GpuView::initialize() {
   updateSurface();
   const auto handles = surface_->handles();
   std::array<char, 2048> error{};
-  ui_ = create_(handles.platform, handles.window, handles.display,
-                static_cast<uint32_t>(framebufferSize_.x),
-                static_cast<uint32_t>(framebufferSize_.y), scale_, error.data(),
-                error.size());
+  const OndaUiCreateOptions options{
+      .platform = handles.platform,
+      .window = handles.window,
+      .display = handles.display,
+      .width = static_cast<uint32_t>(framebufferSize_.x),
+      .height = static_cast<uint32_t>(framebufferSize_.y),
+      .scale = scale_,
+      .present_mode = ONDA_UI_MAILBOX_OR_FIFO,
+      .maximum_frame_latency = 2,
+  };
+  ui_ = create_(&options, error.data(), error.size());
   if (!ui_) {
     error_ = error[0] ? juce::String::fromUTF8(error.data())
                       : "GPU UI initialization failed";
+    release();
+    return false;
+  }
+  framePacer_ = createPacer_(60.0);
+  if (!framePacer_) {
+    error_ = "Could not create the host frame pacer";
     release();
     return false;
   }
@@ -170,9 +190,10 @@ void GpuView::tick() {
   if (ui_ && (!getPeer() || getPeer()->getUniqueID() != peerId_)) {
     release();
   }
-  if (!isShowing()) {
+  if (!isShowing() || getLocalBounds().isEmpty()) {
     if (surface_)
       surface_->setVisible(false);
+    redrawPending_ = false;
     return;
   }
   if (!ui_ && !initialize())
@@ -180,9 +201,8 @@ void GpuView::tick() {
   updateSurface();
   if (exposed_) {
     exposed_ = false;
+    redrawPending_ = true;
     redrawRetryMs_ = 0;
-    resize_(ui_, static_cast<uint32_t>(framebufferSize_.x),
-            static_cast<uint32_t>(framebufferSize_.y), scale_);
   }
   const auto redraw = update_(ui_);
   drain();
@@ -195,7 +215,10 @@ void GpuView::tick() {
     release();
     return;
   }
-  if (redraw > 0 && juce::Time::getMillisecondCounterHiRes() >= redrawRetryMs_)
+  redrawPending_ = redrawPending_ || redraw > 0;
+  const auto now = juce::Time::getMillisecondCounterHiRes();
+  if (redrawPending_ && now >= redrawRetryMs_ &&
+      timerDelay_(framePacer_, now) <= 0)
     draw();
   armWake();
 }
@@ -207,10 +230,11 @@ void GpuView::armWake() {
   if (!ui_ || !isShowing())
     return;
   auto delay = wake_delay_(ui_);
-  if (redrawRetryMs_ > 0) {
-    const auto retry = std::max(
-        0.0, redrawRetryMs_ - juce::Time::getMillisecondCounterHiRes());
-    delay = delay < 0 ? retry : std::min(delay, retry);
+  if (redrawPending_) {
+    const auto now = juce::Time::getMillisecondCounterHiRes();
+    const auto frame =
+        std::max(timerDelay_(framePacer_, now), redrawRetryMs_ - now);
+    delay = delay < 0 ? frame : std::min(delay, frame);
   }
   if (delay >= 0)
     startTimer(static_cast<int>(
@@ -227,6 +251,9 @@ void GpuView::updateSurface() {
     framebufferSize_ = size;
     scale_ = scale;
     exposed_ = true;
+    if (ui_)
+      resize_(ui_, static_cast<uint32_t>(size.x), static_cast<uint32_t>(size.y),
+              scale_);
   }
 }
 void GpuView::draw() {
@@ -238,6 +265,7 @@ void GpuView::draw() {
     drain();
     return;
   }
+  const auto started = juce::Time::getMillisecondCounterHiRes();
   const auto result = render_(ui_);
   if (result < 0) {
     error_ = juce::String::fromUTF8(error_fn_(ui_));
@@ -248,12 +276,14 @@ void GpuView::draw() {
     release();
     return;
   }
-  if (result > 0)
+  redrawPending_ = result == 0;
+  if (result > 0) {
+    timerSubmitted_(framePacer_, started);
     surface_->setVisible(true);
-  // An unavailable swapchain must retry even if no input or audio arrives.
-  redrawRetryMs_ =
-      result == 0 ? juce::Time::getMillisecondCounterHiRes() + 1000.0 / 30.0
-                  : 0.0;
+    redrawRetryMs_ = 0;
+  } else {
+    redrawRetryMs_ = juce::Time::getMillisecondCounterHiRes() + 1000.0 / 30.0;
+  }
   drain();
 }
 void GpuView::componentMovedOrResized(bool, bool) {

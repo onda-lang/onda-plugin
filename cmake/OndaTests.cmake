@@ -56,7 +56,8 @@ target_compile_definitions(onda_gpu_ui_tests PRIVATE JUCE_MODAL_LOOPS_PERMITTED=
 target_link_libraries(onda_gpu_ui_tests PRIVATE juce::juce_gui_basics juce::juce_recommended_config_flags)
 onda_add_test(onda_gpu_ui_tests native onda_gpu_ui_tests)
 onda_add_test(onda_gpu_keyboard_tests core onda_gpu_ui_tests --keyboard)
-set_tests_properties(onda_gpu_ui_tests PROPERTIES
+onda_add_test(onda_gpu_drag_profile performance onda_gpu_ui_tests --drag-profile)
+set_tests_properties(onda_gpu_ui_tests onda_gpu_drag_profile PROPERTIES
     ENVIRONMENT "ONDA_GPU_UI_LIBRARY=${ONDA_GPU_UI_LIBRARY}")
 add_executable(onda_watcher_tests tests/FilesystemWatcherTests.cpp src/FilesystemWatcher.cpp)
 target_compile_features(onda_watcher_tests PRIVATE cxx_std_20)

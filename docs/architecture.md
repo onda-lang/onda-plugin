@@ -207,11 +207,19 @@ matching peer replacement, so an idle view releases its renderer synchronously.
 JUCE's native scale notifier schedules presentation for idle host zoom/DPI changes
 even when logical bounds stay unchanged; AppKit backing changes also invalidate
 the native child directly.
-Resize draws immediately; native exposure schedules a draw through JUCE's event
+Resize and native exposure schedule a draw through JUCE's event
 loop. The child stays hidden until the first frame and hides on rendering errors.
 The 60 Hz editor timer polls processor state; visualization has its own 30 Hz
 publication budget. Input and state changes request a coalesced redraw through
-JUCE's event loop, independently of that polling timer. The UI advances timed
+JUCE's event loop, independently of that polling timer. Sustained input is paced
+at a nominal 60 Hz using the host-owned SDK `FramePacer` timer pair. Creation
+selects `ONDA_UI_MAILBOX_OR_FIFO` to prefer mailbox presentation with FIFO
+fallback; both retain tear-free presentation.
+A maximum frame latency hint of two allows CPU/GPU overlap.
+The renderer has no software frame limit. Parameter commands still drain
+on every event.
+A deferred frame retains its deadline across new input, so the latest value
+draws without more input and idle views stop waking. The UI advances timed
 state without drawing and reports its next wakeup delay. A one-shot view timer
 services that deadline, including deferred persistence that needs no frame, and
 bounded retries for temporarily unavailable presentation. Hidden views cancel

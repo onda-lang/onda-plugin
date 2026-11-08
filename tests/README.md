@@ -38,6 +38,7 @@ structs, tuples, arrays, slices, and integer-domain normalization.
 | `native` | All three platforms: filesystem notifications, native GPU readiness and UI-to-DSP communication, and exported editor attachment/removal. |
 | `audit` | Manual Linux CI or local Linux checks: exported callback interception, gated by the auditor's positive self-tests. |
 | `extended` | Manual CI or local checks: ancestor moves and symlink permutations on Linux/macOS; concurrent state/log stress on all three platforms. |
+| `performance` | Local desktop checks: sustained native slider/knob drags and UI-thread timings. |
 
 Automatic runs of `release.yml` start only on version tags (`vX.Y.Z` or
 `X.Y.Z`) matching `plugin-version`. They build once per platform, run
@@ -155,6 +156,23 @@ also needs Nautilus and `dbus-run-session` and exercises its actual file drag.
 These are X11 checks; native Wayland-to-X11 drops additionally depend on the
 compositor's bridge and are not established by this suite.
 
+To profile sustained slider and knob drags on Linux, macOS, or Windows:
+
+```sh
+ctest --test-dir build -C Release -R '^onda_gpu_drag_profile$' -V
+```
+
+This optional `performance` check uses the real native view and renderer with
+one parameter and no audio processing. It generates input every 4 ms for two
+seconds per layout, reports edits, frames, render time and longest message-loop
+dispatch, and fails if a dispatch stalls for 100 ms. Run it alone on a desktop;
+other native tests can steal focus and cancel the drag. The executable's
+`--drag-profile-no-present` mode repeats the input with presentation bypassed
+to distinguish rendering cost from input handling. Both modes require the
+`ONDA_GPU_UI_LIBRARY` environment variable when invoked directly; CTest sets it.
+This isolates UI-thread contention; macOS REAPER and WindowServer behavior still
+needs confirmation on macOS.
+
 ## Coverage
 
 | Test | Contract |
@@ -164,7 +182,8 @@ compositor's bridge and are not established by this suite.
 | `onda_watcher_tests` | Native filesystem notifications, missing paths, inode replacement, and Linux subscription recovery without JUCE/compiler setup. |
 | `onda_scope_capture_{1,2,8,64}_tests` | Per-channel peak retention/reset, non-finite samples, and meter-only capture without waveform writes. |
 | `onda_channel_layout_script_tests` | Linux layout driver preserves the development SDK selection, resource checkout and revision for all configurations, including release-tag mode. |
-| `onda_gpu_ui_tests` | Dedicated native surface, input/IME, coalesced input redraws without polling, idle wakeups and presentation retries, immediate resize presentation, reparenting, synchronous renderer release before desktop peer destruction and reattachment without manual ticks, and hide/show. Linux pixels survive JUCE repaints; macOS density and Windows parent-renderer ownership are checked. |
+| `onda_gpu_ui_tests` | Dedicated native surface, input/IME, host-paced input redraws without polling or delaying parameter commands, final-value presentation, idle wakeups and presentation retries, resize presentation through frame deadlines, reparenting, synchronous renderer release before desktop peer destruction and reattachment without manual ticks, and hide/show. Linux pixels survive JUCE repaints; macOS density and Windows parent-renderer ownership are checked. |
+| `onda_gpu_drag_profile` | Optional native slider/knob drag timings and detection of UI-thread stalls, independent of DAW and DSP work. |
 | `onda_gpu_keyboard_tests` | Surface-free consumed/unused/error distinctions and forwarding unused keys to the DAW. |
 | `onda_gpu_editor_tests` | Smoothing acknowledgments carry accepted values and errors without resending schemas; teardown resolves drafts before handlers die; hidden input suspension and presentation/capture restoration after reparenting. |
 | `onda_example_tests` | Shipped examples compile and render finite, meaningful output. |

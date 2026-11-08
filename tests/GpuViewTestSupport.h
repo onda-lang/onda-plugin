@@ -22,6 +22,13 @@ struct GpuViewTestAccess {
   static auto &destroy(GpuView &view) { return view.destroy_; }
   static auto &error(GpuView &view) { return view.error_fn_; }
   static bool wakePending(const GpuView &view) { return view.isTimerRunning(); }
+  static bool needsRedraw(GpuView &view) {
+    return view.ui_ && view.update_(view.ui_) > 0;
+  }
+  static void resize(GpuView &view, juce::Point<int> size) {
+    view.resize_(view.ui_, static_cast<uint32_t>(size.x),
+                 static_cast<uint32_t>(size.y), view.scale_);
+  }
   static bool timedUpdatePending(const GpuView &view) {
     return view.ui_ && view.wake_delay_(view.ui_) >= 0;
   }
