@@ -436,12 +436,15 @@ void Editor::handleCommand(const juce::var &command) {
   if (type == "viewState") {
     processor_.setViewState(input->getProperty("state"));
   } else if (type == "midiNote") {
+    const auto generation =
+        parseGeneration(input->getProperty("engineGeneration"));
     const auto key = input->getProperty("key");
     const auto velocity = input->getProperty("velocity");
     const auto pressed = input->getProperty("pressed");
-    if (key.isInt() && (velocity.isDouble() || velocity.isInt()) &&
+    if (generation && key.isInt() &&
+        (velocity.isDouble() || velocity.isInt()) &&
         pressed.isBool())
-      processor_.triggerMidiNote(static_cast<int>(key),
+      processor_.triggerMidiNote(*generation, static_cast<int>(key),
                                  static_cast<float>(velocity),
                                  static_cast<bool>(pressed));
   } else if (type == "clearLog") {

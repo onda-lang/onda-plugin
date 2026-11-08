@@ -1103,16 +1103,18 @@ std::uint64_t Processor::runtimeLogRevision() const noexcept {
   return runtimeLogRevision_.load(std::memory_order_acquire);
 }
 
-void Processor::triggerMidiNote(const int key, const float velocity,
-                                const bool pressed) {
+void Processor::triggerMidiNote(const std::uint64_t generation, const int key,
+                                const float velocity, const bool pressed) {
   if (product_ != Product::instrument || key < 0 ||
       key >= static_cast<int>(midiNoteCount) || !std::isfinite(velocity))
     return;
   const auto status = workerStatus();
-  if (!status.active || !status.midi.noteOn || !status.midi.noteOff)
+  if (!status.active || generation == 0 ||
+      generation != status.engineGeneration || !status.midi.noteOn ||
+      !status.midi.noteOff)
     return;
   if (!keyboardNotes_.tryPush(
-          {status.engineGeneration,
+          {generation,
            keyboardEpoch_.load(std::memory_order_acquire), key,
            pressed ? std::clamp(velocity, 0.0F, 1.0F) : 0.0F}))
     releaseKeyboardNotes();

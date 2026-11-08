@@ -1,6 +1,7 @@
 #pragma once
 
 bool exerciseNativeEditor();
+bool exerciseStaleEditorMidiNotes();
 bool exerciseGpuEditorSmoothingPublications();
 bool exerciseGpuEditorTeardown();
 bool exerciseGpuEditorPeerRecreation();

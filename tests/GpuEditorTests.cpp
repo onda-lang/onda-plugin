@@ -34,6 +34,88 @@ void countScope(OndaUi *ui, uint32_t channels, const float *samples,
 }
 } // namespace
 
+bool exerciseStaleEditorMidiNotes() {
+  using namespace onda::plugin;
+  const juce::File source{
+      pathToJuce(testTemporaryRoot() / "editor-midi-generation.onda")};
+  if (!source.replaceWithText(R"(
+outs { out1, out2 }
+init { level = 0.0 }
+event note_on(id: i32, channel: i32, key: i32, velocity: f32) { level = velocity }
+event note_off(id: i32, channel: i32, key: i32, velocity: f32) { level = 0.0 }
+sample { out1 = level; out2 = level }
+)"))
+    return false;
+  Processor processor(Product::instrument);
+  processor.setNonRealtime(true);
+  processor.loadFile(source, false);
+  processor.prepareToPlay(48'000.0, 8);
+  const auto renders = [&](const float expected) {
+    juce::AudioBuffer<float> audio(2, 8);
+    audio.clear();
+    juce::MidiBuffer midi;
+    processor.processBlock(audio, midi);
+    for (int frame = 0; frame < 8; ++frame) {
+      if (!test::withinTolerance(audio.getSample(0, frame) - expected,
+                                 1.0e-6F)) {
+        std::cerr << "Editor MIDI rendered " << audio.getSample(0, frame)
+                  << ", expected " << expected << '\n';
+        return false;
+      }
+    }
+    return true;
+  };
+  if (!processor.workerStatus().active || !renders(0.0F))
+    return false;
+  Editor editor(processor);
+  const auto oldEngineGeneration = processor.workerStatus().engineGeneration;
+  const auto oldGeneration =
+      juce::String(std::to_string(oldEngineGeneration));
+  const auto send = [&](const juce::var &generation, const bool pressed,
+                        const float velocity) {
+    juce::var command{new juce::DynamicObject};
+    auto *input = command.getDynamicObject();
+    input->setProperty("type", "midiNote");
+    input->setProperty("key", 60);
+    input->setProperty("velocity", velocity);
+    input->setProperty("pressed", pressed);
+    input->setProperty("engineGeneration", generation);
+    EditorTestAccess::command(editor, command);
+  };
+  send(oldGeneration, true, 0.25F);
+  if (!renders(0.25F))
+    return false;
+  // A command queued before adoption must retain the old engine's identity.
+  send(oldGeneration, true, 0.75F);
+  processor.requestReload();
+  if (!renders(0.0F))
+    return false;
+  const auto generation = juce::String(
+      std::to_string(processor.workerStatus().engineGeneration));
+  if (generation == oldGeneration)
+    return false;
+  // Leave the editor unrefreshed, as it can lag behind audio-thread adoption.
+  for (const auto &invalid :
+       {juce::var{oldGeneration}, juce::var{}, juce::var{1}, juce::var{"0"},
+        juce::var{"-1"}, juce::var{"1junk"},
+        juce::var{"18446744073709551616"}}) {
+    send(invalid, true, 0.75F);
+    if (!renders(0.0F))
+      return false;
+  }
+  send(generation, true, 0.5F);
+  if (!renders(0.5F))
+    return false;
+  processor.triggerMidiNote(oldEngineGeneration, 60, 0.75F, true);
+  if (!renders(0.5F))
+    return false;
+  send(oldGeneration, false, 0.0F);
+  if (!renders(0.5F))
+    return false;
+  send(generation, false, 0.0F);
+  return renders(0.0F);
+}
+
 bool exerciseGpuEditorSmoothingPublications() {
   using namespace onda::plugin;
   const juce::File source{

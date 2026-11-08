@@ -3038,39 +3038,39 @@ sample { out1 = level; out2 = level }
     }
     return true;
   };
-  processor.triggerMidiNote(60, 0.75F, true);
+  const auto generation = processor.workerStatus().engineGeneration;
+  processor.triggerMidiNote(generation, 60, 0.75F, true);
   if (!renders(0.75F))
     return false;
-  processor.triggerMidiNote(60, 0.0F, false);
+  processor.triggerMidiNote(generation, 60, 0.0F, false);
   if (!renders(0.0F))
     return false;
-  processor.triggerMidiNote(60, 0.5F, true);
+  processor.triggerMidiNote(generation, 60, 0.5F, true);
   if (!renders(0.5F))
     return false;
   processor.releaseKeyboardNotes();
   if (!renders(0.0F))
     return false;
   // Pending presses must also be cancelled when the editor closes.
-  processor.triggerMidiNote(60, 0.5F, true);
+  processor.triggerMidiNote(generation, 60, 0.5F, true);
   processor.releaseKeyboardNotes();
   if (!renders(0.0F))
     return false;
-  processor.triggerMidiNote(60, 0.5F, true);
+  processor.triggerMidiNote(generation, 60, 0.5F, true);
   if (!renders(0.5F))
     return false;
   for (int index = 0; index < 257; ++index)
-    processor.triggerMidiNote(60, 0.5F, true);
+    processor.triggerMidiNote(generation, 60, 0.5F, true);
   if (!renders(0.0F))
     return false;
-  processor.triggerMidiNote(-1, 1.0F, true);
-  processor.triggerMidiNote(128, 1.0F, true);
+  processor.triggerMidiNote(generation, -1, 1.0F, true);
+  processor.triggerMidiNote(generation, 128, 1.0F, true);
   if (!renders(0.0F))
     return false;
 
-  processor.triggerMidiNote(60, 0.5F, true);
+  processor.triggerMidiNote(generation, 60, 0.5F, true);
   if (!renders(0.5F))
     return false;
-  const auto generation = processor.workerStatus().engineGeneration;
   processor.requestReload();
   if (!test::waitUntil(
           [&] {
@@ -3088,7 +3088,7 @@ sample { out1 = level; out2 = level }
     return false;
   // The UI can release a virtual hold from before adoption. That release
   // must not dispatch a note-off to the new engine's host voice.
-  processor.triggerMidiNote(60, 0.0F, false);
+  processor.triggerMidiNote(generation, 60, 0.0F, false);
   if (!renders(1.0F) || !processor.midiActivitySnapshot().active(60)) {
     std::cerr << "an obsolete virtual key release silenced a new host note\n";
     return false;
@@ -3097,10 +3097,11 @@ sample { out1 = level; out2 = level }
   hostNote.addEvent(juce::MidiMessage::noteOff(1, 60), 0);
   if (!renders(0.0F, hostNote))
     return false;
-  processor.triggerMidiNote(60, 0.5F, true);
+  const auto replacementGeneration = processor.workerStatus().engineGeneration;
+  processor.triggerMidiNote(replacementGeneration, 60, 0.5F, true);
   if (!renders(0.5F))
     return false;
-  processor.triggerMidiNote(60, 0.0F, false);
+  processor.triggerMidiNote(replacementGeneration, 60, 0.0F, false);
   return renders(0.0F);
 }
 
@@ -3178,7 +3179,8 @@ sample { out1 = in1 + level; out2 = in2 + level }
         !render(false, 1.25F) || !render(true, 0.25F, noteOff, 4, 1.25F))
       return false;
     if (product == Product::instrument) {
-      processor.triggerMidiNote(64, 1.0F, true);
+      processor.triggerMidiNote(processor.workerStatus().engineGeneration, 64,
+                                 1.0F, true);
       if (!render(false, 1.25F))
         return false;
       processor.releaseKeyboardNotes();
@@ -4763,6 +4765,7 @@ int runProcessorCases(const int argc, const char *const *argv) {
       {"Vst3EditorAttachment", exerciseVst3EditorAttachment, "native"},
       {"EditorGestureCancellation", exerciseEditorGestureCancellation},
       {"StaleEditorEvents", exerciseStaleEditorEvents},
+      {"StaleEditorMidiNotes", exerciseStaleEditorMidiNotes},
       {"TypedBufferState", exerciseTypedBufferState},
       {"AudioFileBuffers", exerciseAudioFileBuffers},
       {"ParameterArrayProcessor", exerciseParameterArrayProcessor},

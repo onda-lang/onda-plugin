@@ -130,8 +130,10 @@ public:
   [[nodiscard]] RuntimeLogSnapshot runtimeLogSnapshot() const;
   [[nodiscard]] std::uint64_t runtimeLogRevision() const noexcept;
   [[nodiscard]] MidiActivitySnapshot midiActivitySnapshot() const noexcept;
-  // Called on the message thread; notes are dispatched by the audio callback.
-  void triggerMidiNote(int key, float velocity, bool pressed);
+  // Called on the message thread with the displayed engine's generation;
+  // the audio callback rechecks that identity before dispatching the note.
+  void triggerMidiNote(std::uint64_t generation, int key, float velocity,
+                       bool pressed);
   void releaseKeyboardNotes() noexcept;
   void clearRuntimeLog();
   void setScopeCaptureEnabled(bool enabled) noexcept;

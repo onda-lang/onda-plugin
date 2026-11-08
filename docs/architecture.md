@@ -242,8 +242,9 @@ Source/project drops retain filesystem paths for imports and live reload. Buffer
 picker/drop paths share host-side format, name, and binding validation.
 
 The host owns sample rate. Block preference and fast math can be changed while
-unloaded; loaded programs do not advertise run settings. The DAW owns computer
-MIDI routing, so the editor forwards unused keys and omits computer-key note input.
+loaded or unloaded; changing either setting recompiles a loaded program. The DAW
+owns computer MIDI routing, so the editor forwards unused keys and omits
+computer-key note input.
 JUCE's text interface uses the shared draft/selection/caret geometry. Drain
 commands and refresh text state after input and rendering, and before teardown.
 This ends gestures and resolves drafts while command handlers still exist.
@@ -315,10 +316,12 @@ The callback never allocates, locks, or calls UI code for visualization.
 
 Host note state is retained per channel in atomic bitsets and published through
 `midiActivity`; a note stays lit while any host channel holds it. OndaSynth's virtual
-piano notes use a bounded, generation-scoped queue. Closing the editor or overflowing
-the queue releases its holds. Engine adoption clears old virtual holds, so a late
-release cannot stop a note in the replacement engine. MIDI device selection
-remains host-owned.
+piano notes use a bounded, generation-scoped queue. Editor commands retain the
+generation of the displayed engine; the processor rejects obsolete generations
+before queueing and the audio callback checks again before dispatch. Closing the
+editor or overflowing the queue releases its holds. Engine adoption clears old
+virtual holds, so a late release cannot stop a note in the replacement engine.
+MIDI device selection remains host-owned.
 
 ## Processing and automation
 
