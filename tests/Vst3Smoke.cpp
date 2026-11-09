@@ -296,6 +296,13 @@ bool smokeSavedProject(juce::VST3PluginFormatHeadless &format,
     return false;
   if (!checkMetadata(bundle, expected))
     return false;
+  const auto rendererFile = bundle.getChildFile("Contents/Resources/onda_ui")
+                                .getChildFile(ONDA_GPU_UI_LIBRARY_NAME);
+  juce::DynamicLibrary renderer;
+  if (!check(renderer.open(rendererFile.getFullPathName()) &&
+                 renderer.getFunction("onda_ui_create") != nullptr,
+             "Could not load bundled UI renderer: " + rendererFile.getFullPathName()))
+    return false;
 
   juce::OwnedArray<juce::PluginDescription> descriptions;
   format.findAllTypesForFile(descriptions, bundle.getFullPathName());

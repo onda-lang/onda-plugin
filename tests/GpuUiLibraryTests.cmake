@@ -22,6 +22,7 @@ set(CMAKE_SHARED_LIBRARY_PREFIX lib)
 set(CMAKE_SHARED_LIBRARY_SUFFIX .test)
 include("${UI_LIBRARY_CONFIGURATION}")
 file(WRITE "${CMAKE_BINARY_DIR}/selected.txt" "${ONDA_GPU_UI_LIBRARY}")
+file(WRITE "${CMAKE_BINARY_DIR}/bundled.txt" "${ONDA_GPU_UI_LIBRARY_NAME}")
 ]=])
 
 function(expect_library sdk development expected)
@@ -49,4 +50,10 @@ expect_library(A "" "${scratch}/override.test"
 expect_library(B "${scratch}/B" "${scratch}/override.test")
 expect_library(B "${scratch}/B" "${scratch}/B/target/release/libonda_ui.test"
     "-DONDA_GPU_UI_LIBRARY=")
+expect_library(B "${scratch}/B" "${scratch}/B/target/release/libonda_ui.test"
+    "-DWIN32=TRUE")
+file(READ "${scratch}/build/bundled.txt" bundled)
+if(NOT bundled STREQUAL "onda_ui.bin")
+    message(FATAL_ERROR "Windows UI support library must not use a plugin DLL extension: ${bundled}")
+endif()
 file(REMOVE_RECURSE "${scratch}")

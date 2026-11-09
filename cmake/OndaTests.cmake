@@ -269,6 +269,7 @@ target_link_libraries(onda_vst3_smoke PRIVATE
 )
 onda_treat_juce_headers_as_system(onda_vst3_smoke)
 target_compile_definitions(onda_vst3_smoke PRIVATE
+    ONDA_GPU_UI_LIBRARY_NAME="${ONDA_GPU_UI_LIBRARY_NAME}"
     ONDA_PLUGIN_VERSION="${PROJECT_VERSION}"
     ONDA_PLUGIN_INPUT_CHANNELS=${ONDA_PLUGIN_INPUT_CHANNELS}
     ONDA_PLUGIN_CONTROL_INPUTS=${ONDA_PLUGIN_CONTROL_INPUTS}

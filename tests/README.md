@@ -192,7 +192,7 @@ needs confirmation on macOS.
 | `onda_processor_tests` | Host preparation, state persistence, defaults and automation, block-rate parameter smoothing, notifications, failure recovery, realtime callbacks, logs, scope/event adapters, editor lifecycle, and concurrent instances. |
 | `onda_native_editor_tests` | Both products: actual native GPU readiness, source picker on fresh startup, numeric edits reaching DSP, retained state on reopening, and exported `IPlugView` platform support, attachment and removal. |
 | `onda_plugin_symbols_tests` | All platforms: VST3 entry points remain public while JUCE implementation symbols stay private to each plugin module. |
-| `onda_vst3_smoke` | Built bundles expose expected metadata and parameters, instantiate independently, render through JUCE's VST3 host, and restore a saved program with imports after deleting its original files. Bundle lookup also exercises the Windows layout on other platforms. |
+| `onda_vst3_smoke` | Built bundles load their bundled UI renderer, expose expected metadata and parameters, instantiate independently, render through JUCE's VST3 host, and restore a saved program with imports after deleting its original files. Bundle lookup also exercises the Windows layout on other platforms. |
 | `onda_vst3_realtime_audit_tests` | Linux auditor startup, plugin loading, positive allocation/free/mutex detection, allocator semantics, callback budgets, and independent concurrent audit intervals. |
 | `onda_vst3_realtime` | The exported VST3 behavior checks with Linux allocation and mutex interception enabled, after the auditor's own tests pass. |
 | VST3 validators | Steinberg's interface/protocol checks for both products. These complement the behavior checked by the smoke host. |

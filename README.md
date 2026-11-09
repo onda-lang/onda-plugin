@@ -138,6 +138,7 @@ cmake --build build
 The build uses the SDK pinned in `onda-version` and JUCE revision in `juce-version`.
 Each VST3 bundle includes its `onda_ui` library and font notices under
 `Contents/Resources/onda_ui`, so it can be moved as a complete bundle.
+On Windows the renderer is named `onda_ui.bin` to keep DAWs from scanning it as a plugin DLL.
 
 For development against a local Onda checkout, first build its libraries there:
 
