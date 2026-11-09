@@ -178,3 +178,9 @@ ctest --test-dir build -C Release --output-on-failure -L '^(core|native)$'
 See [architecture](docs/architecture.md) for implementation invariants and
 [test contracts](tests/README.md) for CI selections, native editor checks, and
 DAW validation. `plugin-version` controls the plugin release version.
+
+## License
+
+Starting with the Onda 0.9.0 release, Onda-authored code in this repository is licensed
+under the [Apache License, Version 2.0](LICENSE). Third-party components retain their
+respective licenses.
