@@ -18,9 +18,10 @@ An immutable presentation snapshot gives mapped slots their compiled Onda
 names, units, defaults, discrete step counts, and ABI-backed plain-value text.
 Enum descriptors are shared by array elements and snapshots. Host value text and
 the shared view use their member labels while DSP and automation retain ordinary
-i32 ordinal conversion. VST3 exposes enums as choice lists and singleton enums as
-read-only lists. Member or label changes invalidate host presentation even when
-the numeric domain stays unchanged.
+i32 ordinal conversion. Host text parsing prioritizes exact member labels over
+identifier aliases and case-insensitive matches. VST3 exposes enums as choice
+lists and singleton enums as read-only lists. Member or label changes invalidate
+host presentation even when the numeric domain stays unchanged.
 The worker schedules a message-thread parameter-info notification only when
 that mapping changes; the audio thread never reads presentation metadata.
 Bypass queues update the wrapper-owned boolean atomically. Its message-thread
@@ -69,7 +70,7 @@ Construction validates:
 - supplied buffer bindings are Onda-owned immutable project defaults or explicit
   read-only file assets with matching element type and a compatible channel count;
 - canonical MIDI and host-context payload names, order, scalar shapes, and
-  types match;
+  types match, including rejection of nominal enums in primitive arguments;
 - instruments declare exact `note_on` and `note_off` events.
 
 Unbound buffers use Onda's neutral descriptors, matching `onda run`. They do not

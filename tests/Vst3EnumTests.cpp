@@ -97,6 +97,20 @@ sample { out1 = 0.0 }
     return false;
   }
 
+  for (const auto *label : {"LowPass", "low pass", " LowPass "}) {
+    if (!source.replaceWithText(program(label)))
+      return false;
+    setOndaProgram(*instance, source);
+    instance->prepareToPlay(48'000.0, 8);
+    if (!wait([&] { return controller.text("slot01", 1.0) == label; }) ||
+        controller.valueForText("slot01", label) != 1.0 ||
+        controller.valueForText("slot01", "Low Pass") != 0.0 ||
+        controller.valueForText("slot01", "HighPass") != 0.5) {
+      std::cerr << "VST3 enum labels did not round-trip before aliases\n";
+      return false;
+    }
+  }
+
   auto numeric = program("Band select");
   numeric = numeric.replace("mode = Mode::HighPass", "mode: i32 = 1 {0, 2}");
   numeric = numeric.replace("enum One { Only }", "enum One { Only; Another }");

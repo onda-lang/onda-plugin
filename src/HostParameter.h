@@ -152,8 +152,13 @@ public:
     if (!mapping)
       return normalizedText(text);
     if (mapping->enumeration) {
-      const auto input = text.trim();
       const auto &members = mapping->enumeration->members;
+      for (std::size_t ordinal = 0; ordinal < members.size(); ++ordinal) {
+        if (text == juce::String(members[ordinal].label))
+          return static_cast<float>(
+              plainToNormalized(*mapping, static_cast<double>(ordinal)));
+      }
+      const auto input = text.trim();
       for (std::size_t ordinal = 0; ordinal < members.size(); ++ordinal) {
         if (input == juce::String(members[ordinal].name))
           return static_cast<float>(

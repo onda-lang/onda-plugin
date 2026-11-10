@@ -470,6 +470,7 @@ bool validateEvent(const onda_program_t *program, const ExpectedEvent &expected,
     const auto &field = schema.parameters[parameter];
     if (field.name != expected.parameterNames[parameter] || !field.type ||
         field.type->kind != PayloadType::Kind::scalar ||
+        field.type->enumeration ||
         payloadPrimitive(field.type->scalar) !=
             expected.parameterTypes[parameter]) {
       diagnostic = error("Canonical " + std::string(expected.category) +

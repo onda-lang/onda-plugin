@@ -221,8 +221,11 @@ saturation at VST3's signed 32-bit limit.
 stability, ordinal rendering without realtime allocations, label-only reloads,
 and saved-image restoration. `EnumEventMetadata` checks recursive enum choices
 in struct, array, tuple, and slice event fields while preserving integer payloads.
-The VST3 smoke host also checks value-text conversion, list/read-only flags,
-label-only refresh notifications, and transitions back to numeric parameters.
+The VST3 smoke host also checks value-text conversion, including exact-label
+priority over colliding identifiers and case-insensitive aliases, list/read-only
+flags, label-only refresh notifications, and transitions back to numeric parameters.
+`EngineAndWorker` rejects enum arguments in canonical MIDI and host-context
+signatures while user-defined events retain enum support.
 `ProjectBufferOverrideRestore` clears an override while the linked source is
 broken, verifies immediate and completed saves keep the cleared slot unbound,
 and checks that repairing the source does not resurrect the project default.
