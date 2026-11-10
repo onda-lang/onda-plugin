@@ -18,11 +18,11 @@ on:
         type: string
         default: ''
       onda_source_ref:
-        description: Onda commit supplying SDK artifacts in the calling run; empty uses a release
+        description: Exact full Onda source commit of the SDK run
         type: string
         default: ''
       onda_run_id:
-        description: Existing Onda SDK build run; empty uses the calling run
+        description: Onda SDK build run ID; empty uses the pinned release
         type: string
         default: ''
 
@@ -82,13 +82,11 @@ jobs:
             linux-x64|windows-x64|macos-arm64|all) ;;
             *) echo "unknown platform: $TARGET_PLATFORM" >&2; exit 1 ;;
           esac
-          if [[ -n "$ONDA_SOURCE_REF" && ! "$ONDA_SOURCE_REF" =~ ^[0-9a-f]{40}$ ]]; then
-            echo "expected a full Onda SDK source commit" >&2
-            exit 1
-          fi
-          if [[ -n "$ONDA_RUN_ID" && ( ! "$ONDA_RUN_ID" =~ ^[1-9][0-9]*$ || -z "$ONDA_SOURCE_REF" ) ]]; then
-            echo "an existing SDK run requires its exact Onda source commit" >&2
-            exit 1
+          if [[ -n "$ONDA_RUN_ID" || -n "$ONDA_SOURCE_REF" ]]; then
+            if [[ ! "$ONDA_RUN_ID" =~ ^[1-9][0-9]*$ || ! "$ONDA_SOURCE_REF" =~ ^[0-9a-f]{40}$ ]]; then
+              echo 'An unpublished SDK requires both a build run ID and its full Onda source commit' >&2
+              exit 1
+            fi
           fi
 
           audit=false
@@ -220,8 +218,8 @@ jobs:
           name: onda-${{ matrix.platform }}
           path: .onda-sdk
           repository: onda-lang/onda
-          run-id: ${{ inputs.onda_run_id || github.run_id }}
-          github-token: ${{ inputs.onda_run_id && github.token || '' }}
+          run-id: ${{ inputs.onda_run_id }}
+          github-token: ${{ github.token }}
 
       - name: Checkout matching Onda resources
         if: inputs.onda_source_ref != ''

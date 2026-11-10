@@ -8,7 +8,14 @@
 [Pre-built binaries](https://github.com/onda-lang/onda-plugin/releases) are available for Windows, macOS and Linux.
 Release builds target Linux x64 with a Debian 12 baseline (glibc 2.36), Windows
 x64 with the Visual Studio 2022 toolchain and static MSVC runtime, and macOS
-arm64 with a minimum deployment target of macOS 14.0. The macOS binaries are not signed.
+arm64 with a minimum deployment target of macOS 14.0.
+
+Release signing status:
+
+- **macOS:** binaries are not signed with an Apple Developer ID and are not notarized. macOS may
+  block downloaded plug-ins until you approve them in **System Settings → Privacy & Security**.
+  See [Apple's instructions](https://support.apple.com/102445).
+- **Windows:** plug-in binaries are not code-signed (Authenticode).
 
 ## Examples
 
@@ -53,8 +60,7 @@ event render_mode(realtime: bool)
 ```
 
 Timing events run at the start of each Onda block, before MIDI and audio.
-Except for `render_mode`, an event is sent only when the DAW supplies its value.
-Initialize any fallback values your program needs, such as a default tempo.
+These events are only sent when the DAW supplies their value.
 
 ## Parameters and automation
 
@@ -62,11 +68,6 @@ The plugin provides 32 DAW automation slots for `params` by default. Mapped slot
 loaded program's parameter names and units. Array elements each consume one
 slot, in declaration order, up to the configured limit. Slots remain stable when the
 program is recompiled.
-
-Enum parameters expose their member labels in the editor and in DAW value text.
-Hosts supporting VST3 choice lists can also show named choices in automation
-editors. Each enum array element retains its own slot; a one-member enum is a
-fixed, read-only choice.
 
 Scalar numeric parameters without a declared range appear in **Params** and map to
 DAW slots using a plugin-owned 0–1 control range. Declare an explicit range when
@@ -79,13 +80,10 @@ sampled at the start of each Onda block. Discrete parameters hold the latest
 point at that boundary.
 
 **Block Size** controls how often params automation updates.
-Change it or **Fast Math** in Settings to recompile the loaded program. Sample rate
-comes from the DAW. The ◐ button switches Dark / Light, including in the unloaded view.
-Without a saved choice, the editor detects the system appearance at startup. Only the theme
-is saved as a default for new instances. Block size and Fast Math belong to each instance.
+Sample rate comes from the DAW.
 
 The **Smooth** value only affects changes made in the UI editor.
-DAW automation normally bypasses smoothing.
+DAW automation bypasses parameter smoothing.
 
 ## Audio inputs and outputs
 
@@ -101,26 +99,15 @@ layout, declare the two main input channels first; subsequent `ins` map to
 
 Each control appears as a named, automatable DAW parameter. Unlike `params`, control input automation is sample-accurate.
 To supply an external signal, enable and route the corresponding bus through your DAW’s sidechain or auxiliary inputs.
-The routed signal takes precedence over the parameter value.
-
-Controls start at their declared input default, or zero. Declare an input range
-to set the values covered by automation, which maps linearly to that range.
 
 ## Audio buffers
 
 Drop a single supported audio or `.ondabuffer` file onto a buffer card to bind
-or replace its contents. The target card highlights during the drag. **Bind** and
-**Replace** also open a file picker. Supported formats include WAV,
+or replace its contents. Supported formats include WAV,
 AIFF, FLAC, and Ogg Vorbis through JUCE's audio decoders, producing `f32` samples.
-Typed `.ondabuffer` assets preserve `bool`, `i32`, `i64`, `f32`, or `f64` elements,
-including tables. File bindings must be read-only and match the declaration's
+Typed `.ondabuffer` assets preserve `bool`, `i32`, `i64`, `f32`, or `f64` elements.
+File bindings must be read-only and match the declaration's
 element type and channel count. Project assets provide immutable defaults.
-**Clear** unbinds the slot, including a project default, and saves that choice.
-Unbound buffers return neutral values while parameters and controls remain usable.
-
-Binding or clearing a buffer rebuilds the runtime instance using the existing
-compiled program. Linked source and buffer files reload automatically after
-edits. Failed reloads keep the previous working program playing.
 
 Your DAW project saves the program, buffer data, and plugin settings. If linked
 files are unavailable when reopening it, the plugin restores the saved version.
@@ -175,12 +162,7 @@ Run the release test groups on a desktop (or under `xvfb-run -a` on Linux):
 ctest --test-dir build -C Release --output-on-failure -L '^(core|native)$'
 ```
 
+`plugin-version` controls the plugin release version.
 See [architecture](docs/architecture.md) for implementation invariants and
 [test contracts](tests/README.md) for CI selections, native editor checks, and
-DAW validation. `plugin-version` controls the plugin release version.
-
-## License
-
-Starting with the Onda 0.9.0 release, Onda-authored code in this repository is licensed
-under the [Apache License, Version 2.0](LICENSE). Third-party components retain their
-respective licenses.
+DAW validation.

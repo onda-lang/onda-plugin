@@ -32,13 +32,21 @@ on:
           - windows-x64
           - macos-arm64
           - all
+      onda_run_id:
+        description: Onda SDK build run ID; leave both Onda inputs empty to use the pinned release
+        type: string
+        default: ''
+      onda_source_ref:
+        description: Exact full Onda source commit of that SDK run
+        type: string
+        default: ''
 
 permissions:
   contents: read
   actions: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event_name }}-${{ inputs.source_ref || github.ref }}-${{ inputs.tests || 'release' }}-${{ inputs.platform || 'all' }}
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ inputs.source_ref || github.ref }}-${{ inputs.tests || 'release' }}-${{ inputs.platform || 'all' }}-${{ inputs.onda_run_id || 'pinned' }}-${{ inputs.onda_source_ref }}
   cancel-in-progress: true
 
 env:
@@ -53,6 +61,8 @@ jobs:
       tests: ${{ github.event_name == 'push' && 'package' || inputs.tests }}
       platform: ${{ github.event_name == 'push' && 'all' || inputs.platform }}
       release_tag: ${{ github.event_name == 'push' && github.ref_name || '' }}
+      onda_run_id: ${{ inputs.onda_run_id || '' }}
+      onda_source_ref: ${{ inputs.onda_source_ref || '' }}
 
   publish:
     name: Publish release
