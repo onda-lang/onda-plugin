@@ -7,9 +7,69 @@
 #include "RunViewHost.h"
 #include "TemporaryDirectory.h"
 #include "TestNumeric.h"
+#include "UiPreferences.h"
 
 #include <algorithm>
 #include <iostream>
+
+bool exerciseRunViewSchemaReadiness() {
+  using namespace onda::plugin;
+  const juce::File preferencesFile{pathToJuce(testTemporaryRoot() / "ui-preferences.settings")};
+  if (UiPreferences(preferencesFile).theme().isNotEmpty())
+    return false;
+  for (const auto &mode : {"light", "dark"}) {
+    {
+      UiPreferences preferences(preferencesFile);
+      if (!preferences.setTheme(mode) || preferences.setTheme("auto") || preferences.setTheme("invalid"))
+        return false;
+    }
+    UiPreferences reopened(preferencesFile);
+    if (reopened.theme() != mode)
+      return false;
+  }
+  const juce::File source{
+      pathToJuce(testTemporaryRoot() / "schema-ready.onda")};
+  if (!source.replaceWithText(
+          "event send(value: i64) {}\nsample { out1 = 0.0 }\n"))
+    return false;
+  const auto ready = [](Processor &processor) {
+    return static_cast<bool>(makeRunViewState(processor,
+                                              processor.workerStatus(), false,
+                                              {})["state"]["schemaReady"]);
+  };
+  Processor original(Product::effect);
+  if (!ready(original))
+    return false;
+  original.loadFile(source);
+  if (ready(original)) {
+    std::cerr << "Queued compilation exposed an empty schema as ready\n";
+    return false;
+  }
+  juce::MemoryBlock state;
+  original.getStateInformation(state);
+  Processor restored(Product::effect);
+  restored.setNonRealtime(true);
+  restored.setStateInformation(state.getData(),
+                               static_cast<int>(state.getSize()));
+  if (ready(restored)) {
+    std::cerr << "Waiting restoration exposed an empty schema as ready\n";
+    return false;
+  }
+  restored.prepareToPlay(48'000.0, 64);
+  if (!restored.workerStatus().active || !ready(restored)) {
+    std::cerr << "Prepared schema was not ready: "
+              << restored.workerStatus().message << '\n';
+    return false;
+  }
+  restored.unload();
+  if (!ready(restored))
+    return false;
+  if (!source.replaceWithText("this is not valid Onda\n"))
+    return false;
+  restored.loadFile(source);
+  restored.prepareToPlay(48'000.0, 64);
+  return restored.workerStatus().hasError && ready(restored);
+}
 
 bool exerciseFastMath() {
   using namespace onda::plugin;
@@ -65,8 +125,19 @@ bool exerciseFastMath() {
                 << '\n';
       return false;
     }
-    if (processor.setFastMath(!enabled) || processor.fastMath() != enabled)
+    if (!static_cast<bool>(makeRunViewState(processor, processor.workerStatus(),
+                                         false, {})["state"]["supportsRunSettings"])) {
+      std::cerr << "Loaded plugin hid editable run settings\n";
       return false;
+    }
+    for (const auto setting : {!enabled, enabled}) {
+      const auto previous = processor.workerStatus().engineGeneration;
+      if (!processor.setFastMath(setting) || !test::waitForMessage([&] {
+            return processor.workerStatus().engineGeneration > previous &&
+                   renders(processor, setting ? 1.0F : 0.0F);
+          }))
+        return false;
+    }
 
     // Automatic recompilation and host specialization retain the option.
     if (!writeSource(2))
@@ -97,6 +168,9 @@ bool exerciseFastMath() {
       return false;
     }
     restored.unload();
+    if (!static_cast<bool>(makeRunViewState(restored, restored.workerStatus(),
+                                          false, {})["state"]["supportsRunSettings"]))
+      return false;
     if (!restored.setFastMath(!enabled))
       return false;
   }

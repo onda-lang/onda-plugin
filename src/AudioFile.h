@@ -54,6 +54,10 @@ struct AudioFileResult {
 
 [[nodiscard]] AudioFileResult
 decodeAudioFile(const std::filesystem::path &path);
+// Decodes borrowed bytes synchronously; displayPath is used only in errors.
+[[nodiscard]] AudioFileResult
+decodeAudioFile(std::span<const std::uint8_t> encodedBytes,
+                const std::filesystem::path &displayPath);
 // Lowercase filename suffixes, including the leading dot.
 [[nodiscard]] const std::vector<std::string> &supportedAudioFileExtensions();
 [[nodiscard]] std::string supportedAudioFileWildcard();

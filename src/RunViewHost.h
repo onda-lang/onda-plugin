@@ -1,8 +1,7 @@
 #pragma once
 
-#include <juce_gui_extra/juce_gui_extra.h>
+#include <juce_core/juce_core.h>
 
-#include <optional>
 #include <string>
 
 namespace onda::plugin {
@@ -10,9 +9,6 @@ namespace onda::plugin {
 class Processor;
 struct MidiActivitySnapshot;
 struct WorkerStatus;
-
-[[nodiscard]] std::optional<juce::WebBrowserComponent::Resource>
-runViewResource(const juce::String &request);
 
 [[nodiscard]] juce::var makeRunViewState(Processor &processor,
                                          const WorkerStatus &status,
@@ -24,7 +20,11 @@ runViewResource(const juce::String &request);
 [[nodiscard]] juce::var makeRunViewParameterValues(Processor &processor,
                                                    const WorkerStatus &status);
 
-[[nodiscard]] juce::var makeRunViewScope(Processor &processor);
+[[nodiscard]] juce::var makeRunViewLog(Processor &processor);
+
+[[nodiscard]] juce::var makeRunViewSmoothing(double parameterSeconds,
+                                            double inputControlSeconds,
+                                            const std::string &error);
 
 [[nodiscard]] juce::var
 makeRunViewMidiActivity(const MidiActivitySnapshot &activity);

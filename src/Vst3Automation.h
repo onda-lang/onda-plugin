@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
 
 namespace juce {
 class AudioProcessor;
@@ -13,6 +14,10 @@ struct ProcessData;
 
 namespace onda::plugin {
 class Processor;
+std::unique_ptr<juce::AudioProcessorParameter> makeVst3BypassParameter();
+bool vst3SetBypassFromHost(juce::AudioProcessorParameter &parameter,
+                           float value) noexcept;
+void vst3MidiOverflow(juce::AudioProcessor &processor) noexcept;
 juce::String vst3BusName(juce::AudioProcessor &processor, bool input,
                          int index);
 bool vst3OwnsParameter(juce::AudioProcessor &processor,
@@ -24,6 +29,8 @@ double vst3NormalizedToPlain(const juce::AudioProcessorParameter &parameter,
 double vst3PlainToNormalized(const juce::AudioProcessorParameter &parameter,
                              double value);
 std::int32_t vst3ParameterStepCount(
+    const juce::AudioProcessorParameter &parameter, std::int32_t fallback);
+std::int32_t vst3ParameterFlags(
     const juce::AudioProcessorParameter &parameter, std::int32_t fallback);
 
 // The generated wrapper borrows host queues only for this processing call.

@@ -89,9 +89,10 @@ struct ProjectBufferInfo {
   float sampleRate{};
 };
 
+// Bytes are borrowed for the synchronous materialization visit only.
 struct MaterializedProjectFile {
   std::filesystem::path relativePath;
-  std::vector<std::uint8_t> bytes;
+  std::span<const std::uint8_t> bytes;
 };
 
 struct CompileResult {
@@ -123,7 +124,7 @@ withProjectBufferOverrides(const ProjectImage &image,
                            std::span<const ProjectBufferAsset> buffers,
                            Diagnostic &diagnostic);
 using MaterializedProjectVisitor =
-    std::function<bool(MaterializedProjectFile &&)>;
+    std::function<bool(const MaterializedProjectFile &)>;
 [[nodiscard]] bool
 visitMaterializedProjectFiles(const ProjectImage &image, Diagnostic &diagnostic,
                               const MaterializedProjectVisitor &visitor);

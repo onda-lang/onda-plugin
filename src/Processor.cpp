@@ -336,7 +336,10 @@ double Processor::getTailLengthSeconds() const {
                                       : 0.0;
 }
 
+void Processor::releaseResources() { scopeCapture_.clearMeter(); }
+
 void Processor::reset() {
+  scopeCapture_.clearMeter();
   clearMidiActivity();
   if (runtimeFaulted_.load(std::memory_order_acquire))
     runtimeRecoveryRequested_.store(true, std::memory_order_release);
@@ -623,7 +626,9 @@ void Processor::processBlockBypassed(juce::AudioBuffer<float> &audio,
 
 void Processor::processAudio(juce::AudioBuffer<float> &audio,
                              juce::MidiBuffer &midi, const bool bypassed) {
-  juce::ScopedNoDenormals noDenormals;
+  // The host may change processing threads or their FP policy between calls.
+  // Onda checks the thread's register without TLS or allocation.
+  onda_configure_current_thread_audio_fp_mode();
   const auto frames = audio.getNumSamples();
   if (isNonRealtime()) {
     if (runtimeRecoveryRequested_.exchange(false, std::memory_order_acq_rel))
@@ -654,11 +659,12 @@ void Processor::processAudio(juce::AudioBuffer<float> &audio,
   }
 
   acquireEngine();
+  // Editor compilation preferences take effect with a successful replacement.
+  // Host configuration changes invalidate the old engine explicitly.
   if (deactivateRequested_.load(std::memory_order_acquire) ||
       active_ == nullptr || activeFaulted_ ||
       !sameSampleRate(active_->sampleRate(),
-                      expectedSampleRate_.load(std::memory_order_acquire)) ||
-      active_->blockSize() != ondaBlockSize()) {
+                      expectedSampleRate_.load(std::memory_order_acquire))) {
     fallback(audio);
     return;
   }
@@ -791,6 +797,24 @@ void Processor::processAudio(juce::AudioBuffer<float> &audio,
     return true;
   };
   auto succeeded = true;
+  if (hostNotesOffRequested_.exchange(false, std::memory_order_acq_rel)) {
+    for (std::size_t channel = 0; channel < midiActiveNotes_.size(); ++channel) {
+      for (std::size_t word = 0; word < midiNoteWordCount; ++word) {
+        auto notes =
+            midiActiveNotes_[channel][word].load(std::memory_order_relaxed);
+        while (notes != 0U && succeeded) {
+          const auto key =
+              word * 64U + static_cast<std::size_t>(std::countr_zero(notes));
+          const MidiEvent release{MidiKind::noteOff, 0,
+                                  static_cast<std::int32_t>(channel),
+                                  static_cast<std::int32_t>(key), 0.0F};
+          succeeded = processRange(0, 0, std::span{&release, 1U});
+          notes &= notes - 1U;
+        }
+      }
+    }
+    clearMidiActivity();
+  }
   const auto epoch = keyboardEpoch_.load(std::memory_order_acquire);
   if (consumedKeyboardEpoch_ != epoch) {
     for (std::size_t key = 0; key < keyboardHeldNotes_.size() && succeeded;
@@ -1035,7 +1059,8 @@ std::string Processor::triggerEvent(const std::uint64_t generation,
   command.eventIndex = event->index;
   std::size_t payloadBytes{};
   std::string payloadError;
-  if (!encodePayload(event->schema, values, command.payload, payloadBytes,
+  if (!encodePayload(event->schema, event->payloadPlan.get(), values,
+                     command.payload, payloadBytes,
                      payloadError))
     return "Event '" + event->name +
            "' has an invalid payload: " + payloadError;
@@ -1078,16 +1103,18 @@ std::uint64_t Processor::runtimeLogRevision() const noexcept {
   return runtimeLogRevision_.load(std::memory_order_acquire);
 }
 
-void Processor::triggerMidiNote(const int key, const float velocity,
-                                const bool pressed) {
+void Processor::triggerMidiNote(const std::uint64_t generation, const int key,
+                                const float velocity, const bool pressed) {
   if (product_ != Product::instrument || key < 0 ||
       key >= static_cast<int>(midiNoteCount) || !std::isfinite(velocity))
     return;
   const auto status = workerStatus();
-  if (!status.active || !status.midi.noteOn || !status.midi.noteOff)
+  if (!status.active || generation == 0 ||
+      generation != status.engineGeneration || !status.midi.noteOn ||
+      !status.midi.noteOff)
     return;
   if (!keyboardNotes_.tryPush(
-          {status.engineGeneration,
+          {generation,
            keyboardEpoch_.load(std::memory_order_acquire), key,
            pressed ? std::clamp(velocity, 0.0F, 1.0F) : 0.0F}))
     releaseKeyboardNotes();
@@ -1129,6 +1156,14 @@ void Processor::clearRuntimeLog() {
 
 void Processor::setScopeCaptureEnabled(const bool enabled) noexcept {
   scopeCapture_.setEnabled(enabled);
+}
+
+void Processor::setMeterCaptureEnabled(const bool enabled) noexcept {
+  scopeCapture_.setMeterEnabled(enabled);
+}
+
+MeterSnapshot Processor::meterSnapshot() noexcept {
+  return scopeCapture_.meterSnapshot();
 }
 
 ScopeRevision Processor::scopeRevision() const noexcept {
@@ -1297,8 +1332,6 @@ void Processor::captureHostAutomation(const std::uint32_t id,
 
 bool Processor::setFastMath(const bool enabled) {
   std::unique_lock lock(preparationMutex_);
-  if (!canSetBlockSize())
-    return false;
   if (fastMath() == enabled)
     return true;
   fastMath_.store(enabled, std::memory_order_release);
@@ -1316,14 +1349,12 @@ int Processor::ondaBlockSize() const noexcept {
 }
 
 bool Processor::canSetBlockSize() const {
-  const auto status = worker_->status();
-  return status.path.empty() && !status.active && !status.compiling;
+  return hostBlockSize() > 0;
 }
 
 bool Processor::setPreferredBlockSize(const int samples) {
   std::unique_lock lock(preparationMutex_);
-  if (samples < 0 || (samples > 0 && samples > hostBlockSize()) ||
-      !canSetBlockSize())
+  if (samples < 0 || (samples > 0 && samples > hostBlockSize()))
     return false;
   if (preferredBlockSize() == samples)
     return true;

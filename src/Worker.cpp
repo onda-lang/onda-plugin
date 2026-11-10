@@ -116,7 +116,8 @@ void Worker::configure(const double sampleRate, const int blockSize,
       status_.message = "Waiting for host specialization";
       status_.compiling = false;
       status_.hasError = false;
-      deactivateStatus();
+      if (!retainActivePublication())
+        deactivateStatus();
       incrementStatusRevision();
     }
   }
@@ -552,6 +553,8 @@ HostParameterValues Worker::parameterValuesLocked() const {
 }
 
 void Worker::advanceGeneration() noexcept {
+  status_.schemaReady =
+      desired_.path.empty() && !desired_.fallbackProjectImage.valid();
   desired_.reuseCompilation = false;
   desired_.changedBuffers.clear();
   ++desired_.generation;
@@ -578,6 +581,7 @@ void Worker::deactivateStatus() noexcept {
   status_.active = false;
   hasPreparedEngine_.store(false, std::memory_order_release);
   status_.engineGeneration = 0;
+  status_.blockSize = 0;
 }
 
 void Worker::setParameterMappings(
@@ -609,6 +613,7 @@ void Worker::reportFailure(const char *const message) noexcept {
     std::lock_guard lock(mutex_);
     status_.compiling = false;
     status_.hasError = true;
+    status_.schemaReady = true;
     incrementStatusRevision();
     try {
       status_.message = message;
@@ -640,6 +645,33 @@ std::shared_ptr<const EnginePublication> Worker::activePublication() const {
   return {};
 }
 
+bool Worker::retainActivePublication() {
+  const auto retained = activePublication();
+  if (!retained)
+    return false;
+  status_.engineGeneration = retained->status.engineGeneration;
+  status_.blockSize = retained->status.blockSize;
+  setParameterMappings(retained->status.mappings, retained->status.controls);
+  status_.buffers = retained->status.buffers;
+  status_.events = retained->status.events;
+  status_.midi = retained->status.midi;
+  status_.usingProjectImage = retained->status.usingProjectImage;
+  // Clear intent belongs to saved state immediately, while audio can still
+  // be using an older instance. Status updates must not resurrect its assets.
+  const auto retainClearIntent =
+      publishedProjectState_.path == desired_.path &&
+      std::ranges::any_of(publishedProjectState_.bufferBindings,
+                          [](const BufferFileBinding &binding) {
+                            return binding.path.empty();
+                          });
+  if (!retainClearIntent)
+    publishProjectState(retained->project, desired_.notifyProjectChange,
+                        retained->seed, retained->values);
+  status_.active = true;
+  hasPreparedEngine_.store(true, std::memory_order_release);
+  return true;
+}
+
 bool Worker::updateStatus(const Request &request, std::string message,
                           const bool compiling,
                           std::vector<BufferMapping> buffers,
@@ -648,29 +680,9 @@ bool Worker::updateStatus(const Request &request, std::string message,
   if (!matchesDesiredLocked(request)) {
     return false;
   }
-  const auto retained = activePublication();
-  if (retained) {
-    status_.engineGeneration = retained->status.engineGeneration;
-    setParameterMappings(retained->status.mappings, retained->status.controls);
-    status_.buffers = retained->status.buffers;
+  if (retainActivePublication()) {
     if (!buffers.empty())
       status_.pendingBuffers = std::move(buffers);
-    status_.events = retained->status.events;
-    status_.midi = retained->status.midi;
-    status_.usingProjectImage = retained->status.usingProjectImage;
-    // Clear intent belongs to saved state immediately, while audio can still
-    // be using an older instance. Status updates must not resurrect its assets.
-    const auto retainClearIntent =
-        publishedProjectState_.path == desired_.path &&
-        std::ranges::any_of(publishedProjectState_.bufferBindings,
-                            [](const BufferFileBinding &binding) {
-                              return binding.path.empty();
-                            });
-    if (!retainClearIntent)
-      publishProjectState(retained->project, desired_.notifyProjectChange,
-                          retained->seed, retained->values);
-    status_.active = true;
-    hasPreparedEngine_.store(true, std::memory_order_release);
   } else {
     clearPublishedInterface();
     status_.buffers = std::move(buffers);
@@ -678,6 +690,7 @@ bool Worker::updateStatus(const Request &request, std::string message,
   status_.path = desired_.path;
   status_.message = std::move(message);
   status_.compiling = compiling;
+  status_.schemaReady = !compiling && hasError;
   status_.hasError = hasError;
   incrementStatusRevision();
   return true;
@@ -1245,10 +1258,12 @@ void Worker::build(const Request &request) {
                           : "Active";
     status_.compiling = false;
     status_.hasError = usingProjectImage && !desired_.path.empty();
+    status_.schemaReady = true;
     status_.active = true;
     hasPreparedEngine_.store(true, std::memory_order_release);
     status_.usingProjectImage = usingProjectImage;
     status_.engineGeneration = request.generation;
+    status_.blockSize = result.engine->blockSize();
     setParameterMappings(std::move(mappings), std::move(controls));
     status_.buffers = std::move(buffers);
     status_.pendingBuffers.reset();
@@ -1278,6 +1293,8 @@ void Worker::build(const Request &request) {
 }
 
 void Worker::run() noexcept {
+  // Generated initializers run here before the engine reaches the audio thread.
+  onda_configure_current_thread_audio_fp_mode();
   try {
     std::uint64_t observedGeneration{};
     for (;;) {

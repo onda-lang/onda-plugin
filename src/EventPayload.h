@@ -1,5 +1,9 @@
 #pragma once
 
+#include "EnumMetadata.h"
+
+#include <onda.h>
+
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -44,6 +48,7 @@ struct PayloadType {
   Kind kind{};
   PayloadScalar scalar{};
   std::optional<PayloadIntegerRange> integerRange;
+  EnumMetadataPtr enumeration;
   std::string name;
   std::vector<PayloadField> fields;
   std::vector<PayloadTypePtr> elements;
@@ -61,22 +66,6 @@ struct PayloadSchema {
   std::vector<PayloadParameter> parameters;
 };
 
-struct PayloadLeaf {
-  std::string path;
-  PayloadScalar scalar{};
-  std::size_t fixedElements{1U};
-  std::vector<std::size_t> shape;
-};
-
-struct PayloadParameterPlan {
-  bool dynamic{};
-  std::vector<PayloadLeaf> leaves;
-};
-
-struct PayloadPlan {
-  std::vector<PayloadParameterPlan> parameters;
-};
-
 [[nodiscard]] bool parsePayloadSchema(std::string_view json,
                                       PayloadSchema &schema,
                                       std::string &error);
@@ -86,10 +75,9 @@ struct PayloadPlan {
 payloadDefaultValue(const PayloadType &type,
                     const std::optional<PayloadDefault> &defaultValue);
 [[nodiscard]] bool encodePayload(const PayloadSchema &schema,
+                                 const onda_payload_plan_t *plan,
                                  const juce::var &values,
                                  std::span<std::byte> destination,
                                  std::size_t &written, std::string &error);
-[[nodiscard]] PayloadPlan makePayloadPlan(const PayloadSchema &schema);
-[[nodiscard]] std::size_t payloadScalarBytes(PayloadScalar scalar) noexcept;
 
 } // namespace onda::plugin

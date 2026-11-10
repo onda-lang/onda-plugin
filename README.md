@@ -6,7 +6,16 @@
 [Onda](https://onda-lang.org) audio programming language in your DAW.
 
 [Pre-built binaries](https://github.com/onda-lang/onda-plugin/releases) are available for Windows, macOS and Linux.
-The macOS VST3 binaries require macOS 14 (Sonoma) or later and are not signed.
+Release builds target Linux x64 with a Debian 12 baseline (glibc 2.36), Windows
+x64 with the Visual Studio 2022 toolchain and static MSVC runtime, and macOS
+arm64 with a minimum deployment target of macOS 14.0.
+
+Release signing status:
+
+- **macOS:** binaries are not signed with an Apple Developer ID and are not notarized. macOS may
+  block downloaded plug-ins until you approve them in **System Settings → Privacy & Security**.
+  See [Apple's instructions](https://support.apple.com/102445).
+- **Windows:** plug-in binaries are not code-signed (Authenticode).
 
 ## Examples
 
@@ -32,6 +41,10 @@ events are optional. `OndaFX` may omit them all. Channels are zero-based, MIDI
 notes use `id = -1`, and velocity, pressure, bend, and CC values use `[0, 1]`.
 Pitch bend is centered at `0.5`.
 
+Each callback accepts up to 4,096 MIDI events and MIDI-controller automation
+points combined. If that limit is exceeded, the plugin discards that MIDI batch
+and releases held host notes. Ordinary parameter and control automation continues.
+
 These optional events provide DAW transport and timing information:
 
 ```onda
@@ -47,8 +60,7 @@ event render_mode(realtime: bool)
 ```
 
 Timing events run at the start of each Onda block, before MIDI and audio.
-Except for `render_mode`, an event is sent only when the DAW supplies its value.
-Initialize any fallback values your program needs, such as a default tempo.
+These events are only sent when the DAW supplies their value.
 
 ## Parameters and automation
 
@@ -60,15 +72,18 @@ program is recompiled.
 Scalar numeric parameters without a declared range appear in **Params** and map to
 DAW slots using a plugin-owned 0–1 control range. Declare an explicit range when
 controls should cover other values, for example `frequency = 440.0 {20.0, 20000.0}`.
+Mapped parameter defaults must be finite. An unsupported default rejects the
+replacement and keeps the previous working program and automation mapping.
 
 Continuous `params` automation follows the DAW's normalized linear curve,
 sampled at the start of each Onda block. Discrete parameters hold the latest
-point at that boundary. 
+point at that boundary.
 
 **Block Size** controls how often params automation updates.
+Sample rate comes from the DAW.
 
-The **Smooth** value only affects changes made in the UI editor. 
-DAW automation normally bypasses smoothing. 
+The **Smooth** value only affects changes made in the UI editor.
+DAW automation bypasses parameter smoothing.
 
 ## Audio inputs and outputs
 
@@ -82,70 +97,72 @@ layout, declare the two main input channels first; subsequent `ins` map to
 `Control 1`, `Control 2`, and so on. See
 [external_control.onda](examples/effects/external_control.onda) for an example.
 
-Each control appears as a named, automatable DAW parameter. Unlike `params`, control input automation is sample-accurate. 
-To supply an external signal, enable and route the corresponding bus through your DAW’s sidechain or auxiliary inputs. 
-The routed signal takes precedence over the parameter value.
-
-Controls start at their declared input default, or zero. Declare an input range
-to set the values covered by automation, which maps linearly to that range.
+Each control appears as a named, automatable DAW parameter. Unlike `params`, control input automation is sample-accurate.
+To supply an external signal, enable and route the corresponding bus through your DAW’s sidechain or auxiliary inputs.
 
 ## Audio buffers
 
 Drop a single supported audio or `.ondabuffer` file onto a buffer card to bind
-or replace its contents. The target card highlights during the drag. **Bind** and
-**Replace** also open a file picker. Supported formats include WAV,
+or replace its contents. Supported formats include WAV,
 AIFF, FLAC, and Ogg Vorbis through JUCE's audio decoders, producing `f32` samples.
-Typed `.ondabuffer` assets preserve `bool`, `i32`, `i64`, `f32`, or `f64` elements,
-including tables. File bindings must be read-only and match the declaration's
+Typed `.ondabuffer` assets preserve `bool`, `i32`, `i64`, `f32`, or `f64` elements.
+File bindings must be read-only and match the declaration's
 element type and channel count. Project assets provide immutable defaults.
-**Clear** unbinds the slot, including a project default, and saves that choice.
-Unbound buffers return neutral values while parameters and controls remain usable.
-
-Binding or clearing a buffer rebuilds the runtime instance using the existing
-compiled program. Linked source and buffer files reload automatically after
-edits. Failed reloads keep the previous working program playing.
 
 Your DAW project saves the program, buffer data, and plugin settings. If linked
 files are unavailable when reopening it, the plugin restores the saved version.
 
 ## Build
 
-Requirements:
-
-- CMake 3.22+, Ninja, and a C++20 compiler
-- Linux editor builds: GTK 3 and WebKitGTK 4.1 development packages
-
-Configure and build the plugins:
+Requires CMake 3.24+, Ninja, and a C++20 compiler. Linux also needs X11,
+Fontconfig, FreeType, and ALSA development packages and a Vulkan driver.
 
 ```sh
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 ```
 
-To run tests:
+The build uses the SDK pinned in `onda-version` and JUCE revision in `juce-version`.
+Each VST3 bundle includes its `onda_ui` library and font notices under
+`Contents/Resources/onda_ui`, so it can be moved as a complete bundle.
+On Windows the renderer is named `onda_ui.bin` to keep DAWs from scanning it as a plugin DLL.
+
+For development against a local Onda checkout, first build its libraries there:
 
 ```sh
-ctest --test-dir build --output-on-failure -L '^(core|native)$'
+cargo build --release -p onda_api -p onda_ui --features onda_ui/ffi
 ```
 
-Native editor tests require a desktop; Linux CI uses `xvfb-run -a`.
-See [test placement and browser setup](tests/README.md) for manual CI and local checks.
-
-Custom builds can change the fixed input, control, output, and parameter-slot counts:
+Then configure this repository with that checkout:
 
 ```sh
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
-  -DONDA_PLUGIN_INPUT_CHANNELS=4 \
-  -DONDA_PLUGIN_CONTROL_INPUTS=8 \
-  -DONDA_PLUGIN_OUTPUT_CHANNELS=8 \
-  -DONDA_PLUGIN_PARAMETER_SLOTS=64
+  -DONDA_DEVELOPMENT_SOURCE_DIR=/path/to/onda
+cmake --build build
 ```
 
-Main and control inputs together must not exceed 64 channels; outputs support
-1 to 64 channels. Set `ONDA_PLUGIN_CONTROL_INPUTS=0` to omit control inputs.
-Parameter slots support counts from 1 to 64, matching the automation bank's capacity.
+`ONDA_GPU_UI_LIBRARY` optionally overrides the UI library path at build or run time.
+An empty build option follows the selected SDK on every configure. Use a
+library/header from the same Onda build when overriding it.
 
-Versions are pinned in [plugin-version](plugin-version),
-[onda-version](onda-version), and [juce-version](juce-version).
-See [architecture](docs/architecture.md) and [test documentation](tests/README.md)
-for implementation and validation details.
+Custom layouts use `ONDA_PLUGIN_INPUT_CHANNELS`, `ONDA_PLUGIN_CONTROL_INPUTS`,
+`ONDA_PLUGIN_OUTPUT_CHANNELS`, and `ONDA_PLUGIN_PARAMETER_SLOTS`. Main and control
+inputs together must not exceed 64; outputs and parameter slots support 1–64.
+Set control inputs to zero to omit those buses.
+
+```sh
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+  -DONDA_PLUGIN_INPUT_CHANNELS=4 -DONDA_PLUGIN_CONTROL_INPUTS=8 \
+  -DONDA_PLUGIN_OUTPUT_CHANNELS=8 -DONDA_PLUGIN_PARAMETER_SLOTS=64
+```
+
+Run the release test groups on a desktop (or under `xvfb-run -a` on Linux):
+
+```sh
+ctest --test-dir build -C Release --output-on-failure -L '^(core|native)$'
+```
+
+`plugin-version` controls the plugin release version.
+See [architecture](docs/architecture.md) for implementation invariants and
+[test contracts](tests/README.md) for CI selections, native editor checks, and
+DAW validation.

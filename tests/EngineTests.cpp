@@ -1017,7 +1017,7 @@ bool exerciseTypedProjectDefaults() {
              waveform->minimums == std::vector<double>{testCase.expected} &&
              waveform->maximums == std::vector<double>{testCase.expected};
     };
-    if (buffers.size() != 1U || buffers[0].loadedFrames != 1 ||
+    if (buffers.size() != 1U || buffers[0].loadedSamples != 1 ||
         buffers[0].loadedChannels != 1 ||
         !close(buffers[0].loadedSampleRate, 48'000.0F) ||
         !buffers[0].loadedPath.empty() || !hasWaveform(*disk.engine))
@@ -1764,10 +1764,12 @@ int exerciseEngineAndWorker() {
 
   const auto expectRejected =
       [&source](const std::string_view text,
-                const std::string_view expectedDiagnostic) {
+                const std::string_view expectedDiagnostic,
+                const onda::plugin::Product product =
+                    onda::plugin::Product::effect) {
         source.writeText(text);
         const auto rejected = onda::plugin::PreparedEngine::build(
-            source.path(), onda::plugin::Product::effect, 48'000.0, 8);
+            source.path(), product, 48'000.0, 8);
         return !rejected.engine && rejected.diagnostic.message.find(
                                        expectedDiagnostic) != std::string::npos;
       };
@@ -1800,6 +1802,31 @@ int exerciseEngineAndWorker() {
                       "sample { out1 = 0.0 }\n",
                       "Canonical MIDI event")) {
     std::cerr << "one-element arrays were accepted as canonical scalars\n";
+    return 1;
+  }
+
+  for (const auto product :
+       {onda::plugin::Product::effect, onda::plugin::Product::instrument}) {
+    if (!expectRejected(R"(
+enum Pitch { Zero; One }
+outs { out1 }
+event note_on(id: i32, channel: i32, key: Pitch, velocity: f32) {}
+event note_off(id: i32, channel: i32, key: i32, velocity: f32) {}
+sample { out1 = 0.0 }
+)",
+                        "Canonical MIDI event", product)) {
+      std::cerr << "an enum was accepted in a canonical MIDI signature\n";
+      return 1;
+    }
+  }
+  if (!expectRejected(R"(
+enum Beats { One; Two }
+outs { out1 }
+event time_signature(numerator: Beats, denominator: i32) {}
+sample { out1 = 0.0 }
+)",
+                      "Canonical host-context event")) {
+    std::cerr << "an enum was accepted in a canonical host-context signature\n";
     return 1;
   }
 
@@ -1847,7 +1874,7 @@ sample { out1 = in1; out2 = in2 }
       unboundBuffer.engine->bufferMappings()[0].channelKind !=
           onda::plugin::BufferChannelKind::fixed ||
       unboundBuffer.engine->bufferMappings()[0].fixedChannels != 2 ||
-      unboundBuffer.engine->bufferMappings()[0].loadedFrames != 0) {
+      unboundBuffer.engine->bufferMappings()[0].loadedSamples != 0) {
     std::cerr << "unbound buffers did not retain neutral processing and metadata: "
               << unboundBuffer.diagnostic.message << '\n';
     return 1;
@@ -1866,7 +1893,7 @@ sample { out1 = in1; out2 = in2 }
   }
   const auto &bufferMetadata = buffered.engine->bufferMappings()[0];
   if (bufferMetadata.loadedPath != audioFile.path() ||
-      bufferMetadata.loadedFrames != 8 || bufferMetadata.loadedChannels != 2 ||
+      bufferMetadata.loadedSamples != 8 || bufferMetadata.loadedChannels != 2 ||
       !close(bufferMetadata.loadedSampleRate, 48'000.0F)) {
     std::cerr << "decoded buffer metadata is incorrect\n";
     return 1;

@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.22)
+cmake_minimum_required(VERSION 3.24)
 
 if(NOT DEFINED ONDA_PLUGIN_VERSION OR ONDA_PLUGIN_VERSION STREQUAL "")
     if(DEFINED ENV{ONDA_PLUGIN_VERSION}
@@ -49,18 +49,27 @@ if(NOT JUCE_REVISION MATCHES "^[0-9a-f]+$" OR
     message(FATAL_ERROR "Invalid JUCE revision '${JUCE_REVISION}'")
 endif()
 
-# The shared run view requires Safari 17, bundled with macOS 14.
+# Floating-point std::to_chars cannot back-deploy to the SDK's macOS 11 baseline.
 if(CMAKE_HOST_APPLE AND NOT DEFINED CMAKE_OSX_DEPLOYMENT_TARGET)
     set(CMAKE_OSX_DEPLOYMENT_TARGET "14.0" CACHE STRING "Minimum macOS version")
 endif()
 project(onda-plugin VERSION "${ONDA_PLUGIN_VERSION}" LANGUAGES C CXX)
+if(APPLE)
+    enable_language(OBJCXX)
+    set(CMAKE_OBJCXX_STANDARD 20)
+    set(CMAKE_OBJCXX_STANDARD_REQUIRED YES)
+    set(CMAKE_OBJCXX_EXTENSIONS OFF)
+    # JUCE's C/C++ visibility settings do not cover Objective-C++ modules.
+    # Keep their helpers private so host/plugin JUCE copies cannot mix state.
+    set(CMAKE_OBJCXX_VISIBILITY_PRESET hidden)
+endif()
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/juce-version"
     "${CMAKE_CURRENT_SOURCE_DIR}/onda-version"
     "${CMAKE_CURRENT_SOURCE_DIR}/plugin-version")
 
 if(APPLE AND CMAKE_OSX_DEPLOYMENT_TARGET VERSION_LESS "14.0")
-    message(FATAL_ERROR "The Onda plugin editor requires macOS 14.0 or later")
+    message(FATAL_ERROR "The Onda plugin requires macOS 14.0 or later")
 endif()
 
 if(MSVC)
@@ -72,7 +81,6 @@ include(FetchContent)
 include(CTest)
 
 option(ONDA_PLUGIN_BUILD_TESTS "Build the C++ plugin tests" ON)
-option(ONDA_PLUGIN_BUILD_BROWSER_TESTS "Register the Node/Playwright browser tests" OFF)
 option(ONDA_PLUGIN_BUILD_VST3_AUDIT "Build the Linux exported-callback auditor" ON)
 set(ONDA_PLUGIN_INPUT_CHANNELS "2" CACHE STRING
     "Number of main audio input channels exposed by each VST3")
@@ -109,7 +117,9 @@ set(ONDA_SDK_ARCHIVE "" CACHE FILEPATH
 set(ONDA_SDK_CHECKSUMS "" CACHE FILEPATH
     "Optional pre-downloaded SHA256SUMS.txt for the pinned Onda release")
 set(ONDA_RELEASE_SOURCE_DIR "" CACHE PATH
-    "Optional checkout of the pinned Onda release, used only for UI resources")
+    "Optional checkout of the pinned Onda release, used for GPU fixtures and font licenses")
+set(ONDA_RELEASE_SOURCE_REVISION "" CACHE STRING
+    "Expected Onda resource commit for an unpublished SDK; empty verifies the release tag")
 set(ONDA_DEVELOPMENT_SOURCE_DIR "" CACHE PATH
     "Use a local Onda checkout and its target/release libraries for development")
 set(ONDA_JUCE_ROOT "" CACHE PATH "Optional local JUCE checkout")
@@ -238,13 +248,9 @@ else()
         "${CMAKE_BINARY_DIR}/_deps/onda-${ONDA_VERSION}-${ONDA_SDK_PLATFORM}")
     set(ONDA_SDK_ROOT
         "${ONDA_SDK_EXTRACT_DIR}/onda-${ONDA_VERSION}-${ONDA_SDK_PLATFORM}")
-    if(NOT EXISTS "${ONDA_SDK_ROOT}/lib/cmake/Onda/OndaConfig.cmake")
-        file(REMOVE_RECURSE "${ONDA_SDK_EXTRACT_DIR}")
-        file(MAKE_DIRECTORY "${ONDA_SDK_EXTRACT_DIR}")
-        file(ARCHIVE_EXTRACT
-            INPUT "${ONDA_SDK_ARCHIVE}"
-            DESTINATION "${ONDA_SDK_EXTRACT_DIR}")
-    endif()
+    include(cmake/OndaSdkArchive.cmake)
+    onda_extract_sdk_archive("${ONDA_SDK_ARCHIVE}"
+        "${ONDA_SDK_ARCHIVE_SHA256}" "${ONDA_SDK_ROOT}")
 
     if(NOT ONDA_RELEASE_SOURCE_DIR)
         FetchContent_Declare(
@@ -258,8 +264,18 @@ else()
         set(ONDA_RELEASE_SOURCE_DIR "${ondareleasesource_SOURCE_DIR}")
     endif()
 
+    if(ONDA_RELEASE_SOURCE_REVISION)
+        string(LENGTH "${ONDA_RELEASE_SOURCE_REVISION}" onda_revision_length)
+        if(NOT ONDA_RELEASE_SOURCE_REVISION MATCHES "^[0-9a-f]+$"
+                OR NOT onda_revision_length EQUAL 40)
+            message(FATAL_ERROR "ONDA_RELEASE_SOURCE_REVISION must be a full commit SHA")
+        endif()
+        set(onda_resource_ref "${ONDA_RELEASE_SOURCE_REVISION}")
+    else()
+        set(onda_resource_ref "${ONDA_VERSION}")
+    endif()
     execute_process(
-        COMMAND git rev-parse "${ONDA_VERSION}^{commit}"
+        COMMAND git rev-parse "${onda_resource_ref}^{commit}"
         WORKING_DIRECTORY "${ONDA_RELEASE_SOURCE_DIR}"
         OUTPUT_VARIABLE ONDA_RELEASE_TAG_REVISION
         OUTPUT_STRIP_TRAILING_WHITESPACE
@@ -274,7 +290,7 @@ else()
             OR NOT ONDA_RELEASE_HEAD_GIT_RESULT EQUAL 0
             OR NOT ONDA_RELEASE_SOURCE_HEAD STREQUAL ONDA_RELEASE_TAG_REVISION)
         message(FATAL_ERROR
-            "Onda release resources are not at tag ${ONDA_VERSION}: "
+            "Onda resources are not at ${onda_resource_ref}: "
             "got ${ONDA_RELEASE_SOURCE_HEAD}")
     endif()
 
@@ -334,22 +350,31 @@ endif()
 
 include(cmake/OndaVst3Automation.cmake)
 include(cmake/OndaJuceXEmbed.cmake)
-include(cmake/OndaJuceBrowser.cmake)
-if(MSVC)
-    # MSVC /O2 and /Ox can break JUCE's WebView2 COM callbacks. Source options
-    # follow target options, so only this JUCE compilation unit uses /O1 and
-    # stays outside link-time optimization.
-    # https://github.com/juce-framework/JUCE/issues/1642
-    set_property(SOURCE
-        "${onda_browser_module_patched}"
-        APPEND PROPERTY COMPILE_OPTIONS
-        "$<$<NOT:$<CONFIG:Debug>>:/O1>"
-        "$<$<CONFIG:Release>:/GL->")
-endif()
+include(cmake/OndaJuceGuiBasics.cmake)
 
 function(onda_treat_juce_headers_as_system target)
     target_include_directories(${target} SYSTEM PRIVATE
         "${ONDA_JUCE_SOURCE_DIR}/modules")
+endfunction()
+
+if(WIN32)
+    set(ONDA_GPU_SURFACE_SOURCE src/NativeGpuSurface_windows.cpp)
+elseif(APPLE)
+    set(ONDA_GPU_SURFACE_SOURCE src/NativeGpuSurface_mac.mm)
+else()
+    find_package(X11 REQUIRED COMPONENTS Xext)
+    set(ONDA_GPU_SURFACE_SOURCE src/NativeGpuSurface_linux.cpp)
+endif()
+
+function(onda_add_gpu_view target)
+    target_sources(${target} PRIVATE src/GpuView.cpp src/GpuView.h
+        src/GpuTextInput.cpp src/NativeGpuSurface.h ${ONDA_GPU_SURFACE_SOURCE})
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        target_link_libraries(${target} PRIVATE X11::X11 X11::Xext)
+    elseif(APPLE)
+        target_compile_definitions(${target} PRIVATE
+            ONDA_GPU_NS_VIEW_CLASS=${target}GpuSurfaceView)
+    endif()
 endfunction()
 
 add_library(onda_lto_flags INTERFACE)
@@ -389,28 +414,6 @@ file(COPY
     "${ONDA_SDK_ROOT}/licenses"
     DESTINATION "${ONDA_RELEASE_LICENSE_DIR}/Onda")
 
-if(WIN32)
-    set(ONDA_WEBVIEW2_ROOT "${JUCE_WEBVIEW2_PACKAGE_LOCATION}")
-    if(NOT EXISTS "${ONDA_WEBVIEW2_ROOT}/LICENSE.txt")
-        file(GLOB ONDA_WEBVIEW2_LICENSES
-            "${JUCE_WEBVIEW2_PACKAGE_LOCATION}/Microsoft.Web.WebView2.*/LICENSE.txt")
-        list(LENGTH ONDA_WEBVIEW2_LICENSES ONDA_WEBVIEW2_LICENSE_COUNT)
-        if(NOT ONDA_WEBVIEW2_LICENSE_COUNT EQUAL 1)
-            message(FATAL_ERROR
-                "Expected one Microsoft.Web.WebView2 package license under "
-                "${JUCE_WEBVIEW2_PACKAGE_LOCATION}, found "
-                "${ONDA_WEBVIEW2_LICENSE_COUNT}")
-        endif()
-        list(GET ONDA_WEBVIEW2_LICENSES 0 ONDA_WEBVIEW2_LICENSE)
-        get_filename_component(ONDA_WEBVIEW2_ROOT
-            "${ONDA_WEBVIEW2_LICENSE}" DIRECTORY)
-    endif()
-    copy_onda_release_license(
-        "${ONDA_WEBVIEW2_ROOT}/LICENSE.txt" "WebView2-LICENSE.txt")
-    copy_onda_release_license(
-        "${ONDA_WEBVIEW2_ROOT}/NOTICE.txt" "WebView2-NOTICE.txt")
-endif()
-
 copy_onda_release_license("${ONDA_JUCE_SOURCE_DIR}/LICENSE.md" "JUCE-LICENSE.md")
 copy_onda_release_license(
     "${ONDA_JUCE_SOURCE_DIR}/modules/juce_audio_processors_headless/format_types/VST3_SDK/LICENSE.txt"
@@ -437,16 +440,7 @@ copy_onda_release_license(
     "${ONDA_JUCE_SOURCE_DIR}/modules/juce_graphics/unicode/sheenbidi/LICENSE"
     "SheenBidi-LICENSE.txt")
 
-include(cmake/OndaRunView.cmake)
-juce_add_binary_data(onda_run_resources
-    NAMESPACE OndaRunResources
-    HEADER_NAME OndaRunResources.h
-    SOURCES
-        "${ONDA_RELEASE_SOURCE_DIR}/ui/run/run.html"
-        "${onda_buffers_script}"
-        "${ONDA_RELEASE_SOURCE_DIR}/ui/number-input.js"
-        "${ONDA_RELEASE_SOURCE_DIR}/packages/onda_processor_abi/src/param-control.js"
-)
+include(cmake/OndaGpuUiLibrary.cmake)
 
 add_library(onda_plugin_engine STATIC
     src/ParameterAutomation.cpp
@@ -463,6 +457,8 @@ add_library(onda_plugin_engine STATIC
     src/BufferWaveform.h
     src/Engine.cpp
     src/Engine.h
+    src/EnumMetadata.cpp
+    src/EnumMetadata.h
     src/EventPayload.cpp
     src/EventPayload.h
     src/FilesystemWatcher.cpp
@@ -493,8 +489,8 @@ target_compile_definitions(onda_plugin_engine PUBLIC
     ONDA_PLUGIN_OUTPUT_CHANNELS=${ONDA_PLUGIN_OUTPUT_CHANNELS}
     ONDA_PLUGIN_PARAMETER_SLOTS=${ONDA_PLUGIN_PARAMETER_SLOTS}
 )
-# Keep engine, codec, and embedded-resource symbols private to each module.
-set_target_properties(onda_plugin_engine onda_run_resources PROPERTIES
+# Keep engine and codec symbols private to each module.
+set_target_properties(onda_plugin_engine PROPERTIES
     CXX_EXTENSIONS OFF
     CXX_VISIBILITY_PRESET hidden
     VISIBILITY_INLINES_HIDDEN YES
@@ -523,8 +519,6 @@ function(add_onda_plugin target product_name plugin_code is_synth)
         NEEDS_MIDI_OUTPUT FALSE
         IS_MIDI_EFFECT FALSE
         COPY_PLUGIN_AFTER_BUILD FALSE
-        NEEDS_WEB_BROWSER TRUE
-        NEEDS_WEBVIEW2 TRUE
     )
     juce_generate_juce_header(${target})
     target_sources(${target} PRIVATE
@@ -543,12 +537,26 @@ function(add_onda_plugin target product_name plugin_code is_synth)
         src/StateFormat.h
         src/SpscQueue.h
     )
+    onda_add_gpu_view(${target})
+    target_include_directories(${target} PRIVATE "${ONDA_SDK_ROOT}/include")
+    target_compile_definitions(${target} PRIVATE
+        ONDA_GPU_UI_LIBRARY_NAME="${ONDA_GPU_UI_LIBRARY_NAME}")
+    set(onda_gpu_resources "$<TARGET_FILE_DIR:${target}_VST3>/../Resources/onda_ui")
+    file(GLOB onda_gpu_font_notices CONFIGURE_DEPENDS "${ONDA_RELEASE_SOURCE_DIR}/assets/fonts/OFL-*.txt")
+    add_custom_command(TARGET ${target}_VST3 POST_BUILD
+        COMMAND "${CMAKE_COMMAND}" -E rm -rf "${onda_gpu_resources}"
+        COMMAND "${CMAKE_COMMAND}" -E make_directory "${onda_gpu_resources}"
+        COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+            "${ONDA_GPU_UI_LIBRARY}" "${onda_gpu_resources}/${ONDA_GPU_UI_LIBRARY_NAME}"
+        COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+            ${onda_gpu_font_notices} "${onda_gpu_resources}"
+        VERBATIM)
+    set_property(TARGET ${target}_VST3 APPEND PROPERTY LINK_DEPENDS
+        "${ONDA_GPU_UI_LIBRARY}" ${onda_gpu_font_notices})
     target_link_libraries(${target} PRIVATE
         onda_plugin_engine
-        onda_run_resources
         juce::juce_audio_formats
         juce::juce_audio_processors
-        juce::juce_gui_extra
         juce::juce_audio_plugin_client
         juce::juce_recommended_config_flags
         juce::juce_recommended_warning_flags
@@ -556,10 +564,9 @@ function(add_onda_plugin target product_name plugin_code is_synth)
     )
     onda_treat_juce_headers_as_system(${target})
     target_compile_definitions(${target} PRIVATE
-        JUCE_WEB_BROWSER=1
+        JUCE_WEB_BROWSER=0
         JUCE_USE_CURL=0
         JUCE_VST3_CAN_REPLACE_VST2=0
-        JUCE_USE_WIN_WEBVIEW2_WITH_STATIC_LINKING=1
     )
     target_compile_features(${target} PRIVATE cxx_std_20)
 endfunction()
@@ -573,13 +580,6 @@ add_onda_plugin(OndaFX "OndaFX" Oefx FALSE
     Fx)
 target_compile_definitions(OndaFX PRIVATE
     ONDA_PLUGIN_PRODUCT_EFFECT=1)
-
-# JUCE shares one generated Linux web-browser subprocess source between all
-# targets in this directory. Unix Makefiles can otherwise invoke its generator
-# concurrently for both plug-ins and race while renaming the same output file.
-if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-    add_dependencies(OndaFX OndaSynth)
-endif()
 
 if(BUILD_TESTING AND ONDA_PLUGIN_BUILD_TESTS)
     include(cmake/OndaTests.cmake)

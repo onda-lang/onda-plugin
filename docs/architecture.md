@@ -16,9 +16,18 @@ settles to its bypass state. Settled bypass returns main dry input for effects
 and silence for instruments. The scope captures the audible mixed output.
 An immutable presentation snapshot gives mapped slots their compiled Onda
 names, units, defaults, discrete step counts, and ABI-backed plain-value text.
+Enum descriptors are shared by array elements and snapshots. Host value text and
+the shared view use their member labels while DSP and automation retain ordinary
+i32 ordinal conversion. Host text parsing prioritizes exact member labels over
+identifier aliases and case-insensitive matches. VST3 exposes enums as choice
+lists and singleton enums as read-only lists. Member or label changes invalidate
+host presentation even when the numeric domain stays unchanged.
 The worker schedules a message-thread parameter-info notification only when
-that mapping changes; the audio thread never reads presentation metadata. The
-wrapper also exposes the fixed, non-automatable
+that mapping changes; the audio thread never reads presentation metadata.
+Bypass queues update the wrapper-owned boolean atomically. Its message-thread
+timer delivers coalesced listener notifications with host origin, keeping TLS
+initialization and listener locks out of processing and avoiding host edit echoes.
+The wrapper also exposes the fixed, non-automatable
 controller mappings that VST3 requires to deliver pitch bend, channel pressure,
 and CC through JUCE's MIDI buffer.
 
@@ -61,7 +70,7 @@ Construction validates:
 - supplied buffer bindings are Onda-owned immutable project defaults or explicit
   read-only file assets with matching element type and a compatible channel count;
 - canonical MIDI and host-context payload names, order, scalar shapes, and
-  types match;
+  types match, including rejection of nominal enums in primitive arguments;
 - instruments declare exact `note_on` and `note_off` events.
 
 Unbound buffers use Onda's neutral descriptors, matching `onda run`. They do not
@@ -105,9 +114,10 @@ to the latest stored target. New engines, Reset, and pending seeds also settle
 immediately. UI commands, host gestures, and presentation snapshots remain off
 the audio thread; state serializes both sections' settings.
 
-The pinned SDK exposes scalar input defaults but cannot read array defaults.
-An array default overlapping control channels is rejected during preparation;
-arrays without defaults remain valid and disconnected channels receive zero.
+Borrowed SDK descriptors expose scalar and array defaults. Preparation decodes
+each control element from the same packed default bytes used for parameters;
+disconnected channels receive their declared default (zero when absent), clamped
+to the declared range.
 
 Audio files are read and decoded entirely on the worker. Their storage remains
 stable for the lifetime of the prepared engine and is never touched by the
@@ -170,7 +180,9 @@ complete checkpoint takes precedence until its replacement succeeds.
 
 Project export is derived only from that coherent image. Onda owns portable
 path mapping, syntax-aware directive rewriting, manifest construction, and
-typed asset encoding. The plugin writes the returned materialization plan to a
+typed asset encoding. The plugin borrows each materialized file for synchronous export and waveform
+inspection. Explicit buffer clears retain the plan while replacing only the
+manifest bytes. Export writes the returned materialization plan to a
 sibling staging directory, renames it into place, and links the exported
 `.ondaproject` manifest. It does not parse or reproduce the manifest's entry and
 buffer semantics, and it never partially overwrites a project. Every output stream is explicitly
@@ -179,121 +191,106 @@ An export captures its image and request generation before background work
 begins. The worker checks both under its mutex before relinking; a newer user
 request leaves the exported files intact without changing the current project.
 
-`RunViewHost` owns embedded-resource routing and projection of processor state
-into the shared view's host-message schema. `Editor` owns the native browser
-lifetime, periodic publication, and command routing. Processor tests
-exercise the editor lifecycle through JUCE's real browser component; resource
-bytes and capability state are tested directly through `RunViewHost`.
-After the initial schema, parameter and input-control value changes publish a
-`parameterValues` message containing only names, normalized values, and any
-exact plain defaults. The bridge converts values through the existing domains;
-the shared view updates its existing bindings without rendering other sections.
-Worker, routing, settings, and restored-view changes still publish full state.
-The editor accepts native source/project drops and keeps their original paths
-for imports and live reload. Build copies of JUCE forward macOS webview drops
-and GTK subprocess drops to the browser's `FileDragAndDropTarget`. The GTK IPC
-decoder and JavaScriptCore callbacks read UTF-8 explicitly so filenames survive
-both directions of the subprocess boundary.
-Windows accepts DOM file drops through WebView2's additional-object messages,
-then reads their native `ICoreWebView2File` paths.
-Native drag positions and paths reach the shared buffer view as `bufferFileDrag`
-messages. It highlights the card under the cursor and emits `bindBufferFile`
-on a single supported audio or `.ondabuffer` drop. The editor validates the
-named buffer and absolute file path before using the same binding path as the
-file picker. Both use extensions from the registered audio decoders. A build
-adaptation makes the pinned buffer view delegate its format policy to the host,
-which receives that same extension list from native code.
-The shared run view, buffer cards, and number widget are embedded directly from
-the pinned Onda release sources; their fixes and behavior live upstream. Host publications
-and unedited blur retain plain values without applying the editor's range or
-step grid. Exact `i64` defaults cross
-the bridge as decimal text, preserving all 64 bits through display and focus.
-User edits still apply the control domain before normalized host conversion.
-Device-popover queries check selector support because REAPER's embedded WebKit
-can disable popovers. Unavailable device panels are hidden in their entirety,
-so an inert popover cannot appear as an empty floating panel. Layout toggle
-buttons center their labels explicitly, including when text exceeds the padded
-content width.
-Numeric fields display decimal dots independently of regional settings, while
-retaining native arithmetic for arrow-key steps and editing constraints.
-Worker failures are reported explicitly, independently of their status text.
-Waiting and retrying states leave the view's error empty, so restoration retains
-saved event arguments until their compiled schema arrives.
-The browser bridge ends DAW parameter gestures when a control is removed,
-its metadata changes, or another program is selected. Cancellation sends an
-`endParamGesture` command without writing a value; ordinary host automation
-updates retain ongoing gestures.
-Windows explicitly uses WebView2 with a writable per-user data folder, and its
-editor lifecycle test requires the native browser's ready handshake.
-The editor publishes its initial state on `webviewReady` and keeps the loading
-overlay until the shared view responds with `runViewReady`, after rendering the
-host state and restoring saved controls and the document scroll position.
-Each restore carries a `readyId` so an acknowledgment from an older render
-cannot uncover a newer one.
+## Native editor
 
-The view lists user-defined events but omits the canonical `plugin_midi` and
-`plugin_host` families, which the host drives. The host consumes Onda's
-recursive event schemas, including nested structs, tuples, fixed arrays, and
-struct slices. Arguments are validated and packed into Onda's little-endian
-structure-of-arrays wire format on the message thread before entering a bounded
-SPSC queue. Each callback consumes at most eight user events, bounding work even
-while the message thread submits more. Onda's flat event-tensor metadata is
-checked against the recursive schema plan when an engine is prepared. The native
-borrowed-view entry point is not used because values cross both UI/audio threads
-and the queue; the packed entry keeps ownership explicit and dispatch
-allocation-free. The callback dispatches events at its next boundary without
-allocation or locking; payload
-rejection returns an empty execution-output batch and remains non-fatal, while
-handler safety failures quarantine the engine. Structured delegate records are
-decoded from the same schema into the runtime log. A build generation on every
-command prevents stale event indices from crossing an engine replacement.
-The bridge carries the generation of the rendered event schema as decimal text
-to preserve all 64 bits. The processor rejects a stale generation before event
-lookup or payload encoding, and the callback checks it again before dispatch.
-Automatic filesystem reloads advance this generation as well as explicit
-requests. The worker atomically replaces and destroys an unconsumed queued
-engine, so a suspended host cannot cause repeated compilation or prevent
-preparation from completing.
-Each published engine owns an immutable snapshot of its interface and project
-checkpoint. The worker keeps weak references to these snapshots and selects
-the audio thread's active generation when retaining a previous engine after a
-failed reload. This preserves the matching checkpoint even if adoption overlaps
-another build. Snapshot copying and destruction stay off the audio thread.
+`RunViewHost` projects processor state into the shared
+[UI host protocol](https://github.com/onda-lang/onda/blob/main/docs/ui-api.md).
+`Editor` routes commands and publications; `GpuView` loads `onda_ui` and owns a
+`NativeGpuSurface`. The Rust library owns screen layout, input policy, and drafts;
+the plugin owns DAW automation, files, persistence, and DSP.
 
-Ordinary view updates send event defaults as metadata without overwriting the
-arguments edited in the browser. A new engine generation initializes the
-arguments; the explicit argument-reset command restores their defaults. Both
-send the shared view's `resetEventArguments` state flag, so even an incomplete
-draft is discarded when the canonical value has not changed. Unchanged event
-controls retain their DOM nodes, focus, and caret across ordinary updates.
-Focused numeric parameter fields retain their drafts until commit or blur;
-leaving a field without committing reconciles the latest host value.
-Log history is included only when its revision changes or a full view refresh
-is requested, so parameter automation does not repeatedly serialize old logs.
+The surface is a dedicated X11 child, HWND, or NSView inside the JUCE peer.
+Only wgpu draws its pixels; input passes through to JUCE for pointer, keyboard,
+IME, cursor, and file-drop handling. Peer/movement/visibility changes keep the
+child attached. Destroy the renderer before the child or its borrowed display.
+The pinned JUCE build notifies child components before desktop peer removal,
+matching peer replacement, so an idle view releases its renderer synchronously.
+JUCE's native scale notifier schedules presentation for idle host zoom/DPI changes
+even when logical bounds stay unchanged; AppKit backing changes also invalidate
+the native child directly.
+Resize and native exposure schedule a draw through JUCE's event
+loop. The child stays hidden until the first frame and hides on rendering errors.
+The 60 Hz editor timer polls processor state; visualization has its own 30 Hz
+publication budget. Input and state changes request a coalesced redraw through
+JUCE's event loop, independently of that polling timer. Sustained input is paced
+at a nominal 60 Hz using the host-owned SDK `FramePacer` timer pair. Creation
+selects `ONDA_UI_MAILBOX_OR_FIFO` to prefer mailbox presentation with FIFO
+fallback; both retain tear-free presentation.
+A maximum frame latency hint of two allows CPU/GPU overlap.
+The renderer has no software frame limit. Parameter commands still drain
+on every event.
+A deferred frame retains its deadline across new input, so the latest value
+draws without more input and idle views stop waking. The UI advances timed
+state without drawing and reports its next wakeup delay. A one-shot view timer
+services that deadline, including deferred persistence that needs no frame, and
+bounded retries for temporarily unavailable presentation. Hidden views cancel
+their wakeups; exposure forces presentation even when UI state is unchanged.
 
-Editor dimensions and the parameter-control layout are processor-owned UI
-state. Changes notify the host that non-parameter state is dirty, are serialized
-with the project, and are restored before a recreated editor installs its size
-constraints. The browser bridge projects the saved layout into the shared view
-instead of relying on webview-local storage. Coherent project-image publication,
-buffer changes, export relinking, and unload also notify the host that saved
-state changed. Identical recompilation and initial host-state restoration do not
-mark the host dirty. Project-state notifications are delivered by the
-message-thread timer.
-
-The shared view reports its page and log scroll positions, keyboard octave and
-velocity, section and argument folds, and event argument drafts as one bounded
-snapshot.
-The processor retains that snapshot per plugin instance, serializes it with the
-project, and includes it with the first state sent to each recreated browser or
-after a host state restore in an open editor.
-Event values are matched to their source path and argument schema when restored;
-audio parameters remain owned by the processor and host automation.
+Parameter and input-control values use `parameterValues` after the initial
+schema. The shared Rust UI converts normalized values using published domain
+metadata; exact scalar values can override them, with `i64` carried as decimal
+text. Worker, routing, structural settings, and restored-view changes publish full
+state. Smoothing changes acknowledge only the accepted durations and current
+error; they do not rebuild or resend interface metadata.
+Log history publishes only when its revision changes or a full refresh is needed.
 
 The editor's revision check is lock-free, and the processor timer avoids worker
 and preparation mutexes while there is no pending seed, block-size change, or
 runtime recovery. Runtime-log draining similarly returns after an atomic
 activity check when no output was produced.
+
+Source/project drops retain filesystem paths for imports and live reload. Buffer
+picker/drop paths share host-side format, name, and binding validation.
+
+The host owns sample rate. Block preference and fast math can be changed while
+loaded or unloaded; changing either setting recompiles a loaded program. The DAW
+owns computer MIDI routing, so the editor forwards unused keys and omits
+computer-key note input.
+JUCE's text interface uses the shared draft/selection/caret geometry. Drain
+commands and refresh text state after input and rendering, and before teardown.
+This ends gestures and resolves drafts while command handlers still exist.
+
+### Event dispatch and restoration
+
+User events exclude the canonical `plugin_midi` and `plugin_host` families driven
+by the host. The message thread validates recursive schemas and packs owned
+little-endian payloads into a bounded SPSC queue. The audio callback consumes at
+most eight user events per callback, without allocation or locking. Invalid
+payloads are non-fatal; handler safety failures quarantine the engine.
+
+Onda's generic `onda_payload_layout` query supplies packed tensor regions and
+slice-prefix offsets. Delegate decoding uses the same SDK tensor metadata and
+`onda_payload_layout_from_bytes` traversal, with region storage prepared once. The UI encoder writes directly into these regions, while
+canonical MIDI/host-context bindings cache their offsets during preparation.
+Packed dispatch retains Onda's enum and integer-range normalization. Event
+metadata snapshots use an aliasing shared pointer to keep each borrowed plan's
+program alive across reloads; queued commands still own their payload bytes.
+
+Event commands carry the rendered engine generation as decimal text. The
+processor rejects stale generations before lookup/encoding, and the callback
+checks again before dispatch. Filesystem reloads advance this generation too.
+New engine generations and explicit argument reset publish `resetEventArguments`;
+ordinary updates preserve edits for matching signatures.
+
+Worker schema readiness stays false during waiting, compilation, and retries,
+then becomes true on success, terminal failure, or unload. Errors are independent
+of status text. A fresh presentation `readyId` restores the same source after
+reparenting or host state restoration without replaying ordinary state echoes.
+Saved event values require the same source and ordered argument schema/defaults.
+
+Editor size and opaque shared presentation snapshots are processor-owned and
+serialized with the project; DSP parameter values remain owned by host automation.
+Presentation changes and coherent project/buffer/export/unload changes notify the
+host of dirty non-parameter state through the message-thread timer. Identical
+recompilation and initial state restoration do not mark the host dirty.
+
+Each published engine owns immutable interface/checkpoint data. The worker
+selects the audio thread's active generation when retaining a previous engine
+after a failed reload. Replacing an unconsumed queued engine cannot strand a
+suspended host; snapshot copying and destruction remain off the audio thread.
+
+## Linked-file watching
+
 The worker uses native filesystem notifications for the exact linked source and
 asset graph, filters unrelated sibling activity, and debounces relevant changes
 for 200 ms before validating contents. Ancestor subscriptions also detect moves
@@ -309,28 +306,42 @@ targeted 1-second disk-validation fallback. Unchanged watch plans retain their h
 subscriptions; recovery adds subscriptions only for previously uncovered roots. Directory and
 file identities force replacement when a subscribed inode changes.
 
-While an editor is showing, the callback writes interleaved output into a bounded,
-lock-free scope ring owned by `Processor`. Reset generations avoid a
-read-modify-write in steady-state processing, and the editor only snapshots
-and publishes the scope after its frame revision changes. The snapshot uses its
-newest 1,024 frames at 20 Hz and publishes them through the shared view's
-separate `scopeData` message. Capturing is disabled when the editor closes or
-JUCE reports it hidden. The callback never allocates, locks, or interacts with
-the browser.
+## Visualization and MIDI ownership
 
-Host note-on/off state is retained per MIDI channel in atomic bitsets and
-published separately as `midiActivity`. Notes remain lit while any host channel holds the corresponding key.
-OndaSynth also accepts the shared keyboard's virtual note commands through a
-bounded SPSC queue, dispatched on MIDI channel 1 at the next callback. Commands
-are scoped to the compiled engine generation. Closing the editor or overflowing
-the queue releases its held notes. Adoption clears the old virtual holds; later
-releases for those holds cannot dispatch note-offs to the replacement engine.
+`Processor` owns per-channel peak atomics and the bounded lock-free waveform
+ring. `Editor` queries clipped meter and scope visibility independently and
+publishes both on one 30 Hz clock. Waveforms use the newest 1,024 frames and
+cross the C boundary as floats; the shared UI reduces them before upload.
+Meter-only capture skips the ring. Hidden/closed editors disable both captures.
+The callback never allocates, locks, or calls UI code for visualization.
+
+Host note state is retained per channel in atomic bitsets and published through
+`midiActivity`; a note stays lit while any host channel holds it. OndaSynth's virtual
+piano notes use a bounded, generation-scoped queue. Editor commands retain the
+generation of the displayed engine; the processor rejects obsolete generations
+before queueing and the audio callback checks again before dispatch. Closing the
+editor or overflowing the queue releases its holds. Engine adoption clears old
+virtual holds, so a late release cannot stop a note in the replacement engine.
 MIDI device selection remains host-owned.
+
+## Processing and automation
+
+Onda leaves floating-point mode setup to its host. Each audio callback calls
+`onda_configure_current_thread_audio_fp_mode` on its executing thread, including
+bypass and fallback. The helper checks the register and enables x86 FTZ/DAZ or
+ARM64 FZ only when needed, preserving other control bits. This handles thread
+migration and host policy changes without a TLS first-use allocation. The
+preparation worker configures its own thread before generated initializers;
+`prepareToPlay` leaves the calling host thread's mode unchanged.
 
 The processor keeps host buffer capacity separate from the compiled Onda block
 size. An instance preference of zero follows the host; a positive preference is
-capped by the host capacity. The unloaded view can change it, and saved state
-restores it before specialization. Host capacity changes resize scratch storage
+capped by the host capacity. Settings can change it while loaded or unloaded,
+and saved state restores it before specialization. Editor preference changes
+retain the working engine until a replacement compiles successfully, including
+after a failed build. The run view reports that engine's compiled block size
+separately from the requested preference; repairing the source retries the
+requested size. Host capacity changes resize scratch storage
 without rebuilding an engine whose sample rate and Onda block size still match.
 The timer prepares replacement dry-input storage in a one-slot handoff. Only
 the audio thread adopts it, at callback entry, and returns the old storage for
@@ -339,7 +350,7 @@ preparation; a larger callback uses fallback until adequate storage is adopted.
 Suspended host preparation can replace and reclaim scratch storage directly.
 
 Fast Math is an instance compilation preference, off in a new instance and
-editable while unloaded. Saved state restores it before specialization. Every
+editable in Settings. Saved state restores it before specialization. Every
 worker request captures the option for both disk and saved-image compilation,
 including automatic reloads and host specialization changes.
 
@@ -554,10 +565,18 @@ effect. Double-precision processing is not advertised. A loaded program advertis
 an infinite VST3 tail because arbitrary DSP may sustain indefinitely; an unloaded
 plugin reports no tail. MIDI filtering rejects unsupported system/SysEx and
 malformed channel packets before constructing an owning JUCE message.
+The exported wrapper filters SysEx before JUCE's VST3 conversion as well.
+One callback accepts at most 4,096 MIDI event-list entries and MIDI-controller
+queue points combined, using storage reserved during preparation. JUCE retains
+conversion and stable event ordering. On overflow, the entire MIDI batch is
+discarded and the processor releases its held host notes before rendering,
+without resetting DSP or changing ordinary parameter/control automation. A
+parameter-only overflow defers those releases until the next audio callback.
 
 Generated runtime safety checks return a positive status through the Onda C
-API. Prepared-instance resets use `onda_init_unchecked` so initializer failures
-also return a status without allocating diagnostics. On failure the callback
+API. Prepared-instance resets use `onda_init_checked`, whose success and failure
+paths return numeric status without allocating diagnostics, then refresh process
+readiness with `onda_prepare_process`. On failure the callback
 restores fallback audio, quarantines the active instance, clears its published
 active generation, and publishes an atomic fault flag. Quarantine belongs to
 the audio-owned engine and does not change the worker's lifecycle deactivation

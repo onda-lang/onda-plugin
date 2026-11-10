@@ -18,6 +18,10 @@ bool smokeParameterConversions(juce::VST3PluginFormatHeadless &format,
                                 const juce::PluginDescription &description,
                                 const juce::File &module);
 
+bool smokeEnumParameters(juce::VST3PluginFormatHeadless &format,
+                         const juce::PluginDescription &description,
+                         const juce::File &module);
+
 bool smokeAutomationNotifications(juce::VST3PluginFormatHeadless &format,
                                   const juce::PluginDescription &description,
                                   const juce::File &module);

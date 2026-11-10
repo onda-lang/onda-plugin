@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <vector>
@@ -14,6 +15,11 @@ namespace onda::plugin {
 struct ScopeSnapshot {
   int channels{};
   std::vector<float> samples;
+};
+
+struct MeterSnapshot {
+  static constexpr std::size_t count = pluginOutputChannels;
+  std::array<float, count> peaks{};
 };
 
 struct ScopeRevision {
@@ -38,13 +44,56 @@ public:
     requestReset();
   }
 
+  void setMeterEnabled(const bool enabled) noexcept {
+    meterEnabled_.store(enabled, std::memory_order_release);
+    clearMeter();
+  }
+
+  void clearMeter() noexcept {
+    for (auto &peak : peaks_)
+      peak.store(0.0f, std::memory_order_relaxed);
+  }
+
+  [[nodiscard]] MeterSnapshot meterSnapshot() noexcept {
+    if (!meterEnabled_.load(std::memory_order_acquire))
+      return {};
+    for (std::size_t i = 0; i < lastMeter_.count; ++i) {
+      // Negative means no new block; a captured zero is genuine silence.
+      const auto peak = peaks_[i].exchange(-1.0f, std::memory_order_relaxed);
+      if (peak >= 0.0f)
+        lastMeter_.peaks[i] = peak;
+    }
+    return lastMeter_;
+  }
+
   void requestReset() noexcept {
+    clearMeter();
     requestedReset_.fetch_add(1U, std::memory_order_release);
   }
 
   void push(const std::array<float *, outputChannels> &channels,
             const int frames) noexcept {
-    if (frames <= 0 || !enabled_.load(std::memory_order_acquire))
+    if (frames <= 0)
+      return;
+    if (meterEnabled_.load(std::memory_order_acquire)) {
+      std::array<float, MeterSnapshot::count> blockPeaks{};
+      for (std::size_t channel = 0; channel < outputChannels; ++channel) {
+        auto &peak = blockPeaks[channel];
+        for (int frame = 0; frame < frames; ++frame) {
+          const auto sample = std::abs(channels[channel][frame]);
+          if (std::isfinite(sample))
+            peak = std::max(peak, sample);
+        }
+      }
+      for (std::size_t i = 0; i < blockPeaks.size(); ++i) {
+        auto previous = peaks_[i].load(std::memory_order_relaxed);
+        while (previous < blockPeaks[i] &&
+               !peaks_[i].compare_exchange_weak(previous, blockPeaks[i],
+                                                std::memory_order_relaxed)) {
+        }
+      }
+    }
+    if (!enabled_.load(std::memory_order_acquire))
       return;
 
     const auto requestedReset = requestedReset_.load(std::memory_order_acquire);
@@ -115,6 +164,9 @@ private:
   std::atomic<std::uint64_t> requestedReset_{};
   std::atomic<std::uint64_t> appliedReset_{};
   std::atomic<bool> enabled_{};
+  std::atomic<bool> meterEnabled_{};
+  std::array<std::atomic<float>, MeterSnapshot::count> peaks_{};
+  MeterSnapshot lastMeter_{}; // Owned by the UI snapshot consumer.
 };
 
 } // namespace onda::plugin

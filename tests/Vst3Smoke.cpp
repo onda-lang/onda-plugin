@@ -4,6 +4,8 @@
 #include "TemporaryDirectory.h"
 #include "TestNumeric.h"
 #include "Vst3TestSupport.h"
+#include "Vst3RealtimeTestSupport.h"
+#include "Vst3InputTests.h"
 #include "Vst3AutomationTests.h"
 #include "ControlInputTestSupport.h"
 
@@ -294,6 +296,13 @@ bool smokeSavedProject(juce::VST3PluginFormatHeadless &format,
     return false;
   if (!checkMetadata(bundle, expected))
     return false;
+  const auto rendererFile = bundle.getChildFile("Contents/Resources/onda_ui")
+                                .getChildFile(ONDA_GPU_UI_LIBRARY_NAME);
+  juce::DynamicLibrary renderer;
+  if (!check(renderer.open(rendererFile.getFullPathName()) &&
+                 renderer.getFunction("onda_ui_create") != nullptr,
+             "Could not load bundled UI renderer: " + rendererFile.getFullPathName()))
+    return false;
 
   juce::OwnedArray<juce::PluginDescription> descriptions;
   format.findAllTypesForFile(descriptions, bundle.getFullPathName());
@@ -408,6 +417,45 @@ bool smokeSavedProject(juce::VST3PluginFormatHeadless &format,
     juce::AudioBuffer<float> audio(channels, 512);
     juce::MidiBuffer midi;
     midi.addEvent(juce::MidiMessage::noteOn(1, 60, 1.0F), 16);
+    // Exercise the exported entry on a thread that has never processed this
+    // module. Executable-linked tests cannot catch lazy shared-library TLS.
+    Steinberg::Vst::IAudioProcessor *raw{};
+    if (target.getVST3Client()->getIComponentPtr()->queryInterface(
+            Steinberg::Vst::IAudioProcessor::iid,
+            reinterpret_cast<void **>(&raw)) != Steinberg::kResultOk) {
+      concurrentProcessingSucceeded.store(false, std::memory_order_relaxed);
+      return;
+    }
+    std::array<float *,
+               static_cast<std::size_t>(ONDA_PLUGIN_INPUT_CHANNELS >
+                                                ONDA_PLUGIN_OUTPUT_CHANNELS
+                                            ? ONDA_PLUGIN_INPUT_CHANNELS
+                                            : ONDA_PLUGIN_OUTPUT_CHANNELS)>
+        pointers{};
+    for (int channel = 0; channel < channels; ++channel)
+      pointers[static_cast<std::size_t>(channel)] =
+          audio.getWritePointer(channel);
+    std::array<Steinberg::Vst::AudioBusBuffers, onda::plugin::pluginInputBuses>
+        inputs{};
+    if constexpr (ONDA_PLUGIN_INPUT_CHANNELS > 0) {
+      inputs[0].numChannels = ONDA_PLUGIN_INPUT_CHANNELS;
+      inputs[0].channelBuffers32 = pointers.data();
+    }
+    Steinberg::Vst::AudioBusBuffers output{};
+    output.numChannels = ONDA_PLUGIN_OUTPUT_CHANNELS;
+    output.channelBuffers32 = pointers.data();
+    Steinberg::Vst::ProcessData data{};
+    data.processMode = Steinberg::Vst::kRealtime;
+    data.symbolicSampleSize = Steinberg::Vst::kSample32;
+    data.numSamples = 512;
+    data.numInputs = onda::plugin::pluginInputBuses;
+    data.numOutputs = 1;
+    data.inputs = inputs.data();
+    data.outputs = &output;
+    audio.clear();
+    if (!smokeFreshBypassCallbacks(target, *raw, data))
+      concurrentProcessingSucceeded.store(false, std::memory_order_relaxed);
+    raw->release();
     for (int iteration = 0; iteration < 100; ++iteration) {
       for (int channel = 0; channel < channels; ++channel)
         std::fill_n(audio.getWritePointer(channel), audio.getNumSamples(),
@@ -435,7 +483,7 @@ bool smokeSavedProject(juce::VST3PluginFormatHeadless &format,
   succeeded &=
       check(concurrentProcessingSucceeded.load(std::memory_order_relaxed),
             description.name +
-                " produced an unsafe fallback with two concurrent instances");
+                " failed concurrent callback audio, FP mode, or realtime checks");
   instance->releaseResources();
   secondInstance->releaseResources();
   succeeded &= check(smokeLoadedProgram(*instance),
@@ -452,6 +500,8 @@ bool smokeSavedProject(juce::VST3PluginFormatHeadless &format,
                      description.name + " smokeControlAutomation failed");
   succeeded &= check(smokeParameterConversions(format, description, module),
                      description.name + " smokeParameterConversions failed");
+  succeeded &= check(smokeEnumParameters(format, description, module),
+                     description.name + " smokeEnumParameters failed");
   succeeded &= check(smokeAutomationNotifications(format, description, module),
                      description.name + " smokeAutomationNotifications failed");
   succeeded &=
@@ -461,6 +511,8 @@ bool smokeSavedProject(juce::VST3PluginFormatHeadless &format,
                      instance->getName() + " control input smoke failed");
   succeeded &= check(smokeBypassTransitions(*instance),
                      description.name + " smokeBypassTransitions failed");
+  succeeded &= check(smokeVst3MidiInput(format, description, module),
+                     description.name + " smokeVst3MidiInput failed");
 
   return succeeded;
 }
@@ -468,6 +520,25 @@ bool smokeSavedProject(juce::VST3PluginFormatHeadless &format,
 } // namespace
 
 int main(const int argc, const char *const *argv) {
+  // Export a preset through the real VST3 wrapper for external DAW checks.
+  // Reuse the same state writer as the other exported-module tests.
+  if (argc == 5 && juce::String(argv[1]) == "--preset") {
+    juce::ScopedJuceInitialiser_GUI juceInitialiser;
+    juce::VST3PluginFormatHeadless format;
+    juce::OwnedArray<juce::PluginDescription> descriptions;
+    format.findAllTypesForFile(descriptions, juce::File(argv[2]).getFullPathName());
+    if (descriptions.size() != 1)
+      return 1;
+    juce::String error;
+    auto instance = format.createInstanceFromDescription(*descriptions[0], 48000.0, 512, error);
+    if (!instance || !instance->getVST3Client()) {
+      std::cerr << error << '\n';
+      return 1;
+    }
+    setOndaProgram(*instance, juce::File(argv[3]));
+    const auto preset = instance->getVST3Client()->getPreset();
+    return !preset.isEmpty() && juce::File(argv[4]).replaceWithData(preset.getData(), preset.getSize()) ? 0 : 1;
+  }
   if (argc != 3) {
     std::cerr << "usage: onda_vst3_smoke <instrument-module> <effect-module>\n";
     return 2;

@@ -9,7 +9,6 @@
 
 #include <algorithm>
 #include <cmath>
-#include <cstring>
 #include <limits>
 #include <map>
 
@@ -51,48 +50,6 @@ BufferWaveformPtr summarize(std::size_t frames, std::size_t channels,
   return result;
 }
 
-template <typename T>
-BufferWaveformPtr typedWaveform(std::span<const std::uint8_t> samples,
-                                const onda_buffer_asset_info_t &info) {
-  if (samples.size() / sizeof(T) / info.channels != info.frames)
-    return {};
-  return summarize(info.frames, info.channels, [samples](std::size_t index) {
-    T value{};
-    std::memcpy(&value, samples.data() + index * sizeof(T), sizeof(T));
-    return static_cast<double>(value);
-  });
-}
-
-BufferWaveformPtr assetWaveform(std::span<const std::uint8_t> encoded) {
-  onda_buffer_asset_info_t info{};
-  OndaDiagnostic diagnostic;
-  const auto size =
-      onda_buffer_asset_decode(encoded.data(), encoded.size(), &info, nullptr,
-                               0, diagnostic.outParameter());
-  if (size <= 0 || info.channels == 0U ||
-      static_cast<std::uint64_t>(size) > std::vector<std::uint8_t>{}.max_size())
-    return {};
-  std::vector<std::uint8_t> samples(static_cast<std::size_t>(size));
-  if (onda_buffer_asset_decode(encoded.data(), encoded.size(), &info,
-                               samples.data(), samples.size(),
-                               diagnostic.outParameter()) != size)
-    return {};
-  switch (info.element_type) {
-  case ONDA_PRIMITIVE_BOOL:
-    return typedWaveform<std::uint8_t>(samples, info);
-  case ONDA_PRIMITIVE_I32:
-    return typedWaveform<std::int32_t>(samples, info);
-  case ONDA_PRIMITIVE_I64:
-    return typedWaveform<std::int64_t>(samples, info);
-  case ONDA_PRIMITIVE_F32:
-    return typedWaveform<float>(samples, info);
-  case ONDA_PRIMITIVE_F64:
-    return typedWaveform<double>(samples, info);
-  default:
-    return {};
-  }
-}
-
 } // namespace
 
 BufferWaveformPtr makeBufferWaveform(std::span<const float> samples,
@@ -130,13 +87,17 @@ BufferWaveforms projectBufferWaveforms(const ProjectImage &image) {
   juce::var manifest;
   Diagnostic diagnostic;
   const auto visited = visitMaterializedProjectFiles(
-      image, diagnostic, [&](MaterializedProjectFile &&file) {
+      image, diagnostic, [&](const MaterializedProjectFile &file) {
         if (file.relativePath == "project.ondaproject") {
           manifest = juce::JSON::parse(juce::String::fromUTF8(
               reinterpret_cast<const char *>(file.bytes.data()),
               static_cast<int>(file.bytes.size())));
         } else if (file.relativePath.extension() == ".ondabuffer") {
-          assets.emplace(file.relativePath, assetWaveform(file.bytes));
+          const auto decoded = decodeAudioFile(file.bytes, file.relativePath);
+          if (decoded.audio)
+            assets.emplace(file.relativePath,
+                           makeBufferWaveform(decoded.audio->samples,
+                                            decoded.audio->channels));
         }
         return true;
       });

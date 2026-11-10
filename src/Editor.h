@@ -4,9 +4,10 @@
 
 #include "ControlValue.h"
 #include "ScopeCapture.h"
+#include "UiPreferences.h"
 
 #include <juce_audio_processors/juce_audio_processors.h>
-#include <juce_gui_extra/juce_gui_extra.h>
+#include <juce_gui_basics/juce_gui_basics.h>
 
 #include <array>
 #include <memory>
@@ -14,6 +15,7 @@
 
 namespace onda::plugin {
 
+class GpuView;
 class Processor;
 enum class ParamControlLayout : std::uint8_t;
 
@@ -34,19 +36,26 @@ public:
 
 private:
   friend struct EditorTestAccess;
-  class Browser;
 
+  bool viewVisible() const;
+  void viewReady();
+  void emitState(juce::var message);
   void timerCallback() override;
   void handleCommand(const juce::var &command);
   void publishFileDrag(const char *phase, const juce::StringArray &files, int x,
                        int y);
   void endParameterGesture(std::size_t index);
   void publishState(bool force);
+  void publishSmoothing();
   void publishMidiActivity(bool force = false);
-  void publishScope(bool force = false);
+  void publishVisualization(bool force = false);
+  void updateTheme();
 
   Processor &processor_;
-  std::unique_ptr<Browser> browser_;
+  UiPreferences preferences_;
+  bool lightTheme_{};
+  std::unique_ptr<GpuView> gpu_;
+  double publishedVisualizationTimeMs_{};
   juce::Label loadingOverlay_;
   std::unique_ptr<juce::FileChooser> fileChooser_;
   std::uint64_t publishedRevision_{};
@@ -70,9 +79,12 @@ private:
   bool hasPublishedMidi_{};
   bool hasPublishedScope_{};
   bool scopeCaptureActive_{};
-  bool browserReady_{};
+  bool meterCaptureActive_{};
+  bool viewReady_{};
   std::array<bool, slotCount + controlCount> activeGestures_{};
   std::string actionError_;
+  // Small settings acknowledgments must not copy the worker's interface snapshot.
+  std::string publishedWorkerError_;
 
   JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(Editor)
 };

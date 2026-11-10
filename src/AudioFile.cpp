@@ -24,8 +24,11 @@ AudioFileResult failure(const std::string &message,
   return result;
 }
 
-AudioFileResult decode(const std::vector<std::uint8_t> &encodedBytes,
-                       const std::filesystem::path &displayPath) {
+} // namespace
+
+AudioFileResult decodeAudioFile(
+    const std::span<const std::uint8_t> encodedBytes,
+    const std::filesystem::path &displayPath) {
   if (encodedBytes.empty())
     return failure("Audio file contains no encoded data", displayPath);
 
@@ -133,8 +136,6 @@ AudioFileResult decode(const std::vector<std::uint8_t> &encodedBytes,
   return result;
 }
 
-} // namespace
-
 AudioFileResult decodeAudioFile(const std::filesystem::path &path) {
   std::error_code error;
   const auto fileBytes = std::filesystem::file_size(path, error);
@@ -151,7 +152,7 @@ AudioFileResult decodeAudioFile(const std::filesystem::path &path) {
               static_cast<std::streamsize>(encodedBytes.size()));
   if (!stream || static_cast<std::size_t>(stream.gcount()) != fileBytes)
     return failure("Could not read the complete audio file", path);
-  return decode(encodedBytes, path);
+  return decodeAudioFile(encodedBytes, path);
 }
 
 const std::vector<std::string> &supportedAudioFileExtensions() {

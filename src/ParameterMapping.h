@@ -1,5 +1,6 @@
 #pragma once
 
+#include "EnumMetadata.h"
 #include "ScalarValue.h"
 
 #include <onda_processor_abi.h>
@@ -28,6 +29,7 @@ struct ParameterMapping {
   std::optional<double> curve;
   std::optional<double> step;
   std::optional<std::int64_t> stepCount;
+  EnumMetadataPtr enumeration;
   bool defaultMayExceedRange{};
 
   onda_processor_param_domain hostDomain() const noexcept {
@@ -118,6 +120,9 @@ struct ParameterMapping {
            equalOptionalDouble(left.curve, right.curve) &&
            equalOptionalDouble(left.step, right.step) &&
            left.stepCount == right.stepCount &&
+           (left.enumeration == right.enumeration ||
+            (left.enumeration && right.enumeration &&
+             *left.enumeration == *right.enumeration)) &&
            left.defaultMayExceedRange == right.defaultMayExceedRange;
   }
 };

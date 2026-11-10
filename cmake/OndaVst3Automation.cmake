@@ -20,13 +20,35 @@ set(onda_vst3_to_normalized_anchor
     "        Vst::ParamValue toNormalized (Vst::ParamValue v) const override  { return v; }")
 set(onda_vst3_steps_anchor
     "                return (Steinberg::int32) (0 < numSteps && numSteps < 0x7fffffff ? numSteps - 1 : 0);")
+set(onda_vst3_flags_anchor
+    "            anyUpdated |= updateParamIfScalarChanged (info.defaultNormalizedValue, (double) param.getDefaultValue());")
+set(onda_vst3_initial_flags_anchor
+    "            if (isBypassParameter)\n                info.flags |= Vst::ParameterInfo::kIsBypass;")
+set(onda_vst3_bypass_factory_anchor
+    "            ownedBypassParameter.reset (new AudioParameterBool (\"byps\", \"Bypass\", false));")
+set(onda_vst3_bypass_value_anchor
+    "                        setValueAndNotifyIfChanged (*param, (float) change->value);")
+set(onda_vst3_parameter_signature_anchor
+    "    void processParameterChanges (Vst::IParameterChanges& paramChanges)")
+set(onda_vst3_parameter_call_anchor
+    "            processParameterChanges (*data.inputParameterChanges);")
+set(onda_vst3_midi_points_anchor
+    "                    for (Steinberg::int32 point = 0; point < numPoints; ++point)")
+set(onda_vst3_midi_events_anchor
+    "            MidiEventList::toMidiBuffer (midiBuffer, *data.inputEvents);\n       #endif")
+set(onda_vst3_midi_storage_anchor "        midiBuffer.ensureSize (2048);")
 string(LENGTH "${onda_vst3_source}" onda_vst3_source_length)
 foreach(anchor IN ITEMS onda_vst3_capture_anchor onda_vst3_publish_anchor
                         onda_vst3_bus_anchor onda_vst3_titles_anchor
                         onda_vst3_endpoint_anchor onda_vst3_controller_write_anchor
                         onda_vst3_controller_edit_anchor
                         onda_vst3_to_plain_anchor onda_vst3_to_normalized_anchor
-                        onda_vst3_steps_anchor)
+                        onda_vst3_steps_anchor onda_vst3_flags_anchor
+                        onda_vst3_initial_flags_anchor
+                        onda_vst3_bypass_factory_anchor onda_vst3_bypass_value_anchor
+                        onda_vst3_parameter_signature_anchor onda_vst3_parameter_call_anchor
+                        onda_vst3_midi_points_anchor onda_vst3_midi_events_anchor
+                        onda_vst3_midi_storage_anchor)
     string(REPLACE "${${anchor}}" "" unmatched "${onda_vst3_source}")
     string(LENGTH "${unmatched}" unmatched_length)
     string(LENGTH "${${anchor}}" anchor_length)
@@ -38,15 +60,37 @@ foreach(anchor IN ITEMS onda_vst3_capture_anchor onda_vst3_publish_anchor
     endif()
 endforeach()
 # Onda publishes managed endpoints atomically and notifies listeners on the
-# message thread. Keep JUCE's original handling for bypass and MIDI mappings.
+# message thread. Bypass uses the same notification origin; JUCE still converts
+# and orders MIDI, within a shared callback budget.
 string(REPLACE "${onda_vst3_endpoint_anchor}"
     "${onda_vst3_endpoint_anchor}\n                if (onda::plugin::vst3OwnsParameter (*pluginInstance, vstParamID))\n                    continue;"
     onda_vst3_source "${onda_vst3_source}")
 string(REPLACE "${onda_vst3_capture_anchor}"
-    "        onda::plugin::ScopedVst3Automation ondaAutomation (*pluginInstance, data);\n\n${onda_vst3_capture_anchor}"
+    "        onda::plugin::ScopedVst3Automation ondaAutomation (*pluginInstance, data);\n        onda::plugin::Vst3MidiInput ondaMidiInput (data.inputEvents);\n\n${onda_vst3_capture_anchor}"
     onda_vst3_source "${onda_vst3_source}")
 string(REPLACE "${onda_vst3_publish_anchor}"
     "            processParameterChanges (*data.inputParameterChanges);\n\n        ondaAutomation.publishTargets();\n\n       #if JucePlugin_WantsMidiInput"
+    onda_vst3_source "${onda_vst3_source}")
+string(REPLACE "${onda_vst3_bypass_factory_anchor}"
+    "            ownedBypassParameter = onda::plugin::makeVst3BypassParameter();"
+    onda_vst3_source "${onda_vst3_source}")
+string(REPLACE "${onda_vst3_bypass_value_anchor}"
+    "                        if (! onda::plugin::vst3SetBypassFromHost (*param, (float) change->value))\n                            setValueAndNotifyIfChanged (*param, (float) change->value);"
+    onda_vst3_source "${onda_vst3_source}")
+string(REPLACE "${onda_vst3_parameter_signature_anchor}"
+    "    void processParameterChanges (Vst::IParameterChanges& paramChanges, onda::plugin::Vst3MidiInput& midiInput)"
+    onda_vst3_source "${onda_vst3_source}")
+string(REPLACE "${onda_vst3_parameter_call_anchor}"
+    "            processParameterChanges (*data.inputParameterChanges, ondaMidiInput);"
+    onda_vst3_source "${onda_vst3_source}")
+string(REPLACE "${onda_vst3_midi_points_anchor}"
+    "                    const auto midiPoints = midiInput.accept (numPoints);\n                    for (Steinberg::int32 point = 0; point < midiPoints; ++point)"
+    onda_vst3_source "${onda_vst3_source}")
+string(REPLACE "${onda_vst3_midi_events_anchor}"
+    "            MidiEventList::toMidiBuffer (midiBuffer, ondaMidiInput);\n       #endif\n\n        if (ondaMidiInput.overflowed())\n        {\n            midiBuffer.clear();\n            onda::plugin::vst3MidiOverflow (*pluginInstance);\n        }"
+    onda_vst3_source "${onda_vst3_source}")
+string(REPLACE "${onda_vst3_midi_storage_anchor}"
+    "        midiBuffer.ensureSize (onda::plugin::Vst3MidiInput::storageBytes);"
     onda_vst3_source "${onda_vst3_source}")
 string(REPLACE "${onda_vst3_bus_anchor}"
     "                toString128 (info.name, onda::plugin::vst3BusName (*pluginInstance, dir == Vst::kInput, index));"
@@ -54,7 +98,7 @@ string(REPLACE "${onda_vst3_bus_anchor}"
 # Onda patch changes have no JUCE program parameter. Still invalidate the
 # host's value cache after plugin-owned defaults reach the controller.
 string(REPLACE "${onda_vst3_titles_anchor}"
-    "        if (details.programChanged)\n            flags |= Vst::kParamValuesChanged;\n\n${onda_vst3_titles_anchor}\n            flags |= Vst::kIoTitlesChanged;"
+    "        if (details.programChanged)\n            flags |= Vst::kParamValuesChanged;\n\n${onda_vst3_titles_anchor}\n            flags |= Vst::kIoTitlesChanged | Vst::kParamTitlesChanged;"
     onda_vst3_source "${onda_vst3_source}")
 # Use the same numeric mapping for controller conversions and DSP.
 string(REPLACE "${onda_vst3_to_plain_anchor}"
@@ -68,6 +112,13 @@ string(REPLACE "${onda_vst3_to_normalized_anchor}"
 string(REPLACE "${onda_vst3_steps_anchor}"
     "                return onda::plugin::vst3ParameterStepCount (param, (Steinberg::int32) (0 < numSteps && numSteps < 0x7fffffff ? numSteps - 1 : 0));"
     onda_vst3_source "${onda_vst3_source}")
+# Choice lists and fixed choices can change when the loaded patch changes.
+string(REPLACE "${onda_vst3_flags_anchor}"
+    "${onda_vst3_flags_anchor}\n            anyUpdated |= updateParamIfScalarChanged (info.flags, onda::plugin::vst3ParameterFlags (param, info.flags));"
+    onda_vst3_source "${onda_vst3_source}")
+string(REPLACE "${onda_vst3_initial_flags_anchor}"
+    "${onda_vst3_initial_flags_anchor}\n            info.flags = onda::plugin::vst3ParameterFlags (param, info.flags);"
+    onda_vst3_source "${onda_vst3_source}")
 # Host endpoints synchronize controller presentation without writing rounded
 # values back to DSP or reporting new plugin edits to the host.
 string(REPLACE "${onda_vst3_controller_write_anchor}"
@@ -76,7 +127,7 @@ string(REPLACE "${onda_vst3_controller_write_anchor}"
 string(REPLACE "${onda_vst3_controller_edit_anchor}"
     "            if (! onda::plugin::vst3IsHostParameterNotification (audioProcessor->getParamForVSTParamID (vstParamId)))\n                performEdit (vstParamId, newValue);"
     onda_vst3_source "${onda_vst3_source}")
-string(PREPEND onda_vst3_source "#include \"Vst3Automation.h\"\n")
+string(PREPEND onda_vst3_source "#include \"Vst3Automation.h\"\n#include \"Vst3MidiInput.h\"\n")
 # JUCE uses an Objective-C++ compilation unit on macOS that includes the C++
 # wrapper. Preserve its language when replacing it with the patched source.
 set(onda_vst3_extension cpp)

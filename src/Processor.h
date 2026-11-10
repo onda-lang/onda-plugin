@@ -73,7 +73,7 @@ public:
   ~Processor() override;
 
   void prepareToPlay(double sampleRate, int maximumBlockSize) override;
-  void releaseResources() override {}
+  void releaseResources() override;
   void reset() override;
   [[nodiscard]] bool
   isBusesLayoutSupported(const BusesLayout &layouts) const override;
@@ -130,11 +130,15 @@ public:
   [[nodiscard]] RuntimeLogSnapshot runtimeLogSnapshot() const;
   [[nodiscard]] std::uint64_t runtimeLogRevision() const noexcept;
   [[nodiscard]] MidiActivitySnapshot midiActivitySnapshot() const noexcept;
-  // Called on the message thread; notes are dispatched by the audio callback.
-  void triggerMidiNote(int key, float velocity, bool pressed);
+  // Called on the message thread with the displayed engine's generation;
+  // the audio callback rechecks that identity before dispatching the note.
+  void triggerMidiNote(std::uint64_t generation, int key, float velocity,
+                       bool pressed);
   void releaseKeyboardNotes() noexcept;
   void clearRuntimeLog();
   void setScopeCaptureEnabled(bool enabled) noexcept;
+  void setMeterCaptureEnabled(bool enabled) noexcept;
+  [[nodiscard]] MeterSnapshot meterSnapshot() noexcept;
   [[nodiscard]] ScopeRevision scopeRevision() const noexcept;
   [[nodiscard]] ScopeSnapshot scopeSnapshot() const;
   [[nodiscard]] juce::File lastBrowseDirectory() const;
@@ -156,6 +160,9 @@ public:
   [[nodiscard]] bool ownsHostParameter(std::uint32_t id) const noexcept;
   void publishHostAutomationTargets() noexcept;
   void clearHostAutomation() noexcept;
+  void requestHostNotesOff() noexcept {
+    hostNotesOffRequested_.store(true, std::memory_order_release);
+  }
   [[nodiscard]] juce::String controlInputName(std::size_t index) const;
 
   [[nodiscard]] int preferredBlockSize() const noexcept {
@@ -256,6 +263,7 @@ private:
   SpscSlot<PreparedEngine *> retirements_;
   std::atomic<bool> deactivateRequested_{};
   std::atomic<bool> resetRequested_{};
+  std::atomic<bool> hostNotesOffRequested_{};
   std::atomic<bool> parameterSettleRequested_{};
   std::atomic<bool> runtimeFaulted_{};
   std::atomic<bool> runtimeRecoveryRequested_{};

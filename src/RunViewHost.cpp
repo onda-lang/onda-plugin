@@ -3,31 +3,12 @@
 #include "JucePath.h"
 #include "Processor.h"
 
-#include <OndaRunResources.h>
-
 #include <algorithm>
-#include <array>
-#include <cstddef>
-#include <cstring>
 #include <limits>
 #include <utility>
 
 namespace onda::plugin {
 namespace {
-
-using Resource = juce::WebBrowserComponent::Resource;
-
-Resource utf8Resource(const char *data, const int size, juce::String mime) {
-  constexpr std::array<std::byte, 3U> byteOrderMark{
-      std::byte{0xef}, std::byte{0xbb}, std::byte{0xbf}};
-  Resource result;
-  result.data.resize(byteOrderMark.size() + static_cast<std::size_t>(size));
-  std::copy(byteOrderMark.begin(), byteOrderMark.end(), result.data.begin());
-  std::memcpy(result.data.data() + byteOrderMark.size(), data,
-              static_cast<std::size_t>(size));
-  result.mimeType = std::move(mime);
-  return result;
-}
 
 juce::var object() { return juce::var{new juce::DynamicObject}; }
 
@@ -57,6 +38,8 @@ void appendParameters(juce::var &state, Processor &processor,
     set(parameter, "label", juce::String(mapping.name));
     set(parameter, "type", juce::String(mapping.type));
     set(parameter, "scalar", true);
+    if (mapping.enumeration)
+      set(parameter, "enumeration", enumMetadataValue(*mapping.enumeration));
     if (!mapping.arrayName.empty()) {
       auto array = object();
       set(array, "name", juce::String(mapping.arrayName));
@@ -153,30 +136,6 @@ void appendRuntimeLog(juce::var &state, const RuntimeLogSnapshot &runtimeLog) {
 
 } // namespace
 
-std::optional<Resource> runViewResource(const juce::String &request) {
-  const auto path = request.upToFirstOccurrenceOf("?", false, false);
-  if (path == "/buffers.js")
-    return utf8Resource(OndaRunResources::buffers_js,
-                        OndaRunResources::buffers_jsSize,
-                        "text/javascript; charset=utf-8");
-  if (path == "/" || path == "/index.html") {
-    return utf8Resource(OndaRunResources::run_html,
-                        OndaRunResources::run_htmlSize,
-                        "text/html; charset=utf-8");
-  }
-  if (path == "/param-control.js") {
-    return utf8Resource(OndaRunResources::paramcontrol_js,
-                        OndaRunResources::paramcontrol_jsSize,
-                        "text/javascript; charset=utf-8");
-  }
-  if (path == "/number-input.js") {
-    return utf8Resource(OndaRunResources::numberinput_js,
-                        OndaRunResources::numberinput_jsSize,
-                        "text/javascript; charset=utf-8");
-  }
-  return std::nullopt;
-}
-
 juce::var makeRunViewState(Processor &processor, const WorkerStatus &status,
                            const bool canExportProject,
                            const std::string &actionError,
@@ -185,6 +144,7 @@ juce::var makeRunViewState(Processor &processor, const WorkerStatus &status,
   auto state = object();
   set(state, "running", status.active);
   set(state, "connected", status.active);
+  set(state, "schemaReady", status.schemaReady);
   // Use decimal text to preserve the full generation through JavaScript.
   set(state, "engineGeneration",
       juce::String(std::to_string(status.engineGeneration)));
@@ -224,6 +184,7 @@ juce::var makeRunViewState(Processor &processor, const WorkerStatus &status,
   set(state, "midi", std::move(midi));
   set(state, "midiKeyboardInteractive",
       processor.product() == Product::instrument && noteOn && noteOff);
+  set(state, "showComputerKeyLabels", false);
   set(state, "midiInputDevices", juce::Array<juce::var>{});
   set(state, "currentMidiInputDevice", juce::var{});
   set(state, "paramLayout",
@@ -231,7 +192,8 @@ juce::var makeRunViewState(Processor &processor, const WorkerStatus &status,
           ? juce::String{"knobs"}
           : juce::String{"sliders"});
   set(state, "sampleRateHz", processor.hostSampleRate());
-  set(state, "blockSamples", processor.ondaBlockSize());
+  set(state, "blockSamples",
+      status.blockSize > 0 ? status.blockSize : processor.ondaBlockSize());
 
   if (includeRuntimeLog)
     appendRuntimeLog(state, processor.runtimeLogSnapshot());
@@ -257,9 +219,9 @@ juce::var makeRunViewState(Processor &processor, const WorkerStatus &status,
     set(buffer, "loadedPath",
         mapping.loadedPath.empty() ? juce::var{}
                                    : juce::var{pathToJuce(mapping.loadedPath)});
-    const auto loaded = mapping.loadedFrames > 0 && mapping.loadedChannels > 0;
-    set(buffer, "loadedFrames",
-        loaded ? juce::var{mapping.loadedFrames} : juce::var{});
+    const auto loaded = mapping.loadedSamples > 0 && mapping.loadedChannels > 0;
+    set(buffer, "loadedSamples",
+        loaded ? juce::var{mapping.loadedSamples} : juce::var{});
     set(buffer, "loadedChannels",
         loaded ? juce::var{mapping.loadedChannels} : juce::var{});
     set(buffer, "loadedSampleRate",
@@ -345,6 +307,28 @@ juce::var makeRunViewState(Processor &processor, const WorkerStatus &status,
   return message;
 }
 
+juce::var makeRunViewLog(Processor &processor) {
+  auto state = object();
+  appendRuntimeLog(state, processor.runtimeLogSnapshot());
+  auto message = object();
+  set(message, "type", "state");
+  set(message, "state", std::move(state));
+  return message;
+}
+
+juce::var makeRunViewSmoothing(const double parameterSeconds,
+                               const double inputControlSeconds,
+                               const std::string &error) {
+  auto state = object();
+  set(state, "paramSmoothingMs", parameterSeconds * 1000.0);
+  set(state, "inputControlSmoothingMs", inputControlSeconds * 1000.0);
+  set(state, "error", juce::String(error));
+  auto message = object();
+  set(message, "type", "state");
+  set(message, "state", std::move(state));
+  return message;
+}
+
 juce::var makeRunViewParameterValues(Processor &processor,
                                      const WorkerStatus &status) {
   auto state = object();
@@ -352,20 +336,6 @@ juce::var makeRunViewParameterValues(Processor &processor,
   auto message = object();
   set(message, "type", "parameterValues");
   set(message, "state", std::move(state));
-  return message;
-}
-
-juce::var makeRunViewScope(Processor &processor) {
-  const auto snapshot = processor.scopeSnapshot();
-  juce::Array<juce::var> samples;
-  samples.ensureStorageAllocated(static_cast<int>(snapshot.samples.size()));
-  for (const auto sample : snapshot.samples)
-    samples.add(sample);
-
-  auto message = object();
-  set(message, "type", "scopeData");
-  set(message, "channels", snapshot.channels);
-  set(message, "samples", std::move(samples));
   return message;
 }
 

@@ -7,7 +7,7 @@
 #include "TemporaryDirectory.h"
 #include "TestNumeric.h"
 #include "TestWait.h"
-#include "Vst3RealtimeAudit.h"
+#include "Vst3RealtimeTestSupport.h"
 #include "Vst3TestSupport.h"
 #include "Vst3ControllerTestSupport.h"
 
@@ -31,35 +31,7 @@ using vst3_test::HostInterface;
 using vst3_test::ObservedController;
 using vst3_test::ReleaseInterface;
 
-tresult processRealtime(Vst::IAudioProcessor &processor,
-                        Vst::ProcessData &data) {
-#if defined(__linux__)
-  static const auto begin = reinterpret_cast<decltype(&onda_vst3_audit_begin)>(
-      dlsym(RTLD_DEFAULT, "onda_vst3_audit_begin"));
-  static const auto end = reinterpret_cast<decltype(&onda_vst3_audit_end)>(
-      dlsym(RTLD_DEFAULT, "onda_vst3_audit_end"));
-  if (begin != nullptr && end != nullptr) {
-    begin();
-    const auto result = processor.process(data);
-    Vst3RealtimeCounts counts;
-    end(&counts);
-    // JUCE retains one callback mutex. Managed automation must add no locks,
-    // allocations or frees, including queue flushes and MIDI segment splits.
-    if (counts.hasViolations(1)) {
-      std::cerr << "VST3 realtime audit: " << counts.locks << " locks, "
-                << counts.allocations << " allocations, " << counts.frees
-                << " frees\n";
-      return kResultFalse;
-    }
-    return result;
-  }
-  if (std::getenv("ONDA_REQUIRE_VST3_AUDIT") != nullptr) {
-    std::cerr << "VST3 realtime audit library was not loaded\n";
-    return kResultFalse;
-  }
-#endif
-  return processor.process(data);
-}
+using vst3_test::processRealtime;
 
 struct Point {
   int32 offset;

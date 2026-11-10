@@ -5,6 +5,7 @@
 namespace onda::plugin {
 
 struct EditorTestAccess {
+  static void tick(Editor &editor) { editor.timerCallback(); }
   static void command(Editor &editor, const juce::var &command) {
     editor.handleCommand(command);
   }

@@ -82,7 +82,8 @@ bool check(Product product, const char *type) {
   }
   auto compiled =
       compileFile(pathFromJuce(source.getFullPathName()), 1000.0, 8);
-  if (!compiled.program || onda_param_has_range(compiled.program.get(), 0) != 0)
+  const auto *info = onda_param_info(compiled.program.get(), 0);
+  if (info == nullptr || info->has_range != 0)
     return false;
 
   const auto discrete =
@@ -186,6 +187,67 @@ bool authoredDefault(Product product) {
   const auto value = (*state["params"].getArray())[0]["value"];
   return (value.isVoid() || value == juce::var{1.0}) &&
          roundTrip(processor, product, 1.0F);
+}
+
+bool rejectNonFiniteDefaults(const Product product) {
+  const juce::File source{
+      pathToJuce(testTemporaryRoot() / "nonfinite-parameter-default.onda")};
+  const auto valid = program("test = 0.5; following = 0.25 {0.0, 1.0}");
+  if (!source.replaceWithText(valid))
+    return false;
+  Processor processor(product);
+  processor.loadFile(source);
+  processor.prepareToPlay(1000.0, 8);
+  const auto initial = processor.workerStatus();
+  if (!initial.active || !render(processor, 0.5F))
+    return false;
+
+  struct Case {
+    const char *declaration;
+    const char *name;
+  };
+  const auto arrayIndex = slotCount > 1 ? 1 : 0;
+  const std::array cases{
+      Case{"test: f32 = 0.0 / 0.0", "test"},
+      Case{"test: f64 = 0.0 / 0.0", "test"},
+      Case{"test: f32 = 1.0 / 0.0", "test"},
+      Case{"test: f64 = -1.0 / 0.0", "test"},
+      Case{arrayIndex == 1 ? "test: f32[2] = [0.25, 0.0 / 0.0]"
+                           : "test: f32[1] = [0.0 / 0.0]",
+           arrayIndex == 1 ? "test[1]" : "test[0]"},
+      Case{arrayIndex == 1 ? "test: f64[2] = [0.25, 1.0 / 0.0]"
+                           : "test: f64[1] = [1.0 / 0.0]",
+           arrayIndex == 1 ? "test[1]" : "test[0]"}};
+  for (const auto &test : cases) {
+    if (!source.replaceWithText(program({}, false) + "\nparams { " +
+                                test.declaration +
+                                "; following = 0.25 {0.0, 1.0} }\n"))
+      return false;
+    const auto rejected = PreparedEngine::build(
+        pathFromJuce(source.getFullPathName()), product, 1000.0, 8);
+    if (!rejected.compilation->program || rejected.engine ||
+        rejected.diagnostic.message.find("'" + std::string{test.name} + "'") ==
+            std::string::npos ||
+        rejected.diagnostic.message.find("finite default") == std::string::npos) {
+      std::cerr << "Non-finite default was not rejected explicitly: "
+                << test.declaration << '\n';
+      return false;
+    }
+    processor.requestReload();
+    processor.prepareToPlay(1000.0, 8);
+    const auto retained = processor.workerStatus();
+    if (!retained.hasError || !retained.active ||
+        retained.engineGeneration != initial.engineGeneration ||
+        retained.mappings != initial.mappings || !render(processor, 0.5F)) {
+      std::cerr << "Rejected default changed the active parameter mapping\n";
+      return false;
+    }
+  }
+  if (!source.replaceWithText(valid))
+    return false;
+  processor.requestReload();
+  processor.prepareToPlay(1000.0, 8);
+  return !processor.workerStatus().hasError && render(processor, 0.5F);
 }
 
 bool fullWidthIntegerDefault(const Product product, const char *literal) {
@@ -316,6 +378,8 @@ bool exerciseUnrangedParameters() {
       std::cerr << "Unranged parameter authored default failed\n";
       return false;
     }
+    if (!rejectNonFiniteDefaults(product))
+      return false;
     for (const auto *literal : {"9007199254740993", "-9007199254740993",
                                "9223372036854775807", "-9223372036854775808"})
       if (!fullWidthIntegerDefault(product, literal))

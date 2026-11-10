@@ -1,27 +1,44 @@
 # Test contracts
 
-`onda_watcher_tests` exercises the native notification backend without JUCE or the compiler.
-It covers missing paths and inode replacement. On Linux it also verifies that fallback retries
-and recovery retain healthy inotify subscriptions.
+## Run locally
 
-Run the release contracts with:
+Configure/build as described in the [root README](../README.md#build), then run:
 
 ```sh
 ctest --test-dir build -C Release --output-on-failure -L '^(core|native)$'
 ```
 
-Native editor checks require a desktop. Linux CI supplies an X11 display with
-`xvfb-run -a`; a local desktop also works. The processor executable uses
-`juce_add_console_app` for the Windows console entry point and normal JUCE
-message-loop and WebKit subprocess startup.
+Native checks require a desktop. Linux CI uses `xvfb-run -a`; a local X11 desktop
+also works. Use the `core` label for tests that do not require a native surface.
+Native scheduling checks wait for bounded completion and verify a return to
+idle; OS exposure events and transient swapchains can add presentation attempts.
+
+`AudioThreadFpMode` verifies SDK FP setup for worker initialization and callbacks,
+including bypass, thread migration, multiple instances, and host mode changes.
+The exported VST3 audit also checks untouched processing threads before warmup,
+catching dynamic-library TLS allocation that executable-linked tests cannot. It
+audits first and subsequent callbacks for allocations and locks, and checks that
+preparation leaves the calling host thread's mode unchanged.
+Those first callbacks include actual bypass queues. Exported input regressions
+also check audible bypass transitions and deferred controller delivery without
+host edit echoes; dense notes and CC curves through the 4,096-entry shared MIDI
+budget; overflow in either source and their combination; release of held notes
+and subsequent recovery; and rejection of SysEx before owning-message allocation.
+
+`EventPayloadLayout` verifies exact packed bytes for dynamic and empty slices,
+full-width integers, signed float zeros (including `"-0"` strings in scalar and
+structured values), and rejection before writing when capacity is insufficient.
+It also encodes through a retained event snapshot after its engine is destroyed.
+`StructuredEvents` exercises the encoder through real callbacks with nested
+structs, tuples, arrays, slices, and integer-domain normalization.
 
 | CTest label | Placement and purpose |
 | --- | --- |
 | `core` | All three toolchains: deterministic C++ DSP, state, automation and worker behavior; examples; exported VST3 behavior and protocol validation. |
-| `native` | All three platforms: filesystem notifications, native browser readiness and UI-to-DSP communication, and exported editor attachment/removal. |
-| `browser` | Manual Linux CI or local checks: the injected bridge and detailed DOM behavior in pinned Playwright/Chromium. |
+| `native` | All three platforms: filesystem notifications, native GPU readiness and UI-to-DSP communication, and exported editor attachment/removal. |
 | `audit` | Manual Linux CI or local Linux checks: exported callback interception, gated by the auditor's positive self-tests. |
 | `extended` | Manual CI or local checks: ancestor moves and symlink permutations on Linux/macOS; concurrent state/log stress on all three platforms. |
+| `performance` | Local desktop checks: sustained native slider/knob drags and UI-thread timings. |
 
 Automatic runs of `release.yml` start only on version tags (`vX.Y.Z` or
 `X.Y.Z`) matching `plugin-version`. They build once per platform, run
@@ -39,24 +56,22 @@ a branch such as `main`, a tag such as `0.1.30`, or a full 40-character commit S
 The workflow checks out that source ref, including its tests, and reads
 `plugin-version` from that checkout. Use `main` to test changes since a release;
 an old tag still uses its original tests. Tag/version matching is required for
-automatic releases. Manual runs have read-only repository permissions and do
-not package or publish releases.
-The manual trigger becomes available after this workflow is on the default
-branch, as described in [GitHub's manual workflow documentation](https://docs.github.com/en/actions/how-tos/manage-workflow-runs/manually-run-a-workflow).
+automatic releases. Manual runs have read-only repository permissions and never
+publish a release.
+The `package` selection builds and retains archives as workflow artifacts.
 
 | Test selection | Platforms | Work performed |
 | --- | --- | --- |
-| `browser-audit` (default) | `linux-x64` | Browser and exported callback audit checks, sharing one plugin build. |
-| `browser` | `linux-x64` | Browser checks; skips plugin compilation. |
-| `audit` | `linux-x64` | Exported callback audit and its instrumentation self-tests. |
+| `package` | Any one platform, or `all` | Default builds, `core`/`native`, VST3 validation, and package artifacts; publishing occurs only for a matching version tag. |
+| `audit` (default) | `linux-x64` | Exported callback audit and its instrumentation self-tests. |
 | `extended` | Any one platform, or `all` | Extended filesystem and concurrency cases. |
 | `channels` | `linux-x64` | Builds and validates four additional channel/parameter configurations; skips the default plugin build. |
 | `all` | Any one platform, or `all` | All applicable optional checks; Linux includes the four custom builds. |
 
 The default platform is `linux-x64`. Unsupported test/platform combinations fail
 before dependencies are installed or plugins are built. Validator tooling is
-built only for release runs and Linux channel checks. Failures retain CTest logs,
-browser diagnostics and Windows test executables where available.
+built for package runs and Linux channel checks. Failures retain CTest logs,
+Windows test executables where available.
 
 For example, to check the Windows test changes on `main`:
 
@@ -68,14 +83,12 @@ gh workflow run release.yml --ref main \
 Here `--ref main` selects the workflow definition; `source_ref` selects the
 code and tests to check out. No new version tag or plugin release is needed.
 
-To include the portable browser checks locally:
-
-```sh
-npm ci --prefix tests
-npm exec --prefix tests -- playwright install chromium --only-shell
-cmake -S . -B build -DONDA_PLUGIN_BUILD_BROWSER_TESTS=ON
-ctest --test-dir build --output-on-failure -L '^browser$'
-```
+The reusable `build.yml` also accepts `onda_source_ref` from an Onda integration
+workflow. It verifies unpublished SDK artifacts and resource checkout against
+that commit. Additional channel builds retain the same resource revision pin.
+Onda integration runs can also supply `onda_run_id` to reuse an existing SDK
+build in `onda-lang/onda`. The caller grants `actions: read`; the same source
+and archive checks apply without rebuilding the SDK.
 
 Run extended cases with:
 
@@ -123,33 +136,77 @@ artifacts.
 controls, and events remain published and editable before binding and after
 clearing. Rendered values and the interface survive saving and restoring without
 the source file. `NativeEditor` also loads an unbound-buffer program and edits
-its parameter in the real webview.
+its parameter in the native GPU view.
+
+## Real DAW checks
+
+On Linux, use an isolated X11 display:
+
+```sh
+xvfb-run -a python3 scripts/test-gpu-reaper.py build
+xvfb-run -a python3 scripts/test-gpu-reaper.py build --file-drops
+```
+
+The script uses a temporary REAPER profile and relocated bundles. It checks
+library loading, native edits, DAW automation, resize, reopening, and optional
+source drops. Native edits use keyboard traversal and a fresh clipboard copy to
+verify parameter focus before typing, independently of panel positions.
+Requirements are REAPER, X11/XTest, and ImageMagick. `--nautilus`
+also needs Nautilus and `dbus-run-session` and exercises its actual file drag.
+These are X11 checks; native Wayland-to-X11 drops additionally depend on the
+compositor's bridge and are not established by this suite.
+
+To profile sustained slider and knob drags on Linux, macOS, or Windows:
+
+```sh
+ctest --test-dir build -C Release -R '^onda_gpu_drag_profile$' -V
+```
+
+This optional `performance` check uses the real native view and renderer with
+one parameter and no audio processing. It generates input every 4 ms for two
+seconds per layout, reports edits, frames, render time and longest message-loop
+dispatch, and fails if a dispatch stalls for 100 ms. Run it alone on a desktop;
+other native tests can steal focus and cancel the drag. The executable's
+`--drag-profile-no-present` mode repeats the input with presentation bypassed
+to distinguish rendering cost from input handling. Both modes require the
+`ONDA_GPU_UI_LIBRARY` environment variable when invoked directly; CTest sets it.
+This isolates UI-thread contention; macOS REAPER and WindowServer behavior still
+needs confirmation on macOS.
 
 ## Coverage
 
 | Test | Contract |
 | --- | --- |
+| `onda_sdk_archive_tests` | SDK extraction follows archive contents when reconfiguring, rebuilds consumers despite older archived timestamps, reuses an unchanged archive, and repairs incomplete or unidentified extraction caches. |
+| `onda_gpu_ui_library_tests` | Renderer selection follows development and release SDK changes in one build directory, preserves explicit overrides, and resumes automatic selection when an override is cleared. |
+| `onda_watcher_tests` | Native filesystem notifications, missing paths, inode replacement, and Linux subscription recovery without JUCE/compiler setup. |
+| `onda_scope_capture_{1,2,8,64}_tests` | Per-channel peak retention/reset, non-finite samples, and meter-only capture without waveform writes. |
+| `onda_channel_layout_script_tests` | Linux layout driver preserves the development SDK selection, resource checkout and revision for all configurations, including release-tag mode. |
+| `onda_gpu_ui_tests` | Dedicated native surface, input/IME, host-paced input redraws without polling or delaying parameter commands, final-value presentation, idle wakeups and presentation retries, resize presentation through frame deadlines, reparenting, synchronous renderer release before desktop peer destruction and reattachment without manual ticks, and hide/show. Linux pixels survive JUCE repaints; macOS density and Windows parent-renderer ownership are checked. |
+| `onda_gpu_drag_profile` | Optional native slider/knob drag timings and detection of UI-thread stalls, independent of DAW and DSP work. |
+| `onda_gpu_keyboard_tests` | Surface-free consumed/unused/error distinctions and forwarding unused keys to the DAW. |
+| `onda_gpu_editor_tests` | Smoothing acknowledgments carry accepted values and errors without resending schemas; teardown resolves drafts before handlers die; hidden input suspension and presentation/capture restoration after reparenting. |
 | `onda_example_tests` | Shipped examples compile and render finite, meaningful output. |
 | `onda_plugin_tests` | SDK ownership, DSP and MIDI behavior, buffer decoding, portable checkpoints, project export, worker replacement, file watching, and compiler serialization. Extended watcher permutations run separately. |
 | `onda_buffer_cache_tests` | Source/import edits before buffer binding or clearing, and shared buffer-file edits before rebinding. Uses real preparation and DSP with native notifications withheld to make cache invalidation races deterministic, including edits with unchanged size and modification time. |
 | `onda_processor_tests` | Host preparation, state persistence, defaults and automation, block-rate parameter smoothing, notifications, failure recovery, realtime callbacks, logs, scope/event adapters, editor lifecycle, and concurrent instances. |
-| `onda_native_editor_tests` | Both products: actual native browser handshake, visible file picker on fresh startup, visible checkbox edits reaching DSP, retained state on reopening, and exported `IPlugView` platform support, attachment and removal. |
-| `onda_vst3_smoke` | Built bundles expose expected metadata and parameters, instantiate independently, render through JUCE's VST3 host, and restore a saved program with imports after deleting its original files. Bundle lookup also exercises the Windows layout on other platforms. |
+| `onda_native_editor_tests` | Both products: actual native GPU readiness, source picker on fresh startup, numeric edits reaching DSP, retained state on reopening, and exported `IPlugView` platform support, attachment and removal. |
+| `onda_plugin_symbols_tests` | All platforms: VST3 entry points remain public while JUCE implementation symbols stay private to each plugin module. |
+| `onda_vst3_smoke` | Built bundles load their bundled UI renderer, expose expected metadata and parameters, instantiate independently, render through JUCE's VST3 host, and restore a saved program with imports after deleting its original files. Bundle lookup also exercises the Windows layout on other platforms. |
 | `onda_vst3_realtime_audit_tests` | Linux auditor startup, plugin loading, positive allocation/free/mutex detection, allocator semantics, callback budgets, and independent concurrent audit intervals. |
 | `onda_vst3_realtime` | The exported VST3 behavior checks with Linux allocation and mutex interception enabled, after the auditor's own tests pass. |
-| `onda_editor_bridge_tests` | The injected bridge ends cancelled parameter gestures without writing stale values, retains gestures across automation updates, and stamps events with the exact rendered generation. Enabled with browser tests. |
-| `onda_run_view_parameter_tests` | The shipped view and bridge preserve exact defaults across publications and focus/blur, retain focused drafts, clamp edits, render/clear logs, display monitored MIDI notes, and save/restore scroll position. Visible decimals use dots in an Italian document and arrow keys retain numeric stepping. Layout labels stay centered at narrow and wide editor sizes. Startup, loaded controls, resizing and scrolling also work when the webview rejects popover selectors and does not hide popovers automatically. Enabled with browser tests. |
 | VST3 validators | Steinberg's interface/protocol checks for both products. These complement the behavior checked by the smoke host. |
 
-Run bridge tests directly with `node tests/EditorBridgeTests.mjs`.
-Parameter publication tests also exercise the `parameterValues` path through
-the actual bridge, including exact defaults and focused drafts. `NativeEditor`
-requires real editor writes to publish values without replacing buffer cards.
+Parameter publication tests check exact defaults and focused drafts through
+the native adapter. `NativeEditor` requires real GPU edits to reach the DSP and
+retains values across closing and reopening the editor. It disables parameter
+smoothing so edit-delivery checks do not depend on how many audio samples fit
+between GUI message-loop iterations; dedicated processing tests cover smoothing.
 The `EditorGestureCancellation` processor case checks the native command against
 JUCE's actual value and gesture notifications, including cancellation after a
 newer host automation value.
 `StaleEditorEvents` checks that same-name events with a replacement schema
-reject stale or invalid browser generations and accept the current generation.
+reject stale or invalid UI generations and accept the current generation.
 `ClickableMidiKeyboard` also holds a virtual key across replacement, starts a
 new host note, and checks that releasing the old virtual hold preserves it.
 `HostBypass` checks note presses and releases, virtual-key cancellation, audible
@@ -160,6 +217,15 @@ and exclusion of control buses from dry output. The VST3 smoke host repeats
 those transitions through the exported Bypass parameter. Controller conversion
 tests check exact native discrete counts around JUCE's continuous sentinel and
 saturation at VST3's signed 32-bit limit.
+`EnumParameters` checks labelled scalar and array parameters, singleton slot
+stability, ordinal rendering without realtime allocations, label-only reloads,
+and saved-image restoration. `EnumEventMetadata` checks recursive enum choices
+in struct, array, tuple, and slice event fields while preserving integer payloads.
+The VST3 smoke host also checks value-text conversion, including exact-label
+priority over colliding identifiers and case-insensitive aliases, list/read-only
+flags, label-only refresh notifications, and transitions back to numeric parameters.
+`EngineAndWorker` rejects enum arguments in canonical MIDI and host-context
+signatures while user-defined events retain enum support.
 `ProjectBufferOverrideRestore` clears an override while the linked source is
 broken, verifies immediate and completed saves keep the cleared slot unbound,
 and checks that repairing the source does not resurrect the project default.
@@ -173,7 +239,9 @@ discrete edits, automation, Reset, saved state, and native file reload after
 adding a parameter while input controls are present. It verifies that Onda's
 metadata remains unranged and authored defaults outside 0–1 survive loading,
 Reset, and state restoration. It also checks adding an explicit range after an
-unranged default and rejects saved defaults outside their scalar type.
+unranged default and rejects saved defaults outside their scalar type. Non-finite
+scalar and array defaults must fail preparation with a named error, retaining the
+previous engine, automation mapping, and audio until a valid reload succeeds.
 `EventOnlyParameterSmoothing` checks that zero-frame MIDI and user-event
 callbacks preserve subsequent `f32` and `f64` smoothing after startup and reset,
 including partial first blocks, with allocation and lock auditing.
@@ -183,10 +251,13 @@ products must ramp from the last rendered value across callbacks and MIDI
 splits, without realtime allocations or locks.
 `UiAndHostParameterChanges` checks the 30 ms editor default, direct host changes,
 cancellation of editor ramps, state round-tripping, and allocation/lock auditing
-during mixed editor and host changes. `BlockProcessing` checks unloaded-only
+during mixed editor and host changes. `BlockProcessing` checks live and unloaded
 block-size selection, saved preferences and host limits, callback-delimited
 blocks, curve interpolation at chunk boundaries, MIDI and queued user
 events, oversized host callbacks, and allocation/lock auditing.
+`FailedBlockSizeChange` checks both products in realtime and offline modes:
+failed settings rebuilds retain audio and the published effective block size,
+and source repair applies the requested size without another host preparation.
 `CallbackProcessing` uses a shared reference for processor and exported VST3
 tests with block sizes 1, 3, and 8, changing callback lengths (including zero),
 parameter curves, sample-accurate control curves and buses, aliased input/output,
@@ -245,7 +316,7 @@ compiler, DSP, or notification implementation.
 
 `MessageThreadDelivery` deliberately does **not** use that helper. It checks that
 the real JUCE timer delivers project changes, parameter defaults, and logs through
-the native message loop, with a deadline. Native WebView2 readiness and asynchronous
+the native message loop, with a deadline. Native GPU readiness and asynchronous
 export completion also wait for their actual completion signals.
 
 For every state-notification assertion:
@@ -316,10 +387,11 @@ VST3s. They cover default-disabled mono bus metadata, individual and combined
 activation, fixed channel positions with an earlier bus disabled, disconnected
 scalar defaults, per-sample clamping including NaN, MIDI timing, short final
 blocks, and bypass using only main audio inputs. Processor
-renders audit allocations and locks. Preparation rejects control array defaults
-that the pinned SDK cannot expose, and rejects scalar/array `f64`, `i32`, and
-`bool` control ports. An additional fixture enables every control bus while the
-program declares none, supplying NaNs on those buses and checking that output
+renders audit allocations and locks. Control arrays preserve per-element defaults,
+including arrays spanning main audio and control slots. Preparation rejects
+scalar/array `f64`, `i32`, and `bool` control ports. An additional fixture enables
+every control bus while the program declares none, supplying NaNs on those buses
+and checking that output
 stays valid. Both processor and exported VST3 tests route the last control bus
 with all earlier control buses disabled, then check its current parameter value
 after disconnecting it. Processor tests automate every lane concurrently across
@@ -342,15 +414,12 @@ the `ControlInputs` processor case alongside the VST3 smoke test and validators.
   C++ allocation/deallocation auditing runs on all platforms; C allocation/free and mutex-lock
   interception use Linux linker wrapping. Passing on macOS or Windows does not
   establish the same interception coverage.
-- Native editor tests wait for the shipped view's readiness acknowledgment and
-  edit a real DOM control through the native bridge. Exported editor tests check
+- Native editor tests wait for the shipped GPU view to initialize and
+  edit a numeric field through the native adapter. Exported editor tests check
   `IPlugView` return values for platform support, attachment, and removal. These
   checks complement each other; VST3 validation does not replace real DAW testing.
   Linux builds guard JUCE's deferred XEmbed resize callback after its embedded
   window is destroyed. The exported editor reopening test exercises this lifetime.
-- Detailed focus/blur and DOM behavior runs in pinned Playwright/Chromium once.
-  It asserts that focus enables editing rather than waiting for OS window focus.
-  Failures retain a screenshot, DOM snapshot and command/scroll diagnostics.
 
 `MovedSourceAncestor` is disabled on Windows. Its directory watcher holds open
 handles that can prevent moving a containing folder, even with delete sharing,

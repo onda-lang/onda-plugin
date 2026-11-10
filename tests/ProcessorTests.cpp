@@ -17,6 +17,8 @@
 #include "StateFormat.h"
 #include "TestAudioFile.h"
 #include "BlockProcessingTests.h"
+#include "AudioFpTests.h"
+#include "PayloadLayoutTests.h"
 #include "AutomationSeedingTests.h"
 #include "ScratchHandoffTests.h"
 #include "ControlInputTests.h"
@@ -26,6 +28,7 @@
 #include "UnrangedParameterTests.h"
 #include "ParameterLifecycleTests.h"
 #include "ParameterDefaultTests.h"
+#include "EnumParameterTests.h"
 #include "BypassTests.h"
 #include "BypassTestSupport.h"
 
@@ -586,25 +589,6 @@ bool processWithoutAllocation(onda::plugin::Processor &processor,
 }
 
 bool exerciseRunViewAdapter() {
-  const auto root = onda::plugin::runViewResource("/");
-  const auto index = onda::plugin::runViewResource("/index.html?cache=1");
-  const auto script = onda::plugin::runViewResource("/param-control.js?v=2");
-  const auto numberScript =
-      onda::plugin::runViewResource("/number-input.js?v=2");
-  const auto buffersScript = onda::plugin::runViewResource("/buffers.js?v=2");
-  if (!root || !index || !script || !numberScript || !buffersScript ||
-      buffersScript->data.size() <= 3U || root->data.size() <= 3U ||
-      index->data != root->data ||
-      root->mimeType != "text/html; charset=utf-8" ||
-      script->mimeType != "text/javascript; charset=utf-8" ||
-      numberScript->mimeType != "text/javascript; charset=utf-8" ||
-      buffersScript->mimeType != "text/javascript; charset=utf-8" ||
-      root->data[0] != std::byte{0xef} || root->data[1] != std::byte{0xbb} ||
-      root->data[2] != std::byte{0xbf} ||
-      onda::plugin::runViewResource("/missing.txt")) {
-    std::cerr << "embedded run-view resources were not served canonically\n";
-    return false;
-  }
   onda::plugin::Processor processor(onda::plugin::Product::effect);
   processor.prepareToPlay(48'000.0, 64);
   const auto message = onda::plugin::makeRunViewState(
@@ -749,16 +733,6 @@ bool exerciseRunViewAdapter() {
     return false;
   }
 
-  const auto scopeMessage = onda::plugin::makeRunViewScope(processor);
-  const auto *scope = scopeMessage.getDynamicObject();
-  if (scope == nullptr ||
-      scope->getProperty("type").toString() != "scopeData" ||
-      static_cast<int>(scope->getProperty("channels")) != 0 ||
-      scope->getProperty("samples").getArray() == nullptr ||
-      !scope->getProperty("samples").getArray()->isEmpty()) {
-    std::cerr << "empty run-view scope message was invalid\n";
-    return false;
-  }
   return true;
 }
 
@@ -1157,6 +1131,32 @@ bool exerciseScopeCapture() {
     return false;
   }
 
+  processor.setMeterCaptureEnabled(true);
+  juce::AudioBuffer<float> metered(2, 64);
+  metered.clear();
+  metered.setSample(0, 7, -0.8f);
+  metered.setSample(1, 19, 0.6f);
+  juce::MidiBuffer meterMidi;
+  allocation_audit::count.store(0, std::memory_order_relaxed);
+  lock_audit::count.store(0, std::memory_order_relaxed);
+  allocation_audit::enabled = true;
+  lock_audit::enabled = true;
+  processor.processBlock(metered, meterMidi);
+  allocation_audit::enabled = false;
+  lock_audit::enabled = false;
+  if (allocation_audit::count.load() || lock_audit::count.load()) {
+    std::cerr << "meter-only capture allocated or locked on the audio thread\n";
+    return false;
+  }
+  const auto levels = processor.meterSnapshot();
+  if (std::abs(levels.peaks[0] - 0.2f) > 0.0001f ||
+      std::abs(levels.peaks[1] - 0.15f) > 0.0001f ||
+      !processor.scopeSnapshot().samples.empty()) {
+    std::cerr << "meter-only capture lost peaks or retained waveform history\n";
+    return false;
+  }
+  processor.setMeterCaptureEnabled(false);
+
   processor.setScopeCaptureEnabled(true);
   const auto pendingScope = processor.scopeRevision();
   if (!pendingScope.enabled || pendingScope.frames != 0U) {
@@ -1211,19 +1211,6 @@ bool exerciseScopeCapture() {
       std::cerr << "scope snapshot was not the latest interleaved output\n";
       return false;
     }
-  }
-
-  const auto message = onda::plugin::makeRunViewScope(processor);
-  const auto *scope = message.getDynamicObject();
-  const auto *samples =
-      scope == nullptr ? nullptr : scope->getProperty("samples").getArray();
-  if (scope == nullptr ||
-      scope->getProperty("type").toString() != "scopeData" ||
-      static_cast<int>(scope->getProperty("channels")) != 2 ||
-      samples == nullptr ||
-      samples->size() != static_cast<int>(snapshot.samples.size())) {
-    std::cerr << "captured run-view scope message was invalid\n";
-    return false;
   }
 
   processor.setScopeCaptureEnabled(false);
@@ -1289,6 +1276,15 @@ bool exerciseRuntimeLogging() {
     return false;
   }
 
+  const auto logOnly = onda::plugin::makeRunViewLog(processor)["state"];
+  if (logOnly.hasProperty("params") || logOnly.hasProperty("events") ||
+      logOnly.hasProperty("buffers") ||
+      logOnly["logText"].toString() != state->getProperty("logText").toString() ||
+      logOnly["logEntries"].size() != entries->size()) {
+    std::cerr << "log-only update replaced controls or lost output\n";
+    return false;
+  }
+
   const auto parameterUpdate = onda::plugin::makeRunViewState(
       processor, processor.workerStatus(), processor.canExportProject(), {},
       false, false);
@@ -1297,7 +1293,7 @@ bool exerciseRuntimeLogging() {
   if (update == nullptr || !update->hasProperty("params") ||
       update->hasProperty("logText") || update->hasProperty("logEntries") ||
       update->hasProperty("printTransportDropCount")) {
-    std::cerr << "parameter update replaced the unchanged browser log\n";
+    std::cerr << "parameter update replaced the unchanged UI log\n";
     return false;
   }
 
@@ -1309,7 +1305,7 @@ bool exerciseRuntimeLogging() {
       clearedState.getProperty("logEntries", {}).getArray();
   if (clearedEntries == nullptr || !clearedEntries->isEmpty() ||
       clearedState.getProperty("logText", {}).toString().isNotEmpty()) {
-    std::cerr << "cleared log was not sent to the browser\n";
+    std::cerr << "cleared log was not sent to the UI\n";
     return false;
   }
   snapshot = processor.runtimeLogSnapshot();
@@ -1567,6 +1563,7 @@ bool exerciseStateRestore() {
     original.setParamControlLayout(onda::plugin::ParamControlLayout::sliders);
     juce::var viewState{new juce::DynamicObject};
     viewState.getDynamicObject()->setProperty("octave", 2);
+    viewState.getDynamicObject()->setProperty("scopePinned", true);
     StateChangeListener viewStateChanges{original};
     original.setViewState(viewState);
     original.setViewState(viewState);
@@ -1584,6 +1581,7 @@ bool exerciseStateRestore() {
                  onda::plugin::ParamControlLayout::sliders &&
              static_cast<int>(juce::JSON::parse(original.viewState())
                                   .getProperty("octave", {})) == 2 &&
+             static_cast<bool>(juce::JSON::parse(original.viewState())["scopePinned"]) &&
              original.workerStatus().path == source.path();
     };
     const auto reject = [&](const juce::MemoryBlock &candidate) {
@@ -1693,6 +1691,7 @@ bool exerciseStateRestore() {
         width != 777 || height != 888 ||
         static_cast<int>(juce::JSON::parse(restored.viewState())
                              .getProperty("octave", {})) != 2 ||
+        !static_cast<bool>(juce::JSON::parse(restored.viewState())["scopePinned"]) ||
         restored.paramControlLayout() !=
             onda::plugin::ParamControlLayout::sliders ||
         restored.workerStatus().path != source.path()) {
@@ -2153,7 +2152,7 @@ sample {
 
   const auto waitForBufferStatus = [](onda::plugin::Processor &processor,
                                       const bool active,
-                                      const int loadedFrames = -1) {
+                                      const int loadedSamples = -1) {
     onda::plugin::WorkerStatus status;
     const auto ready = test::waitUntil(
         [&] {
@@ -2161,8 +2160,8 @@ sample {
           status = processor.workerStatus();
           return !status.compiling && status.buffers.size() == 1U &&
                  status.active == active &&
-                 (loadedFrames < 0 ||
-                  status.buffers[0].loadedFrames == loadedFrames);
+                 (loadedSamples < 0 ||
+                  status.buffers[0].loadedSamples == loadedSamples);
         },
         test::yieldToWorker);
     return ready ? status : onda::plugin::WorkerStatus{};
@@ -2185,7 +2184,7 @@ sample {
                        false);
     const auto unbound = waitForBufferStatus(processor, true);
     if (unbound.buffers.size() != 1U ||
-        unbound.buffers[0].loadedFrames != 0 || unbound.hasError ||
+        unbound.buffers[0].loadedSamples != 0 || unbound.hasError ||
         processFirstFrame(processor) != std::pair{0.0F, 0.0F}) {
       std::cerr << "unbound buffer did not use neutral audio\n";
       return false;
@@ -2196,7 +2195,7 @@ sample {
     const auto bound = waitForBufferStatus(processor, true, 8);
     if (bound.buffers.size() != 1U ||
         bound.buffers[0].loadedPath != audioFile.path() ||
-        bound.buffers[0].loadedFrames != 8 ||
+        bound.buffers[0].loadedSamples != 8 ||
         bound.buffers[0].loadedChannels != 2) {
       std::cerr << "processor did not publish decoded buffer metadata\n";
       return false;
@@ -2342,7 +2341,7 @@ sample {
             5.0e-4) ||
         !static_cast<bool>(viewState->getProperty("canExportProject")) ||
         viewBuffer->getProperty("loadedPath").toString().isNotEmpty() ||
-        static_cast<int>(viewBuffer->getProperty("loadedFrames")) != 8 ||
+        static_cast<int>(viewBuffer->getProperty("loadedSamples")) != 8 ||
         static_cast<int>(viewBuffer->getProperty("loadedChannels")) != 2 ||
         !test::withinTolerance(
             static_cast<double>(viewBuffer->getProperty("loadedSampleRate")) -
@@ -2369,7 +2368,7 @@ sample {
                      exportDirectory / "project.ondaproject" &&
                  relinkedStatus.buffers.size() == 1U &&
                  relinkedStatus.buffers[0].loadedPath.empty() &&
-                 relinkedStatus.buffers[0].loadedFrames == 8 &&
+                 relinkedStatus.buffers[0].loadedSamples == 8 &&
                  relinkedStatus.buffers[0].loadedChannels == 2;
         },
         test::yieldToWorker);
@@ -3039,39 +3038,39 @@ sample { out1 = level; out2 = level }
     }
     return true;
   };
-  processor.triggerMidiNote(60, 0.75F, true);
+  const auto generation = processor.workerStatus().engineGeneration;
+  processor.triggerMidiNote(generation, 60, 0.75F, true);
   if (!renders(0.75F))
     return false;
-  processor.triggerMidiNote(60, 0.0F, false);
+  processor.triggerMidiNote(generation, 60, 0.0F, false);
   if (!renders(0.0F))
     return false;
-  processor.triggerMidiNote(60, 0.5F, true);
+  processor.triggerMidiNote(generation, 60, 0.5F, true);
   if (!renders(0.5F))
     return false;
   processor.releaseKeyboardNotes();
   if (!renders(0.0F))
     return false;
   // Pending presses must also be cancelled when the editor closes.
-  processor.triggerMidiNote(60, 0.5F, true);
+  processor.triggerMidiNote(generation, 60, 0.5F, true);
   processor.releaseKeyboardNotes();
   if (!renders(0.0F))
     return false;
-  processor.triggerMidiNote(60, 0.5F, true);
+  processor.triggerMidiNote(generation, 60, 0.5F, true);
   if (!renders(0.5F))
     return false;
   for (int index = 0; index < 257; ++index)
-    processor.triggerMidiNote(60, 0.5F, true);
+    processor.triggerMidiNote(generation, 60, 0.5F, true);
   if (!renders(0.0F))
     return false;
-  processor.triggerMidiNote(-1, 1.0F, true);
-  processor.triggerMidiNote(128, 1.0F, true);
+  processor.triggerMidiNote(generation, -1, 1.0F, true);
+  processor.triggerMidiNote(generation, 128, 1.0F, true);
   if (!renders(0.0F))
     return false;
 
-  processor.triggerMidiNote(60, 0.5F, true);
+  processor.triggerMidiNote(generation, 60, 0.5F, true);
   if (!renders(0.5F))
     return false;
-  const auto generation = processor.workerStatus().engineGeneration;
   processor.requestReload();
   if (!test::waitUntil(
           [&] {
@@ -3087,9 +3086,9 @@ sample { out1 = level; out2 = level }
   hostNote.addEvent(juce::MidiMessage::noteOn(1, 60, 1.0F), 0);
   if (!renders(1.0F, hostNote))
     return false;
-  // The browser can release a virtual hold from before adoption. That release
+  // The UI can release a virtual hold from before adoption. That release
   // must not dispatch a note-off to the new engine's host voice.
-  processor.triggerMidiNote(60, 0.0F, false);
+  processor.triggerMidiNote(generation, 60, 0.0F, false);
   if (!renders(1.0F) || !processor.midiActivitySnapshot().active(60)) {
     std::cerr << "an obsolete virtual key release silenced a new host note\n";
     return false;
@@ -3098,10 +3097,11 @@ sample { out1 = level; out2 = level }
   hostNote.addEvent(juce::MidiMessage::noteOff(1, 60), 0);
   if (!renders(0.0F, hostNote))
     return false;
-  processor.triggerMidiNote(60, 0.5F, true);
+  const auto replacementGeneration = processor.workerStatus().engineGeneration;
+  processor.triggerMidiNote(replacementGeneration, 60, 0.5F, true);
   if (!renders(0.5F))
     return false;
-  processor.triggerMidiNote(60, 0.0F, false);
+  processor.triggerMidiNote(replacementGeneration, 60, 0.0F, false);
   return renders(0.0F);
 }
 
@@ -3179,7 +3179,8 @@ sample { out1 = in1 + level; out2 = in2 + level }
         !render(false, 1.25F) || !render(true, 0.25F, noteOff, 4, 1.25F))
       return false;
     if (product == Product::instrument) {
-      processor.triggerMidiNote(64, 1.0F, true);
+      processor.triggerMidiNote(processor.workerStatus().engineGeneration, 64,
+                                 1.0F, true);
       if (!render(false, 1.25F))
         return false;
       processor.releaseKeyboardNotes();
@@ -4033,6 +4034,35 @@ bool exerciseHostPreparation() {
   return !failed.workerStatus().active && rendersImmediately(failed, 64, 1.0F);
 }
 
+bool exerciseMeterLifecycle() {
+  using namespace onda::plugin;
+  TemporarySource source;
+  if (!source.write("sample { out1 = 0.25; out2 = 0.25 }\n"))
+    return false;
+  Processor processor(Product::effect);
+  processor.setNonRealtime(true);
+  processor.loadFile(juce::File(pathToJuce(source.path())), false);
+  processor.prepareToPlay(48'000.0, 64);
+  processor.setMeterCaptureEnabled(true);
+  for (const bool release : {false, true}) {
+    if (!processWithoutAllocation(processor, 0.25F) ||
+        processor.meterSnapshot().peaks[0] != 0.25F ||
+        processor.meterSnapshot().peaks[0] != 0.25F)
+      return false;
+    if (release)
+      processor.releaseResources();
+    else
+      processor.reset();
+    for (const auto peak : processor.meterSnapshot().peaks) {
+      if (peak != 0.0F) {
+        std::cerr << "Host reset/release left a stale meter reading\n";
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
 bool exercisePreparedParameterInitialization() {
   using namespace onda::plugin;
   constexpr auto patch = R"(
@@ -4363,7 +4393,7 @@ sample { out1 = clip[0, 0] + extra[0, 0]; out2 = clip[0, 0] + extra[0, 0] }
       const auto loaded = std::ranges::find(partial.bufferChoices(), name,
                                             &BufferMapping::name);
       if (!partial.pendingBuffers || loaded == partial.bufferChoices().end() ||
-          loaded->loadedFrames == 0 ||
+          loaded->loadedSamples == 0 ||
           !rendersImmediately(processor, 64, 0.25F))
         return false;
       processor.clearBuffer(name);
@@ -4692,8 +4722,10 @@ int runProcessorCases(const int argc, const char *const *argv) {
       {"RealtimeAuditInstrumentation",
        test::exerciseRealtimeAuditInstrumentation},
       {"AlignedAllocation", exerciseAlignedAllocation},
+      {"AudioThreadFpMode", exerciseAudioThreadFpMode},
       {"NewControlDefaults", exerciseNewControlDefaults},
       {"HostPreparation", exerciseHostPreparation},
+      {"MeterLifecycle", exerciseMeterLifecycle},
       {"PreparedParameterInitialization",
        exercisePreparedParameterInitialization},
       {"StateSaveDuringNotification", exerciseStateSaveDuringNotification},
@@ -4707,11 +4739,16 @@ int runProcessorCases(const int argc, const char *const *argv) {
       {"MessageThreadDelivery", exerciseMessageThreadDelivery},
       {"ProjectDirtyNotifications", exerciseProjectDirtyNotifications},
       {"RunViewAdapter", exerciseRunViewAdapter},
+      {"RunViewSchemaReadiness", exerciseRunViewSchemaReadiness},
       {"FastMath", exerciseFastMath},
+      {"FailedBlockSizeChange", exerciseFailedBlockSizeChange},
       {"ScopeCapture", exerciseScopeCapture},
       {"UserEvents", exerciseUserEvents},
       {"StructuredEvents", exerciseStructuredEvents},
+      {"EventPayloadLayout", exerciseEventPayloadLayout},
       {"HostParameterPresentation", exerciseHostParameterPresentation},
+      {"EnumParameters", exerciseEnumParameters},
+      {"EnumEventMetadata", exerciseEnumEventMetadata},
       {"UnrangedParameters", exerciseUnrangedParameters},
       {"RuntimeLogging", exerciseRuntimeLogging},
       {"effect", +[] { return exercise(onda::plugin::Product::effect); }},
@@ -4720,9 +4757,15 @@ int runProcessorCases(const int argc, const char *const *argv) {
       {"StateRestore", exerciseStateRestore},
       {"EditorLifecycle", exerciseEditorLifecycle},
       {"NativeEditor", exerciseNativeEditor, "native"},
+      {"GpuEditorSmoothingPublications", exerciseGpuEditorSmoothingPublications, "gpu"},
+      {"GpuEditorTeardown", exerciseGpuEditorTeardown, "gpu"},
+      {"GpuEditorPeerRecreation", exerciseGpuEditorPeerRecreation, "gpu"},
+      {"GpuEditorRestoreBeforePreparation", exerciseGpuEditorRestoreBeforePreparation, "gpu"},
+      {"GpuEditorFileDrag", exerciseGpuEditorFileDrag, "gpu"},
       {"Vst3EditorAttachment", exerciseVst3EditorAttachment, "native"},
       {"EditorGestureCancellation", exerciseEditorGestureCancellation},
       {"StaleEditorEvents", exerciseStaleEditorEvents},
+      {"StaleEditorMidiNotes", exerciseStaleEditorMidiNotes},
       {"TypedBufferState", exerciseTypedBufferState},
       {"AudioFileBuffers", exerciseAudioFileBuffers},
       {"ParameterArrayProcessor", exerciseParameterArrayProcessor},
@@ -4783,9 +4826,8 @@ int runProcessorCases(const int argc, const char *const *argv) {
   return test::runCases(argc, argv, cases);
 }
 
-// A real JUCE application supplies native message-loop initialization and the
-// WebKit subprocess entry point. ScopedJuceInitialiser_GUI alone identifies an
-// executable as an embedded plugin and cannot host its browser correctly.
+// A real JUCE application supplies native message-loop initialization and
+// application lifecycle for the editor tests.
 class ProcessorTestApplication final : public juce::JUCEApplication {
 public:
   ProcessorTestApplication(int argc, const char *const *argv)

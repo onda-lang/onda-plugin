@@ -1,4 +1,5 @@
 #include "Editor.h"
+#include "GpuView.h"
 
 #include "AudioFile.h"
 #include "JucePath.h"
@@ -12,275 +13,11 @@
 #include <string_view>
 #include <system_error>
 
-#if JUCE_LINUX && !JUCE_USE_EXTERNAL_TEMPORARY_SUBPROCESS
-#error "Linux plugin editors require JUCE's external WebKit subprocess helper"
-#endif
-
 namespace onda::plugin {
 namespace {
 
 const auto editorBackground = juce::Colour::fromRGB(13, 25, 41);
 const auto editorMutedText = juce::Colour::fromRGB(146, 168, 191);
-
-constexpr auto juceHostBridgeScript = R"JS(
-(() => {
-  let parameterDomains = new Map();
-  let parameterPath = "";
-  const activeParameterGestures = new Set();
-  let blockSettingsKey = "";
-  let hostBlockSamples = 0;
-  let eventDefinitions = [];
-  let eventGeneration = "0";
-  const isBufferFile = name => window.__ondaBufferFileExtensions.some(
-    extension => name.toLowerCase().endsWith(extension));
-
-  // WebView2 preserves native paths when File objects cross as additional
-  // objects. Ordinary JSON messages only retain their names and contents.
-  const webview = window.chrome?.webview;
-  if (typeof webview?.postMessageWithAdditionalObjects === "function") {
-    // Run after the buffer view's document handlers so native source/project
-    // drops stay available throughout the editor, including outside cards.
-    window.addEventListener("dragover", (event) => {
-      if (!Array.from(event.dataTransfer?.types || []).includes("Files")) return;
-      event.preventDefault();
-      event.dataTransfer.dropEffect = "copy";
-    });
-    document.addEventListener("drop", (event) => {
-      if (!Array.from(event.dataTransfer?.types || []).includes("Files")) return;
-      event.preventDefault();
-      const files = Array.from(event.dataTransfer.files || []);
-      const sources = files.filter(file => /\.(?:onda|on|ondaproject)$/i.test(file.name));
-      const dropped = sources.length ? sources
-        : files.length === 1 && isBufferFile(files[0].name) ? files : [];
-      if (dropped.length) webview.postMessageWithAdditionalObjects(JSON.stringify({
-        type: "ondaFilesDropped", x: event.clientX, y: event.clientY,
-      }), dropped);
-    });
-  }
-
-  function parameterControlKey(parameter) {
-    const { value, normalizedValue, ...control } = parameter;
-    return JSON.stringify(control);
-  }
-
-  function updatePlainValue(parameter, domain, type = parameter.type) {
-    if (typeof parameter.value !== "number"
-        && !(type === "i64" && typeof parameter.value === "string"))
-      parameter.value = domain.normalizedToPlain(parameter.normalizedValue);
-  }
-
-  function createParameterDomain(parameter) {
-    if (parameter.rangeMin === parameter.rangeMax) return {
-      normalizedToPlain: () => parameter.rangeMin,
-      plainToNormalized: () => parameter.normalizedValue,
-    };
-    return globalThis.__ONDA_PARAM_CONTROL_V2__.createParamDomain({
-      name: parameter.name,
-      scalar: parameter.type,
-      minimum: parameter.rangeMin,
-      maximum: parameter.rangeMax,
-      scale: parameter.scale,
-      curve: parameter.curve,
-      unit: parameter.unit,
-      step: parameter.step,
-      stepCount: parameter.stepCount,
-    });
-  }
-
-  function defaultEventArgumentValue(argument) {
-    const structured = typeof argument?.type === "string"
-      && !/^(?:f32|f64|i32|i64|bool)(?:\[[0-9]*\])?$/.test(argument.type);
-    if (structured) {
-      const value = argument.default ?? {};
-      return typeof structuredClone === "function"
-        ? structuredClone(value)
-        : JSON.parse(JSON.stringify(value));
-    }
-    const isArray = Boolean(
-      argument?.isSlice
-      || (typeof argument?.arrayLength === "number" && argument.arrayLength !== 1)
-      || (typeof argument?.type === "string" && /\[[0-9]*\]$/.test(argument.type))
-    );
-    if (isArray) {
-      return Array.isArray(argument.default) ? argument.default.slice() : [];
-    }
-    if (argument?.type === "bool") {
-      return Boolean(argument.default);
-    }
-    if (argument?.type === "i64") {
-      return typeof argument.default === "string" ? argument.default : "0";
-    }
-    if ((argument?.type === "f32" || argument?.type === "f64")
-        && ["NaN", "Infinity", "-Infinity"].includes(argument.default)) {
-      return argument.default;
-    }
-    const value = Number(argument?.default);
-    return Number.isFinite(value) ? value : 0;
-  }
-
-  function resetEventArguments() {
-    if (typeof window._onHostMessage !== "function") {
-      return;
-    }
-    const events = eventDefinitions.map((event) => ({
-      ...event,
-      args: Array.isArray(event.args)
-        ? event.args.map((argument) => ({
-            ...argument,
-            value: defaultEventArgumentValue(argument),
-          }))
-        : [],
-    }));
-    window._onHostMessage({
-      type: "state", state: { events, resetEventArguments: true },
-    });
-  }
-
-  window.__hostBridge = { mode: "wry", isBufferFile };
-  window.ipc = {
-    postMessage(payload) {
-      let message;
-      try {
-        message = typeof payload === "string" ? JSON.parse(payload) : payload;
-      } catch {
-        return;
-      }
-
-      if (message?.type === "resetEventArguments") {
-        resetEventArguments();
-        return;
-      }
-      if (message?.type === "triggerEvent") {
-        message.engineGeneration = eventGeneration;
-      }
-      if (message?.type === "setRunSettings" && message.blockSamples === hostBlockSamples) {
-        message.blockSamples = 0;
-      }
-      if (message?.type === "setParam" || message?.type === "setInputControl") {
-        const binding = parameterDomains.get(message.name);
-        if (!binding) return;
-        message.value = binding.domain.plainToNormalized(message.value);
-        if (message.commit) activeParameterGestures.delete(message.name);
-        else activeParameterGestures.add(message.name);
-      }
-      window.__JUCE__.backend.emitEvent("ondaCommand", message);
-    },
-  };
-
-  document.addEventListener("DOMContentLoaded", () => {
-    const sampleRate = document.getElementById("run-sample-rate");
-    if (sampleRate) {
-      sampleRate.disabled = true;
-      sampleRate.closest(".param-setting").hidden = true;
-    }
-    const runSettings = document.getElementById("file-picker-settings");
-    if (runSettings) runSettings.style.gridTemplateColumns = "minmax(0, 1fr)";
-    const input = document.getElementById("param-smoothing-ms");
-    if (input) {
-      input.setAttribute("aria-label", "Editor parameter smoothing duration in milliseconds");
-      input.setAttribute("title", "Smooths editor changes. DAW automation updates at block boundaries. 0 disables smoothing.");
-    }
-    updateBlockSettings({ hostBlockSamples: 0, canSetBlockSize: false });
-  });
-
-  function updateBlockSettings(state) {
-    if (!Number.isInteger(state.hostBlockSamples)) return;
-    const select = document.getElementById("run-block-size");
-    if (!select) return;
-    const maximum = state.hostBlockSamples;
-    hostBlockSamples = maximum;
-    const preference = state.preferredBlockSamples ?? 0;
-    const key = `${maximum}:${preference}:${state.canSetBlockSize}`;
-    if (key !== blockSettingsKey) {
-      const options = [];
-      const add = (value, text) => {
-        const option = document.createElement("option");
-        option.value = String(value);
-        option.textContent = text;
-        options.push(option);
-        return option;
-      };
-      add(maximum, maximum > 0 ? `Host (${maximum} samples)` : "Host (waiting)");
-      const sizes = new Set([maximum]);
-      for (const divisor of [2, 4, 8]) {
-        const size = Math.floor(maximum / divisor);
-        if (size > 0 && !sizes.has(size)) {
-          sizes.add(size);
-          add(size, `${size} samples`);
-        }
-      }
-      // Host capacity changes can leave the active fixed size outside these
-      // choices. Display it without offering it as another menu choice.
-      if (preference > 0 && !sizes.has(preference)) {
-        const option = add(preference, preference > maximum
-          ? `${preference} (using ${maximum})` : `${preference} samples`);
-        option.hidden = option.disabled = true;
-      }
-      select.replaceChildren(...options);
-      blockSettingsKey = key;
-    }
-    select.value = String(preference || maximum);
-    select.disabled = state.canSetBlockSize !== true || maximum <= 0;
-    select.title = "Choose before loading a program. Smaller Onda blocks update automation more often and use more CPU.";
-  }
-
-  window.__JUCE__.backend.addEventListener("ondaState", (message) => {
-    if (message?.type === "parameterValues") {
-      for (const bank of ["params", "inputControls"]) {
-        message.state[bank] = (message.state[bank] || []).filter(parameter => {
-          const binding = parameterDomains.get(parameter.name);
-          if (!binding || binding.bank !== bank) return false;
-          updatePlainValue(parameter, binding.domain, binding.type);
-          return true;
-        });
-      }
-    }
-    if (message?.type === "state" && Array.isArray(message.state?.events)) {
-      eventDefinitions = message.state.events;
-      eventGeneration = message.state.engineGeneration;
-    }
-    if (message?.type === "state" && (Array.isArray(message.state?.params) || Array.isArray(message.state?.inputControls))) {
-      const nextPath = message.state.path ?? parameterPath;
-      const nextDomains = new Map([...parameterDomains].filter(([, binding]) =>
-        nextPath === parameterPath && !Array.isArray(message.state[binding.bank])));
-      for (const [bank, endCommand] of [["params", "endParamGesture"], ["inputControls", "endInputControlGesture"]]) {
-        for (const parameter of message.state[bank] || []) {
-          if (parameter.hostValueDomain !== "normalized") {
-            continue;
-          }
-          try {
-            const domain = createParameterDomain(parameter);
-            nextDomains.set(parameter.name, {
-              domain, type: parameter.type,
-              controlKey: parameterControlKey(parameter), endCommand, bank,
-            });
-            updatePlainValue(parameter, domain);
-          } catch {
-            // The shared view will surface malformed parameter metadata.
-          }
-        }
-      }
-      // The shared view discards obsolete drags without committing their value.
-      // Release the DAW gesture separately before the controls are replaced.
-      for (const name of activeParameterGestures) {
-        if (nextPath !== parameterPath || !nextDomains.has(name)
-            || nextDomains.get(name).controlKey !== parameterDomains.get(name)?.controlKey) {
-          activeParameterGestures.delete(name);
-          window.__JUCE__.backend.emitEvent("ondaCommand", {
-            type: parameterDomains.get(name)?.endCommand || "endParamGesture", name,
-          });
-        }
-      }
-      parameterDomains = nextDomains;
-      parameterPath = nextPath;
-    }
-    if (typeof window._onHostMessage === "function") {
-      window._onHostMessage(message);
-    }
-    if (message?.type === "state") updateBlockSettings(message.state);
-  });
-})();
-)JS";
 
 std::optional<double> number(const juce::var &value) {
   if (!value.isInt() && !value.isInt64() && !value.isDouble() &&
@@ -338,104 +75,28 @@ bool isBufferFile(const juce::File &file) {
       });
 }
 
-juce::WebBrowserComponent::Options browserOptions() {
-  juce::WebBrowserComponent::Options options;
-  juce::Array<juce::var> extensions;
-  for (const auto &extension : supportedAudioFileExtensions())
-    extensions.add(juce::String::fromUTF8(extension.c_str()));
-  options = options.withUserScript("window.__ondaBufferFileExtensions = " +
-                                   juce::JSON::toString(extensions) + ";\n" +
-                                   juceHostBridgeScript);
-#if JUCE_WINDOWS
-  const auto dataFolder =
-      juce::File::getSpecialLocation(juce::File::userApplicationDataDirectory)
-          .getChildFile("Onda/VST3/WebView2");
-  options =
-      options.withBackend(juce::WebBrowserComponent::Options::Backend::webview2)
-          .withWinWebView2Options(
-              juce::WebBrowserComponent::Options::WinWebView2{}
-                  .withUserDataFolder(dataFolder));
-#endif
-  return options;
+bool isSourcePath(const juce::String &path) {
+  return juce::File::isAbsolutePath(path) &&
+         juce::File(path).hasFileExtension("onda;on;ondaproject");
 }
 
 } // namespace
 
-class Editor::Browser final : public juce::WebBrowserComponent,
-                              public juce::FileDragAndDropTarget {
-public:
-  explicit Browser(Editor &owner)
-      : WebBrowserComponent(
-            browserOptions()
-                .withNativeIntegrationEnabled()
-                .withKeepPageLoadedWhenBrowserIsHidden()
-                .withEventListener("ondaCommand",
-                                   [&owner](juce::var command) {
-                                     owner.handleCommand(command);
-                                   })
-                .withResourceProvider([](const juce::String &path) {
-                  return runViewResource(path);
-                })),
-        owner_(owner) {}
-
-  [[nodiscard]] juce::String initializationError() const {
-#if JUCE_WINDOWS
-    const auto options = browserOptions();
-    if (const auto result = options.getWinWebView2BackendOptions()
-                                .getUserDataFolder()
-                                .createDirectory();
-        result.failed())
-      return "Could not create the Onda browser data folder: " +
-             result.getErrorMessage();
-    if (!areOptionsSupported(options))
-      return "The Onda editor requires Microsoft Edge WebView2 Runtime";
-#endif
-    return {};
-  }
-
-  bool pageAboutToLoad(const juce::String &url) override {
-    return url.startsWith(getResourceProviderRoot());
-  }
-
-  void newWindowAttemptingToLoad(const juce::String &) override {}
-
-  bool isInterestedInFileDrag(const juce::StringArray &files) override {
-    return owner_.isInterestedInFileDrag(files);
-  }
-
-  void fileDragEnter(const juce::StringArray &files, int x, int y) override {
-    owner_.fileDragEnter(files, x, y);
-  }
-
-  void fileDragMove(const juce::StringArray &files, int x, int y) override {
-    owner_.fileDragMove(files, x, y);
-  }
-
-  void fileDragExit(const juce::StringArray &files) override {
-    owner_.fileDragExit(files);
-  }
-
-  void filesDropped(const juce::StringArray &files, int x, int y) override {
-    owner_.filesDropped(files, x, y);
-  }
-
-  bool pageLoadHadNetworkError(const juce::String &error) override {
-    owner_.loadingOverlay_.setText("Could not load the Onda editor: " + error,
-                                   juce::dontSendNotification);
-    owner_.loadingOverlay_.setVisible(true);
-    return false;
-  }
-
-private:
-  Editor &owner_;
-};
-
 Editor::Editor(Processor &owner)
-    : AudioProcessorEditor(owner), processor_(owner),
-      browser_(std::make_unique<Browser>(*this)) {
+    : AudioProcessorEditor(owner), processor_(owner) {
+  const auto theme = preferences_.theme();
+  lightTheme_ = theme.isEmpty() ? !juce::Desktop::getInstance().isDarkModeActive()
+                                : theme == "light";
+  gpu_ = std::make_unique<GpuView>(
+      [this](const juce::var &command) { handleCommand(command); },
+      [this] {
+        viewReady();
+        loadingOverlay_.setVisible(false);
+      });
   const auto [width, height] = processor_.editorSize();
+  setAccessible(false);
   setOpaque(true);
-  addAndMakeVisible(*browser_);
+  addAndMakeVisible(*gpu_);
   loadingOverlay_.setComponentID("onda-loading-overlay");
   loadingOverlay_.setText("Loading Onda...", juce::dontSendNotification);
   loadingOverlay_.setJustificationType(juce::Justification::centred);
@@ -446,17 +107,17 @@ Editor::Editor(Processor &owner)
   setResizable(true, true);
   setSize(width, height);
   setResizeLimits(360, 480, 1600, 1400);
-  if (const auto error = browser_->initializationError(); error.isNotEmpty())
-    loadingOverlay_.setText(error, juce::dontSendNotification);
-  else
-    browser_->goToURL(juce::WebBrowserComponent::getResourceProviderRoot());
-  startTimerHz(20);
+  updateTheme();
+  startTimerHz(60);
 }
 
 Editor::~Editor() {
   stopTimer();
+  // Release drafts and gestures while their command handlers are still alive.
+  gpu_.reset();
   processor_.releaseKeyboardNotes();
   processor_.setScopeCaptureEnabled(false);
+  processor_.setMeterCaptureEnabled(false);
   for (std::size_t index = 0; index < activeGestures_.size(); ++index)
     endParameterGesture(index);
   processor_.setEditorSize(getWidth(), getHeight());
@@ -473,14 +134,20 @@ void Editor::endParameterGesture(const std::size_t index) {
 }
 
 void Editor::paint(juce::Graphics &graphics) {
-  graphics.fillAll(editorBackground);
+  graphics.fillAll(juce::Colour(lightTheme_ ? 0xffe8f1fc : 0xff081522));
+}
+
+void Editor::updateTheme() {
+  loadingOverlay_.setColour(juce::Label::backgroundColourId,
+                           juce::Colour(lightTheme_ ? 0xffe8f1fc : 0xff081522));
+  loadingOverlay_.setColour(juce::Label::textColourId,
+                           juce::Colour(lightTheme_ ? 0xff4e6a86 : 0xff92a8bf));
+  repaint();
+  publishState(true);
 }
 
 bool Editor::isInterestedInFileDrag(const juce::StringArray &files) {
-  if (std::any_of(files.begin(), files.end(), [](const auto &path) {
-        return juce::File::isAbsolutePath(path) &&
-               juce::File(path).hasFileExtension("onda;on;ondaproject");
-      }))
+  if (std::any_of(files.begin(), files.end(), isSourcePath))
     return true;
   return files.size() == 1 && juce::File::isAbsolutePath(files[0]) &&
          isBufferFile(juce::File(files[0])) &&
@@ -489,21 +156,26 @@ bool Editor::isInterestedInFileDrag(const juce::StringArray &files) {
 
 void Editor::publishFileDrag(const char *phase, const juce::StringArray &files,
                              const int x, const int y) {
-  if (!browserReady_)
+  if (!viewReady_)
     return;
   juce::var message{new juce::DynamicObject};
   auto &object = *message.getDynamicObject();
-  object.setProperty("type", "bufferFileDrag");
+  const auto source = std::find_if(files.begin(), files.end(), isSourcePath);
+  object.setProperty("type", source != files.end() ? "sourceFileDrag"
+                                                   : "bufferFileDrag");
   object.setProperty("phase", phase);
   juce::Array<juce::var> paths;
-  for (const auto &path : files)
-    paths.add(path);
+  if (source != files.end())
+    paths.add(*source);
+  else
+    for (const auto &path : files)
+      paths.add(path);
   object.setProperty("paths", std::move(paths));
   juce::var position{new juce::DynamicObject};
   position.getDynamicObject()->setProperty("x", x);
   position.getDynamicObject()->setProperty("y", y);
   object.setProperty("position", std::move(position));
-  browser_->emitEventIfBrowserIsVisible("ondaState", std::move(message));
+  emitState(std::move(message));
 }
 
 void Editor::fileDragEnter(const juce::StringArray &files, int x, int y) {
@@ -521,10 +193,10 @@ void Editor::fileDragExit(const juce::StringArray &files) {
 void Editor::filesDropped(const juce::StringArray &files, int x, int y) {
   fileDragExit(files);
   for (const auto &path : files) {
-    if (!juce::File::isAbsolutePath(path))
+    if (!isSourcePath(path))
       continue;
     const juce::File file(path);
-    if (!file.hasFileExtension("onda;on;ondaproject") || !file.existsAsFile())
+    if (!file.existsAsFile())
       continue;
     actionError_.clear();
     processor_.loadFile(file, true);
@@ -535,16 +207,50 @@ void Editor::filesDropped(const juce::StringArray &files, int x, int y) {
 }
 
 void Editor::resized() {
-  browser_->setBounds(getLocalBounds());
+  if (gpu_)
+    gpu_->setBounds(getLocalBounds());
   loadingOverlay_.setBounds(getLocalBounds());
   processor_.setEditorSize(getWidth(), getHeight());
 }
 
+bool Editor::viewVisible() const {
+  return gpu_ && gpu_->isVisible();
+}
+
+void Editor::emitState(juce::var message) {
+  if (gpu_)
+    gpu_->message(message);
+}
+
+void Editor::viewReady() {
+  for (std::size_t index = 0; index < activeGestures_.size(); ++index)
+    endParameterGesture(index);
+  viewReady_ = true;
+  hasPublished_ = false;
+  hasPublishedMidi_ = false;
+  hasPublishedScope_ = false;
+  publishState(true);
+  publishMidiActivity(true);
+  publishVisualization(true);
+}
+
 void Editor::timerCallback() {
-  const auto showing = browserReady_ && isShowing() && browser_->isVisible();
-  if (scopeCaptureActive_ != showing) {
-    scopeCaptureActive_ = showing;
-    processor_.setScopeCaptureEnabled(showing);
+  if (gpu_->error().isNotEmpty()) {
+    loadingOverlay_.setText(gpu_->error(), juce::dontSendNotification);
+    loadingOverlay_.setVisible(true);
+  }
+  const auto showing = viewReady_ && isShowing() && viewVisible();
+  const auto captureMeter = showing && gpu_->meterVisible();
+  if (meterCaptureActive_ != captureMeter) {
+    meterCaptureActive_ = captureMeter;
+    processor_.setMeterCaptureEnabled(captureMeter);
+    publishedVisualizationTimeMs_ = 0;
+  }
+  const auto captureScope = showing && gpu_->scopeVisible();
+  if (scopeCaptureActive_ != captureScope) {
+    scopeCaptureActive_ = captureScope;
+    processor_.setScopeCaptureEnabled(captureScope);
+    publishedVisualizationTimeMs_ = 0;
   }
   if (!showing) {
     hasPublished_ = false;
@@ -554,7 +260,7 @@ void Editor::timerCallback() {
   }
   publishState(false);
   publishMidiActivity();
-  publishScope();
+  publishVisualization();
 }
 
 void Editor::publishMidiActivity(const bool force) {
@@ -569,12 +275,11 @@ void Editor::publishMidiActivity(const bool force) {
   }
   publishedMidiRevision_ = activity.revision;
   hasPublishedMidi_ = true;
-  browser_->emitEventIfBrowserIsVisible("ondaState",
-                                        makeRunViewMidiActivity(activity));
+  emitState(makeRunViewMidiActivity(activity));
 }
 
 void Editor::publishState(const bool force) {
-  if (!browserReady_ || !isShowing() || !browser_->isVisible()) {
+  if (!viewReady_ || !isShowing() || !viewVisible()) {
     hasPublished_ = false;
     return;
   }
@@ -601,22 +306,26 @@ void Editor::publishState(const bool force) {
   const auto currentBlockPreference = processor_.preferredBlockSize();
   const auto currentFastMath = processor_.fastMath();
   if (!force && hasPublished_ && revision == publishedRevision_ &&
-      logRevision == publishedLogRevision_ && currentBuses == publishedBuses_ &&
+      currentBuses == publishedBuses_ &&
       currentInputLayout == publishedInputLayout_ &&
-      std::is_eq(currentInputSmoothing <=> publishedInputSmoothing_) &&
       currentKnobLayout == publishedKnobLayout_ &&
-      std::is_eq(currentSmoothingSeconds <=> publishedSmoothingSeconds_) &&
       currentHostBlockSize == publishedHostBlockSize_ &&
       currentBlockPreference == publishedBlockPreference_ &&
       currentFastMath == publishedFastMath_ &&
       viewStateRestoreRevision == publishedViewStateRestoreRevision_) {
+    if (!std::is_eq(currentInputSmoothing <=> publishedInputSmoothing_) ||
+        !std::is_eq(currentSmoothingSeconds <=> publishedSmoothingSeconds_))
+      publishSmoothing();
     if (currentSlots != publishedSlotStamps_ ||
         currentControls != publishedControlStamps_) {
       publishedSlotStamps_ = currentSlots;
       publishedControlStamps_ = currentControls;
-      browser_->emitEventIfBrowserIsVisible(
-          "ondaState",
+      emitState(
           makeRunViewParameterValues(processor_, processor_.workerStatus()));
+    }
+    if (logRevision != publishedLogRevision_) {
+      publishedLogRevision_ = logRevision;
+      emitState(makeRunViewLog(processor_));
     }
     return;
   }
@@ -630,6 +339,7 @@ void Editor::publishState(const bool force) {
       !hasPublished_ ||
       viewStateRestoreRevision != publishedViewStateRestoreRevision_;
   publishedEngineGeneration_ = status.engineGeneration;
+  publishedWorkerError_ = status.hasError ? status.message : std::string{};
   publishedRevision_ = status.revision;
   publishedLogRevision_ = logRevision;
   publishedSlotStamps_ = currentSlots;
@@ -647,6 +357,8 @@ void Editor::publishState(const bool force) {
   auto message =
       makeRunViewState(processor_, status, processor_.canExportProject(),
                        actionError_, resetEventArguments, includeRuntimeLog);
+  auto *appearance = message["state"].getDynamicObject();
+  appearance->setProperty("themeMode", lightTheme_ ? "light" : "dark");
   if (initializeViewState) {
     auto state = message.getDynamicObject()->getProperty("state");
     juce::var viewState;
@@ -656,24 +368,63 @@ void Editor::publishState(const bool force) {
       viewState = juce::var{new juce::DynamicObject};
       viewState.getDynamicObject()->setProperty("reset", true);
     }
+    // Presentation belongs to its source; an untouched newly loaded source
+    // must not inherit a previously saved source's event arguments on reopen.
+    if (!viewState.isObject() ||
+        (viewState.hasProperty("path") &&
+         viewState.getProperty("path", {}).toString() !=
+             state.getProperty("path", {}).toString())) {
+      viewState = juce::var{new juce::DynamicObject};
+      viewState.getDynamicObject()->setProperty("reset", true);
+    }
     viewState.getDynamicObject()->setProperty("readyId", ++publishedReadyId_);
     state.getDynamicObject()->setProperty("viewState", std::move(viewState));
   }
-  browser_->emitEventIfBrowserIsVisible("ondaState", message);
+  emitState(message);
 }
 
-void Editor::publishScope(const bool force) {
-  if (!isShowing() || !browser_->isVisible()) {
-    hasPublishedScope_ = false;
+void Editor::publishSmoothing() {
+  if (!viewReady_ || !isShowing() || !viewVisible()) {
+    hasPublished_ = false;
     return;
   }
+  if (!hasPublished_) {
+    publishState(true);
+    return;
+  }
+  publishedSmoothingSeconds_ = processor_.paramSmoothingSeconds();
+  publishedInputSmoothing_ = processor_.inputControlSmoothingSeconds();
+  emitState(makeRunViewSmoothing(
+      publishedSmoothingSeconds_, publishedInputSmoothing_,
+      actionError_.empty() ? publishedWorkerError_ : actionError_));
+}
+
+void Editor::publishVisualization(const bool force) {
+  if (!isShowing() || !viewVisible() ||
+      (!scopeCaptureActive_ && !meterCaptureActive_))
+    return;
+  // Meters and waveform share one clock, independently of input redraws.
+  constexpr auto intervalMs = 1000.0 / 30.0;
+  const auto now = juce::Time::getMillisecondCounterHiRes();
+  const auto elapsed = !force && publishedVisualizationTimeMs_ > 0.0
+                           ? now - publishedVisualizationTimeMs_
+                           : intervalMs;
+  if (elapsed < intervalMs)
+    return;
+  publishedVisualizationTimeMs_ = now - std::fmod(elapsed, intervalMs);
+  if (meterCaptureActive_) {
+    const auto levels = processor_.meterSnapshot();
+    gpu_->meter(pluginOutputChannels, levels.peaks.data(), levels.peaks.size());
+  }
+  if (!scopeCaptureActive_)
+    return;
   const auto revision = processor_.scopeRevision();
   if (!force && hasPublishedScope_ && revision == publishedScopeRevision_)
     return;
   publishedScopeRevision_ = revision;
   hasPublishedScope_ = true;
-  browser_->emitEventIfBrowserIsVisible("ondaState",
-                                        makeRunViewScope(processor_));
+  const auto snapshot = processor_.scopeSnapshot();
+  gpu_->scope(snapshot.channels, snapshot.samples);
 }
 
 void Editor::handleCommand(const juce::var &command) {
@@ -682,30 +433,18 @@ void Editor::handleCommand(const juce::var &command) {
     return;
   const auto type = input->getProperty("type").toString();
 
-  if (type == "webviewReady") {
-    for (std::size_t index = 0; index < activeGestures_.size(); ++index)
-      endParameterGesture(index);
-    browserReady_ = true;
-    hasPublished_ = false;
-    hasPublishedMidi_ = false;
-    hasPublishedScope_ = false;
-    publishState(true);
-    publishMidiActivity(true);
-    publishScope(true);
-  } else if (type == "runViewReady") {
-    const auto readyId = input->getProperty("readyId");
-    if (browserReady_ && (readyId.isInt() || readyId.isInt64()) &&
-        static_cast<juce::int64>(readyId) == publishedReadyId_)
-      loadingOverlay_.setVisible(false);
-  } else if (type == "viewState") {
+  if (type == "viewState") {
     processor_.setViewState(input->getProperty("state"));
   } else if (type == "midiNote") {
+    const auto generation =
+        parseGeneration(input->getProperty("engineGeneration"));
     const auto key = input->getProperty("key");
     const auto velocity = input->getProperty("velocity");
     const auto pressed = input->getProperty("pressed");
-    if (key.isInt() && (velocity.isDouble() || velocity.isInt()) &&
+    if (generation && key.isInt() &&
+        (velocity.isDouble() || velocity.isInt()) &&
         pressed.isBool())
-      processor_.triggerMidiNote(static_cast<int>(key),
+      processor_.triggerMidiNote(*generation, static_cast<int>(key),
                                  static_cast<float>(velocity),
                                  static_cast<bool>(pressed));
   } else if (type == "clearLog") {
@@ -769,27 +508,35 @@ void Editor::handleCommand(const juce::var &command) {
                        ? std::string{}
                        : "Input control smoothing duration must be finite and "
                          "non-negative";
-    publishState(true);
+    publishSmoothing();
   } else if (type == "setInputControlLayout") {
     const auto layout = input->getProperty("layout").toString();
     if (layout == "sliders" || layout == "knobs")
       processor_.setInputControlLayout(layout == "knobs"
                                            ? ParamControlLayout::knobs
                                            : ParamControlLayout::sliders);
+  } else if (type == "setTheme") {
+    const auto mode = input->getProperty("mode").toString();
+    if (UiPreferences::validTheme(mode)) {
+      lightTheme_ = mode == "light";
+      actionError_ = preferences_.setTheme(mode) ? std::string{} : "Could not save UI theme";
+    } else {
+      actionError_ = "Invalid UI theme";
+    }
+    updateTheme();
   } else if (type == "setFastMath") {
     const auto enabled = input->getProperty("enabled");
     actionError_ =
         enabled.isBool() && processor_.setFastMath(static_cast<bool>(enabled))
             ? std::string{}
-            : "Unload the program before changing Fast Math";
+            : "Invalid Fast Math setting";
     publishState(true);
   } else if (type == "setRunSettings") {
     const auto samples = input->getProperty("blockSamples");
     actionError_ = samples.isInt() && processor_.setPreferredBlockSize(
                                           static_cast<int>(samples))
                        ? std::string{}
-                       : "Unload the program before choosing an Onda block "
-                         "size within the host limit";
+                       : "Choose an Onda block size within the host limit";
     publishState(true);
   } else if (type == "setParamSmoothing") {
     const auto milliseconds = number(input->getProperty("milliseconds"));
@@ -798,7 +545,7 @@ void Editor::handleCommand(const juce::var &command) {
                        ? std::string{}
                        : "Smoothing duration must be finite, non-negative, and "
                          "fit the host sample counter";
-    publishState(true);
+    publishSmoothing();
   } else if (type == "reset") {
     processor_.requestUserReset();
   } else if (type == "triggerEvent") {

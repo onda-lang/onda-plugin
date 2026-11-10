@@ -3,10 +3,12 @@
 #include "JucePath.h"
 #include "ProcessorTestSupport.h"
 #include "RealtimeAudit.h"
+#include "RunViewHost.h"
 #include "TemporaryDirectory.h"
 #include "TestAutomationQueue.h"
 #include "TestNumeric.h"
 
+#include <algorithm>
 #include <array>
 #include <iostream>
 
@@ -168,8 +170,13 @@ block {
     return false;
   processor.loadFile(source);
   processor.prepareToPlay(1000.0, 8);
-  if (processor.canSetBlockSize() || processor.setPreferredBlockSize(2))
+  if (!processor.canSetBlockSize() || !processor.setPreferredBlockSize(2))
     return false;
+  processor.prepareToPlay(1000.0, 8);
+  if (processor.ondaBlockSize() != 2 || !processor.workerStatus().active ||
+      !processor.setPreferredBlockSize(3))
+    return false;
+  processor.prepareToPlay(1000.0, 8);
   const auto render = [&](const std::array<float, 8> &left,
                           const std::array<float, 8> &right,
                           juce::MidiBuffer &midi) {
@@ -264,6 +271,109 @@ block {
             empty))
       return false;
   }
+  // A settings change must specialize without another DAW prepareToPlay call.
+  const auto previous = processor.workerStatus().engineGeneration;
+  juce::AudioBuffer<float> live(2, 8);
+  if (!processor.setParamSmoothingSeconds(0.0) ||
+      !processor.setPreferredBlockSize(2) || !test::waitForMessage([&] {
+        live.clear();
+        if (!test::processRealtime(processor, live, empty))
+          return false;
+        return processor.workerStatus().engineGeneration > previous &&
+               processor.workerStatus().active &&
+               live.getSample(1, 0) == live.getSample(1, 1) &&
+               test::withinTolerance(live.getSample(1, 2) - live.getSample(1, 1) - 1.0F, 1.0e-6F);
+      }))
+    return false;
   processor.unload();
   return processor.canSetBlockSize() && processor.setPreferredBlockSize(2);
+}
+
+bool exerciseFailedBlockSizeChange() {
+  using namespace onda::plugin;
+  const juce::File source{
+      pathToJuce(testTemporaryRoot() / "failed-block-size-change.onda")};
+  const auto program = R"(
+outs { out1 }
+event note_on(id: i32, channel: i32, key: i32, velocity: f32) {}
+event note_off(id: i32, channel: i32, key: i32, velocity: f32) {}
+sample { out1 = f32(BS) / 128.0 }
+)";
+  for (const auto product : {Product::effect, Product::instrument})
+    for (const auto offline : {false, true}) {
+      if (!source.replaceWithText(program))
+        return false;
+      Processor processor(product);
+      processor.setNonRealtime(offline);
+      processor.loadFile(source);
+      processor.prepareToPlay(48'000.0, 64);
+      juce::AudioBuffer<float> audio(
+          std::max(pluginInputChannels, pluginOutputChannels), 64);
+      juce::MidiBuffer midi;
+      const auto renders = [&](const float expected) {
+        audio.clear();
+        if (offline)
+          processor.processBlock(audio, midi);
+        else if (!test::processRealtime(processor, audio, midi))
+          return false;
+        for (int frame = 0; frame < audio.getNumSamples(); ++frame)
+          if (!test::withinTolerance(audio.getSample(0, frame) - expected,
+                                     1.0e-6F)) {
+            std::cerr << "Block-size change rendered "
+                      << audio.getSample(0, frame) << ", expected " << expected
+                      << " (offline " << offline << ")\n";
+            return false;
+          }
+        return true;
+      };
+      if (!renders(0.5F))
+        return false;
+      const auto generation = processor.workerStatus().engineGeneration;
+      if (!source.replaceWithText("this is not valid Onda\n"))
+        return false;
+      processor.requestReload();
+      if (!test::waitForMessage([&] {
+            const auto status = processor.workerStatus();
+            return status.schemaReady && status.hasError && !status.compiling;
+          }) ||
+          !renders(0.5F))
+        return false;
+
+      // Pending and failed editor preferences must keep the previous engine
+      // eligible, including its actual block size in the published run view.
+      if (!processor.setPreferredBlockSize(32) || !renders(0.5F) ||
+          !test::waitForMessage([&] {
+            const auto status = processor.workerStatus();
+            return status.schemaReady && status.hasError && !status.compiling;
+          }) ||
+          !renders(0.5F))
+        return false;
+      const auto status = processor.workerStatus();
+      const auto state =
+          makeRunViewState(processor, status, false, {})["state"];
+      if (!status.active || status.engineGeneration != generation ||
+          !static_cast<bool>(state["running"]) ||
+          !static_cast<bool>(state["connected"]) ||
+          static_cast<int>(state["blockSamples"]) != 64 ||
+          static_cast<int>(state["preferredBlockSamples"]) != 32)
+        return false;
+
+      // Repairing the source applies the requested size without another DAW
+      // prepareToPlay call or an explicit settings retry.
+      if (!source.replaceWithText(program))
+        return false;
+      processor.requestReload();
+      if (!test::waitForMessage([&] {
+            const auto ready = processor.workerStatus();
+            return ready.active && !ready.hasError && !ready.compiling &&
+                   ready.engineGeneration > generation;
+          }) ||
+          !renders(0.25F))
+        return false;
+      const auto repairedState = makeRunViewState(
+          processor, processor.workerStatus(), false, {})["state"];
+      if (static_cast<int>(repairedState["blockSamples"]) != 32)
+        return false;
+    }
+  return true;
 }

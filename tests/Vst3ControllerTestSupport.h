@@ -6,6 +6,7 @@
 #include <juce_audio_processors_headless/format_types/juce_VST3Headers.h>
 
 #include <memory>
+#include <optional>
 
 namespace vst3_test {
 using namespace Steinberg;
@@ -83,8 +84,10 @@ public:
   }
 
   double value(const char *id) const {
-    return controller_->getParamNormalized(
-        juce::VST3ClientExtensions::convertJuceParameterId(id));
+    return value(juce::VST3ClientExtensions::convertJuceParameterId(id));
+  }
+  double value(const Vst::ParamID id) const {
+    return controller_->getParamNormalized(id);
   }
   double plain(const char *id, const double value) const {
     return controller_->normalizedParamToPlain(
@@ -95,15 +98,40 @@ public:
         juce::VST3ClientExtensions::convertJuceParameterId(id), value);
   }
   int32 stepCount(const char *id) const {
+    const auto info = parameterInfo(id);
+    return info ? info->stepCount : -1;
+  }
+  std::optional<Vst::ParameterInfo> parameterInfo(const char *id) const {
     const auto parameterId =
         juce::VST3ClientExtensions::convertJuceParameterId(id);
     for (int32 index = 0; index < controller_->getParameterCount(); ++index) {
       Vst::ParameterInfo info{};
       if (controller_->getParameterInfo(index, info) == kResultOk &&
           info.id == parameterId)
-        return info.stepCount;
+        return info;
     }
-    return -1;
+    return std::nullopt;
+  }
+  juce::String text(const char *id, const double value) const {
+    Vst::String128 result{};
+    if (controller_->getParamStringByValue(
+            juce::VST3ClientExtensions::convertJuceParameterId(id), value,
+            result) != kResultOk)
+      return {};
+    return juce::String{juce::CharPointer_UTF16{
+        reinterpret_cast<const juce::CharPointer_UTF16::CharType *>(result)}};
+  }
+  std::optional<double> valueForText(const char *id,
+                                    const juce::String &text) const {
+    Vst::String128 input{};
+    text.copyToUTF16(
+        reinterpret_cast<juce::CharPointer_UTF16::CharType *>(input), sizeof(input));
+    Vst::ParamValue value{};
+    if (controller_->getParamValueByString(
+            juce::VST3ClientExtensions::convertJuceParameterId(id), input,
+            value) != kResultOk)
+      return std::nullopt;
+    return value;
   }
   tresult PLUGIN_API beginEdit(Vst::ParamID) override {
     ++gestures;
@@ -120,10 +148,12 @@ public:
   tresult PLUGIN_API restartComponent(const int32 flags) override {
     if ((flags & Vst::kParamValuesChanged) != 0)
       ++valueRefreshes;
+    if ((flags & Vst::kParamTitlesChanged) != 0)
+      ++titleRefreshes;
     return kResultOk;
   }
 
-  int edits{}, gestures{}, valueRefreshes{};
+  int edits{}, gestures{}, valueRefreshes{}, titleRefreshes{};
 
 private:
   juce::DynamicLibrary library_;
