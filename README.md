@@ -155,14 +155,3 @@ cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
   -DONDA_PLUGIN_INPUT_CHANNELS=4 -DONDA_PLUGIN_CONTROL_INPUTS=8 \
   -DONDA_PLUGIN_OUTPUT_CHANNELS=8 -DONDA_PLUGIN_PARAMETER_SLOTS=64
 ```
-
-Run the release test groups on a desktop (or under `xvfb-run -a` on Linux):
-
-```sh
-ctest --test-dir build -C Release --output-on-failure -L '^(core|native)$'
-```
-
-`plugin-version` controls the plugin release version.
-See [architecture](docs/architecture.md) for implementation invariants and
-[test contracts](tests/README.md) for CI selections, native editor checks, and
-DAW validation.
