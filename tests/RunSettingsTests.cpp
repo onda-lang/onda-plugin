@@ -74,11 +74,13 @@ bool exerciseRunViewSchemaReadiness() {
 bool exerciseFastMath() {
   using namespace onda::plugin;
   const juce::File source{pathToJuce(testTemporaryRoot() / "fast-math.onda")};
-  const auto writeSource = [&](int increment) {
+  // In f32, 9 / 10 rounds below 9 * (1 / 10). Only full fast math
+  // permits the reciprocal multiplication.
+  const auto writeSource = [&](int level) {
     return source.replaceWithText(
-        "outs { out1 }\nparams { value = 100000000000000000000.0 }\nsample { "
-        "out1 = (value + " +
-        juce::String(increment) + ".0) - value }\n");
+        "outs { out1 }\nparams { value = 9.0 }\nsample:\n"
+        "  if value / 10.0 > 0.9:\n    out1 = " +
+        juce::String(level) + ".0\n  else:\n    out1 = 0.0\n");
   };
   const auto renders = [](Processor &processor, float expected) {
     juce::AudioBuffer<float> audio(
@@ -99,7 +101,7 @@ bool exerciseFastMath() {
     Processor processor(Product::effect);
     processor.setNonRealtime(true);
     if (processor.fastMath()) {
-      std::cerr << "Empty plugin instances must default to strict math\n";
+      std::cerr << "Empty plugin instances must default to the default Onda math mode\n";
       return false;
     }
     {

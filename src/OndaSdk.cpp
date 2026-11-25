@@ -59,7 +59,7 @@ onda_compile_options_t compileOptions(const double sampleRate,
                                       const int blockSize,
                                       const bool fastMath) {
   return {
-      .fast_math = fastMath ? 1 : 0,
+      .math_mode = fastMath ? ONDA_FLOAT_MATH_FAST : ONDA_FLOAT_MATH_DEFAULT,
       .sample_rate = static_cast<float>(sampleRate),
       .block_size = blockSize,
       .const_inputs = nullptr,

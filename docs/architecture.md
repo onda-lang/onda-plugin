@@ -350,7 +350,7 @@ preparation; a larger callback uses fallback until adequate storage is adopted.
 Suspended host preparation can replace and reclaim scratch storage directly.
 
 Fast Math is an instance compilation preference, off in a new instance and
-editable in Settings. Saved state restores it before specialization. Every
+editable in Settings. Disabling it selects Onda's default math mode. Saved state restores it before specialization. Every
 worker request captures the option for both disk and saved-image compilation,
 including automatic reloads and host specialization changes.
 

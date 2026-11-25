@@ -1,5 +1,6 @@
 <h1>
-  <img src="assets/svg/onda-logo-dark-circle.svg" alt="onda logo" width="40" align="absmiddle" /> Onda VST3 Plugin
+  <a href="assets/svg/onda-logo-circle.svg#gh-light-mode-only"><img src="assets/svg/onda-logo-circle.svg" alt="onda logo" width="40" align="absmiddle" /></a>
+  <a href="assets/svg/onda-logo-dark-circle.svg#gh-dark-mode-only"><img src="assets/svg/onda-logo-dark-circle.svg" alt="onda logo" width="40" align="absmiddle" /></a> Onda VST3 Plugin
 </h1>
 
 `OndaSynth` and `OndaFX` are VST3 plugins for running the
